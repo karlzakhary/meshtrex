@@ -22,11 +22,11 @@
 #include "vulkan_utils.h"
 #include "triangle.cpp"
 
-void execute(char** argv);
+void drawTriangle(char** argv);
 
 int main(int argc, char** argv)
 {
-    execute(argv);
+    drawTriangle(argv);
     std::cout << "Hello, World!" << std::endl;
     return 0;
 }

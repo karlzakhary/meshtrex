@@ -13,7 +13,7 @@ VkPipelineLayout createPipelineLayout(VkDevice device)
 	return layout;
 }
 
-void execute(char** argv)
+void drawTriangle(char** argv)
 {
     VK_CHECK(volkInitialize());
 
@@ -75,7 +75,8 @@ void execute(char** argv)
                                                   surface, &presentSupported));
     assert(presentSupported);
 
-    VkFormat swapchainFormat = getSwapchainFormat(physicalDevice, surface);
+	VkFormat swapchainFormat = getSwapchainFormat(physicalDevice, surface);
+	VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
 
     VkSemaphore acquireSemaphore = createSemaphore(device);
     assert(acquireSemaphore);
@@ -95,14 +96,12 @@ void execute(char** argv)
     Shader triangleFS {};
     assert(loadShader(triangleFS, device, argv[0], "spirv/triangle.frag.spv"));
 
-    // TODO: this is critical for performance!
     VkPipelineCache pipelineCache = nullptr;
 	VkPipelineRenderingCreateInfo renderingInfo = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
 		.colorAttachmentCount = 1,
 		.pColorAttachmentFormats = &swapchainFormat,
-		.depthAttachmentFormat = VK_FORMAT_UNDEFINED,
-		.stencilAttachmentFormat = VK_FORMAT_UNDEFINED
+		.depthAttachmentFormat = depthFormat
 	};
 
     VkPipelineLayout pipelineLayout = createPipelineLayout(device);
@@ -136,10 +135,31 @@ void execute(char** argv)
     VkCommandBuffer commandBuffer = nullptr;
     VK_CHECK(vkAllocateCommandBuffers(device, &allocateInfo, &commandBuffer));
 
+	Image colorTarget = {};
+
+	VkClearColorValue colorClear = { 48.f / 255.f, 10.f / 255.f, 36.f / 255.f, 1 };
+
     while (!glfwWindowShouldClose(window)) {
-    	static int frame = 0;
-    	printf("Drawing frame: %d\n", frame++);
         glfwPollEvents();
+
+    	SwapchainStatus swapchainStatus = updateSwapchain(swapchain, physicalDevice, device, surface, familyIndex, window, swapchainFormat);
+
+    	if (swapchainStatus == Swapchain_NotReady)
+    		continue;
+
+    	if (swapchainStatus == Swapchain_Resized || !colorTarget.image)
+    	{
+    		if (colorTarget.image)
+    			destroyImage(colorTarget, device);
+
+    		for (uint32_t i = 0; i < swapchain.imageCount; ++i)
+    		{
+    			if (swapchainImageViews[i])
+    				vkDestroyImageView(device, swapchainImageViews[i], 0);
+
+    			swapchainImageViews[i] = createImageView(device, swapchain.images[i], swapchainFormat, 0, 1);
+    		}
+    	}
 
     	uint32_t imageIndex = 0;
     	VkResult acquireResult = vkAcquireNextImageKHR(device, swapchain.swapchain, ~0ull, acquireSemaphore, VK_NULL_HANDLE, &imageIndex);
@@ -154,51 +174,25 @@ void execute(char** argv)
 
 		VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
 
-    	VkImageMemoryBarrier barrierToRender = {
-    		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			.srcAccessMask = 0,
-			.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-			.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-			.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.image = swapchain.images[imageIndex],
-			.subresourceRange = {
-    			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-				.baseMipLevel = 0,
-				.levelCount = 1,
-				.baseArrayLayer = 0,
-				.layerCount = 1
-			}
-    	};
+    	VkImageMemoryBarrier2 renderBeginBarrier = imageBarrier(
+    		swapchain.images[imageIndex],
+				VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR,
+				0,
+				VK_IMAGE_LAYOUT_UNDEFINED,
+				VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR,
+				VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+				);
 
-    	vkCmdPipelineBarrier(
-			commandBuffer,
-			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			0,
-			0, nullptr,
-			0, nullptr,
-			1, &barrierToRender
-		);
+    	pipelineBarrier(commandBuffer, 0, 0, nullptr, 1, &renderBeginBarrier);
 
-    	VkImageViewCreateInfo createInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-    	createInfo.image = swapchain.images[imageIndex];
-    	createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    	createInfo.format = getSwapchainFormat(physicalDevice, surface);
-    	createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    	createInfo.subresourceRange.levelCount = 1;
-    	createInfo.subresourceRange.layerCount = 1;
-
-    	VkImageView view = nullptr;
-    	VK_CHECK(vkCreateImageView(device, &createInfo, 0, &view));
     	VkRenderingAttachmentInfo colorAttachment = {
     		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-			.imageView = view,
+			.imageView = swapchainImageViews[imageIndex],
 			.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 			.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
 			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-			.clearValue =  { 48.f / 255.f, 10.f / 255.f, 36.f / 255.f, 1 }
+			.clearValue =  colorClear
 		};
 
     	VkRenderingInfo passInfo = { VK_STRUCTURE_TYPE_RENDERING_INFO };
@@ -207,11 +201,10 @@ void execute(char** argv)
     	passInfo.layerCount = 1;
     	passInfo.colorAttachmentCount = 1;
     	passInfo.pColorAttachments = &colorAttachment;
-    	// passInfo.pDepthAttachment = &depthAttachment;
 
 		vkCmdBeginRendering(commandBuffer, &passInfo);
 
-    	VkViewport viewport = {  0.0f,(float)swapchain.height, (float)swapchain.width,-(float)swapchain.height, 0.0f, 1.0f };
+    	VkViewport viewport = {  0.0f,static_cast<float>(swapchain.height), static_cast<float>(swapchain.width),-static_cast<float>(swapchain.height), 0.0f, 1.0f };
 		VkRect2D scissor = { {0, 0}, {(swapchain.width), (swapchain.height)} };
 
 		vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
@@ -222,21 +215,17 @@ void execute(char** argv)
 
 		vkCmdEndRendering(commandBuffer);
 
-    	VkImageMemoryBarrier barrierToPresent = barrierToRender;
-    	barrierToPresent.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    	barrierToPresent.dstAccessMask = 0;
-    	barrierToPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    	barrierToPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    	VkImageMemoryBarrier2 presentBarrier = imageBarrier(
+    		swapchain.images[imageIndex],
+				VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR,
+				VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT_KHR,
+				0,
+				VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+				);
 
-    	vkCmdPipelineBarrier(
-			commandBuffer,
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-			0,
-			0, nullptr,
-			0, nullptr,
-			1, &barrierToPresent
-		);
+    	pipelineBarrier(commandBuffer, 0, 0, nullptr, 1, &presentBarrier);
 
     	VK_CHECK(vkEndCommandBuffer(commandBuffer));
 
@@ -269,15 +258,26 @@ void execute(char** argv)
 
     VK_CHECK(vkDeviceWaitIdle(device));
 
+	if (colorTarget.image)
+		destroyImage(colorTarget, device);
+
+	for (uint32_t i = 0; i < swapchain.imageCount; ++i)
+		if (swapchainImageViews[i])
+			vkDestroyImageView(device, swapchainImageViews[i], nullptr);
+
     vkDestroyCommandPool(device, commandPool, nullptr);
 
+	vkDestroyPipeline(device, trianglePipeline, nullptr);
+	vkDestroyShaderModule(device, triangleVS.module, nullptr);
+	vkDestroyShaderModule(device, triangleFS.module, nullptr);
     destroySwapchain(device, swapchain);
 
-	vkDestroyFence(device, frameFence, 0);
+	vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+	vkDestroyFence(device, frameFence, nullptr);
     vkDestroySemaphore(device, releaseSemaphore, nullptr);
     vkDestroySemaphore(device, acquireSemaphore, nullptr);
 
-    vkDestroySurfaceKHR(instance, surface, 0);
+    vkDestroySurfaceKHR(instance, surface, nullptr);
 
     glfwDestroyWindow(window);
 
