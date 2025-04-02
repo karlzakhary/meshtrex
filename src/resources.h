@@ -1,20 +1,11 @@
 #pragma once
 
-struct Buffer
-{
-	VkBuffer buffer;
-	VkDeviceMemory memory;
-	void* data;
-	size_t size;
-};
-
 struct Image
 {
 	VkImage image;
 	VkImageView imageView;
 	VkDeviceMemory memory;
 };
-
 
 static uint32_t selectMemoryType(const VkPhysicalDeviceMemoryProperties& memoryProperties, uint32_t memoryTypeBits, VkMemoryPropertyFlags flags)
 {

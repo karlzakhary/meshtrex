@@ -1,10 +1,10 @@
 #include <iostream>
 
-#include "triangle.h"
+#include "objViewer.h"
 
 int main(int argc, char** argv)
 {
-    drawTriangle(argv);
+    drawObject(argv, "meshes/kitten.obj");
     std::cout << "Hello, World!" << std::endl;
     return 0;
 }

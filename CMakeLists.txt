@@ -70,3 +70,11 @@ endforeach()
 
 add_custom_target(compile_shaders DEPENDS ${SPIRV_BINARY_FILES})
 add_dependencies(meshtrex compile_shaders)
+
+add_custom_command(
+        TARGET meshtrex POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_SOURCE_DIR}/meshes
+        ${CMAKE_BINARY_DIR}/meshes
+        COMMENT "Copying meshes folder to build directory"
+)

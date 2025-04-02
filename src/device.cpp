@@ -217,7 +217,8 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
     std::vector<const char *> extensions = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-
+        VK_KHR_16BIT_STORAGE_EXTENSION_NAME,
+        VK_KHR_8BIT_STORAGE_EXTENSION_NAME,
         "VK_KHR_portability_subset",
         VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
         VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
