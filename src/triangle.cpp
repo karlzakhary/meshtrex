@@ -1,6 +1,17 @@
 #include "common.h"
 
-VkPipelineLayout createPipelineLayout(VkDevice device)
+#include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
+
+#include "triangle.h"
+#include "device.h"
+#include "glm/vec4.hpp"
+#include "resources.h"
+#include "shaders.h"
+#include "swapchain.h"
+#include "vulkan_utils.h"
+
+VkPipelineLayout createBasicPipelineLayout(VkDevice device)
 {
 	VkPipelineLayoutCreateInfo layoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
 	layoutInfo.setLayoutCount = 0;
@@ -87,7 +98,7 @@ void drawTriangle(char** argv)
     VkFence frameFence = createFence(device);
     assert(frameFence);
 
-    VkQueue queue = 0;
+    VkQueue queue = nullptr;
     vkGetDeviceQueue(device, familyIndex, 0, &queue);
 
     Shader triangleVS {};
@@ -104,7 +115,7 @@ void drawTriangle(char** argv)
 		.depthAttachmentFormat = depthFormat
 	};
 
-    VkPipelineLayout pipelineLayout = createPipelineLayout(device);
+    VkPipelineLayout pipelineLayout = createBasicPipelineLayout(device);
     VkPipeline trianglePipeline = createGraphicsPipeline(
         device,
         pipelineCache,
@@ -135,8 +146,6 @@ void drawTriangle(char** argv)
     VkCommandBuffer commandBuffer = nullptr;
     VK_CHECK(vkAllocateCommandBuffers(device, &allocateInfo, &commandBuffer));
 
-	Image colorTarget = {};
-
 	VkClearColorValue colorClear = { 48.f / 255.f, 10.f / 255.f, 36.f / 255.f, 1 };
 
     while (!glfwWindowShouldClose(window)) {
@@ -147,11 +156,8 @@ void drawTriangle(char** argv)
     	if (swapchainStatus == Swapchain_NotReady)
     		continue;
 
-    	if (swapchainStatus == Swapchain_Resized || !colorTarget.image)
+    	if (swapchainStatus == Swapchain_Resized || !swapchainImageViews.front())
     	{
-    		if (colorTarget.image)
-    			destroyImage(colorTarget, device);
-
     		for (uint32_t i = 0; i < swapchain.imageCount; ++i)
     		{
     			if (swapchainImageViews[i])
@@ -257,9 +263,6 @@ void drawTriangle(char** argv)
     }
 
     VK_CHECK(vkDeviceWaitIdle(device));
-
-	if (colorTarget.image)
-		destroyImage(colorTarget, device);
 
 	for (uint32_t i = 0; i < swapchain.imageCount; ++i)
 		if (swapchainImageViews[i])

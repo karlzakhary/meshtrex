@@ -85,7 +85,7 @@ void createImage(Image& result, VkDevice device,
     createInfo.usage = usage;
     createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    VkImage image = 0;
+    VkImage image = nullptr;
     VK_CHECK(vkCreateImage(device, &createInfo, 0, &image));
 
     VkMemoryRequirements memoryRequirements;
@@ -101,7 +101,7 @@ void createImage(Image& result, VkDevice device,
     allocateInfo.allocationSize = memoryRequirements.size;
     allocateInfo.memoryTypeIndex = memoryTypeIndex;
 
-    VkDeviceMemory memory = 0;
+    VkDeviceMemory memory = nullptr;
     VK_CHECK(vkAllocateMemory(device, &allocateInfo, 0, &memory));
 
     VK_CHECK(vkBindImageMemory(device, image, memory, 0));

@@ -1,6 +1,6 @@
 #pragma once
 
-VkSemaphore createSemaphore(VkDevice device)
+inline VkSemaphore createSemaphore(VkDevice device)
 {
     VkSemaphoreCreateInfo createInfo = {
         VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -11,7 +11,7 @@ VkSemaphore createSemaphore(VkDevice device)
     return semaphore;
 }
 
-VkCommandPool createCommandPool(VkDevice device, uint32_t familyIndex)
+inline VkCommandPool createCommandPool(VkDevice device, uint32_t familyIndex)
 {
     VkCommandPoolCreateInfo createInfo = {
         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -24,7 +24,7 @@ VkCommandPool createCommandPool(VkDevice device, uint32_t familyIndex)
     return commandPool;
 }
 
-VkQueryPool createQueryPool(VkDevice device, uint32_t queryCount, VkQueryType queryType)
+inline VkQueryPool createQueryPool(VkDevice device, uint32_t queryCount, VkQueryType queryType)
 {
     VkQueryPoolCreateInfo createInfo = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
     createInfo.queryType = queryType;
@@ -41,7 +41,7 @@ VkQueryPool createQueryPool(VkDevice device, uint32_t queryCount, VkQueryType qu
     return queryPool;
 }
 
-VkFence createFence(VkDevice device)
+inline VkFence createFence(VkDevice device)
 {
     VkFenceCreateInfo createInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 
