@@ -1,5 +1,4 @@
 #include "common.h"
-
 #include "device.h"
 
 #include <stdio.h>
@@ -232,9 +231,9 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
     VkPhysicalDeviceFeatures2 features = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.features.multiDrawIndirect = true;
-    #ifndef __APPLE__
+#ifndef __APPLE__
     features.features.pipelineStatisticsQuery = true;
-    #endif
+#endif
     features.features.shaderInt16 = true;
     features.features.shaderInt64 = true;
     features.features.samplerAnisotropy = true;

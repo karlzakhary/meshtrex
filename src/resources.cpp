@@ -1,5 +1,4 @@
 #include "common.h"
-
 #include "resources.h"
 
 VkImageMemoryBarrier2 imageBarrier(

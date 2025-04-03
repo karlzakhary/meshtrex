@@ -24,15 +24,17 @@ inline VkCommandPool createCommandPool(VkDevice device, uint32_t familyIndex)
     return commandPool;
 }
 
-inline VkQueryPool createQueryPool(VkDevice device, uint32_t queryCount, VkQueryType queryType)
+inline VkQueryPool createQueryPool(VkDevice device, uint32_t queryCount,
+                                   VkQueryType queryType)
 {
-    VkQueryPoolCreateInfo createInfo = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+    VkQueryPoolCreateInfo createInfo = {
+        VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     createInfo.queryType = queryType;
     createInfo.queryCount = queryCount;
 
-    if (queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS)
-    {
-        createInfo.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT;
+    if (queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
+        createInfo.pipelineStatistics =
+            VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT;
     }
 
     VkQueryPool queryPool = nullptr;

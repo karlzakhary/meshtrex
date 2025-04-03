@@ -39,8 +39,7 @@ static VkShaderStageFlagBits getShaderStage(SpvExecutionModel executionModel)
         case SpvExecutionModelTaskEXT: return VK_SHADER_STAGE_TASK_BIT_EXT;
         case SpvExecutionModelMeshEXT: return VK_SHADER_STAGE_MESH_BIT_EXT;
 
-        default:
-            assert(!"Unsupported execution model");
+        default: assert(!"Unsupported execution model");
     }
 }
 
@@ -79,7 +78,8 @@ static void parseShader(Shader& shader, const uint32_t *code, uint32_t codeSize)
         switch (opcode) {
             case SpvOpEntryPoint: {
                 assert(wordCount >= 2);
-                shader.stage = getShaderStage(static_cast<SpvExecutionModel>(insn[1]));
+                shader.stage =
+                    getShaderStage(static_cast<SpvExecutionModel>(insn[1]));
             } break;
             case SpvOpExecutionMode: {
                 assert(wordCount >= 3);
@@ -339,7 +339,8 @@ static VkDescriptorUpdateTemplate createUpdateTemplate(
     VkDescriptorUpdateTemplateCreateInfo createInfo = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO};
 
-    createInfo.descriptorUpdateEntryCount = static_cast<uint32_t>(entries.size());
+    createInfo.descriptorUpdateEntryCount =
+        static_cast<uint32_t>(entries.size());
     createInfo.pDescriptorUpdateEntries = entries.data();
 
     createInfo.templateType =
@@ -490,8 +491,7 @@ VkPipeline createGraphicsPipeline(
 
     VkPipelineDynamicStateCreateInfo dynamicState = {
         VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamicState.dynamicStateCount =
-        std::size(dynamicStates);
+    dynamicState.dynamicStateCount = std::size(dynamicStates);
     dynamicState.pDynamicStates = dynamicStates;
     createInfo.pDynamicState = &dynamicState;
     createInfo.renderPass = VK_NULL_HANDLE;
