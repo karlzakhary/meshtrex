@@ -64,12 +64,27 @@ bool loadMesh(Mesh& result, const char* path)
     if (!loadObj(vertices, path))
         return false;
 
-    std::vector<uint32_t> indices(vertices.size());
-    for (size_t i = 0; i < indices.size(); ++i)
-        indices[i] = static_cast<uint32_t>(i);
+    bool useMeshOpt = false;
 
-    result.indices = indices;
-    result.vertices = vertices;
+    if (useMeshOpt) {
+        size_t index_count = vertices.size() / 3;
+        std::vector<uint32_t> remap(index_count);
+        size_t vertex_count = meshopt_generateVertexRemap(remap.data(), 0, index_count, vertices.data(), index_count, sizeof(Vertex));
+
+        result.vertices.resize(vertex_count);
+        result.indices.resize(index_count);
+
+        meshopt_remapVertexBuffer(result.vertices.data(), vertices.data(), index_count, sizeof(Vertex), remap.data());
+        meshopt_remapIndexBuffer(result.indices.data(), nullptr, index_count, remap.data());
+    } else {
+        std::vector<uint32_t> indices(vertices.size());
+        for (size_t i = 0; i < indices.size(); ++i)
+            indices[i] = static_cast<uint32_t>(i);
+
+        result.indices = indices;
+        result.vertices = vertices;
+
+    }
 
     return true;
 }

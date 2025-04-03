@@ -157,8 +157,8 @@ uint32_t getGraphicsFamilyIndex(VkPhysicalDevice physicalDevice)
 VkPhysicalDevice pickPhysicalDevice(VkPhysicalDevice *physicalDevices,
                                     uint32_t physicalDeviceCount)
 {
-    VkPhysicalDevice preferred = 0;
-    VkPhysicalDevice fallback = 0;
+    VkPhysicalDevice preferred = nullptr;
+    VkPhysicalDevice fallback = nullptr;
 
     const char *ngpu = getenv("NGPU");
 
@@ -219,7 +219,9 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         VK_KHR_16BIT_STORAGE_EXTENSION_NAME,
         VK_KHR_8BIT_STORAGE_EXTENSION_NAME,
+#ifdef __APPLE__
         "VK_KHR_portability_subset",
+#endif
         VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
         VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
     };
@@ -230,7 +232,9 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
     VkPhysicalDeviceFeatures2 features = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.features.multiDrawIndirect = true;
-    // features.features.pipelineStatisticsQuery = true;
+    #ifndef __APPLE__
+    features.features.pipelineStatisticsQuery = true;
+    #endif
     features.features.shaderInt16 = true;
     features.features.shaderInt64 = true;
     features.features.samplerAnisotropy = true;
@@ -243,12 +247,17 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
 
     VkPhysicalDeviceVulkan12Features features12 = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    // features12.drawIndirectCount = true;
+#ifndef __APPLE__
+    features12.drawIndirectCount = true;
+#endif
     features12.storageBuffer8BitAccess = true;
     features12.uniformAndStorageBuffer8BitAccess = true;
     features12.shaderFloat16 = true;
     features12.shaderInt8 = true;
-    // features12.samplerFilterMinmax = true;
+#ifndef __APPLE__
+    features12.samplerFilterMinmax = true;
+#endif
+
     features12.scalarBlockLayout = true;
 
     features12.descriptorIndexing = true;
@@ -300,7 +309,7 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
     }
 
     VkDevice device = nullptr;
-    VK_CHECK(vkCreateDevice(physicalDevice, &createInfo, 0, &device));
+    VK_CHECK(vkCreateDevice(physicalDevice, &createInfo, nullptr, &device));
 
     return device;
 }

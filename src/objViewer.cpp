@@ -5,6 +5,9 @@
 
 #include "objViewer.h"
 
+#include <cstring>
+#include <string>
+
 #include "buffer.h"
 #include "device.h"
 #include "resources.h"
@@ -55,8 +58,6 @@ void drawObject(char** argv, const char *path)
     int rc = glfwInit();
     assert(rc);
 
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-
     VkInstance instance = createInstance();
     assert(instance);
 
@@ -99,8 +100,9 @@ void drawObject(char** argv, const char *path)
     vkCmdEndRendering = vkCmdEndRenderingKHR;
     vkCmdPipelineBarrier2 = vkCmdPipelineBarrier2KHR;
 
+	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     GLFWwindow *window = glfwCreateWindow(1024, 768, "meshtrex", nullptr, nullptr);
-    assert(window);
+	assert(window);
 
     VkSurfaceKHR surface = createSurface(instance, window);
     assert(surface);
@@ -342,7 +344,7 @@ void drawObject(char** argv, const char *path)
 	if (debugCallback)
 		vkDestroyDebugReportCallbackEXT(instance, debugCallback, 0);
 
-    vkDestroyInstance(instance, 0);
+    vkDestroyInstance(instance, nullptr);
 
 	volkFinalize();
 }

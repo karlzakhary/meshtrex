@@ -31,8 +31,6 @@ void drawTriangle(char** argv)
     int rc = glfwInit();
     assert(rc);
 
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-
     VkInstance instance = createInstance();
     assert(instance);
 
@@ -76,6 +74,7 @@ void drawTriangle(char** argv)
     vkCmdPipelineBarrier2 = vkCmdPipelineBarrier2KHR;
 
     GLFWwindow *window = glfwCreateWindow(1024, 768, "meshtrex", nullptr, nullptr);
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     assert(window);
 
     VkSurfaceKHR surface = createSurface(instance, window);

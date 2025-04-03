@@ -1,6 +1,9 @@
 #include "common.h"
 
 #include "buffer.h"
+
+#include <cstring>
+
 #include "resources.h"
 
 void createBuffer(Buffer& result, VkDevice device, const VkPhysicalDeviceMemoryProperties& memoryProperties, size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags memoryFlags)
