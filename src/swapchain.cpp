@@ -12,10 +12,39 @@
 
 VkSurfaceKHR createSurface(VkInstance instance, GLFWwindow* window)
 {
-    // fallback to GLFW
-    VkSurfaceKHR surface = 0;
-    VK_CHECK(glfwCreateWindowSurface(instance, window, 0, &surface));
-    return surface;
+{
+	// Note: GLFW has a helper glfwCreateWindowSurface but we're going to do this the hard way to reduce our reliance on GLFW Vulkan specifics
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+	VkWin32SurfaceCreateInfoKHR createInfo = { VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
+	createInfo.hinstance = GetModuleHandle(0);
+	createInfo.hwnd = glfwGetWin32Window(window);
+
+	VkSurfaceKHR surface = 0;
+	VK_CHECK(vkCreateWin32SurfaceKHR(instance, &createInfo, 0, &surface));
+	return surface;
+#elif defined(VK_USE_PLATFORM_WAYLAND_KHR)
+	VkWaylandSurfaceCreateInfoKHR createInfo = { VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR };
+	createInfo.display = glfwGetWaylandDisplay();
+	createInfo.surface = glfwGetWaylandWindow(window);
+
+	VkSurfaceKHR surface = 0;
+	VK_CHECK(vkCreateWaylandSurfaceKHR(instance, &createInfo, 0, &surface));
+	return surface;
+#elif defined(VK_USE_PLATFORM_XLIB_KHR)
+	VkXlibSurfaceCreateInfoKHR createInfo = { VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR };
+	createInfo.dpy = glfwGetX11Display();
+	createInfo.window = glfwGetX11Window(window);
+
+	VkSurfaceKHR surface = 0;
+	VK_CHECK(vkCreateXlibSurfaceKHR(instance, &createInfo, 0, &surface));
+	return surface;
+#else
+	// fallback to GLFW
+	VkSurfaceKHR surface = 0;
+	VK_CHECK(glfwCreateWindowSurface(instance, window, 0, &surface));
+	return surface;
+#endif
+}
 }
 
 VkFormat getSwapchainFormat(VkPhysicalDevice physicalDevice, VkSurfaceKHR surface)
@@ -71,8 +100,8 @@ static VkSwapchainKHR createSwapchain(VkDevice device, VkSurfaceKHR surface, VkS
 	createInfo.presentMode = presentMode;
 	createInfo.oldSwapchain = oldSwapchain;
 
-	VkSwapchainKHR swapchain = 0;
-	VK_CHECK(vkCreateSwapchainKHR(device, &createInfo, 0, &swapchain));
+	VkSwapchainKHR swapchain = nullptr;
+	VK_CHECK(vkCreateSwapchainKHR(device, &createInfo, nullptr, &swapchain));
 
 	return swapchain;
 }
@@ -89,7 +118,7 @@ void createSwapchain(Swapchain& result, VkPhysicalDevice physicalDevice, VkDevic
 	assert(swapchain);
 
 	uint32_t imageCount = 0;
-	VK_CHECK(vkGetSwapchainImagesKHR(device, swapchain, &imageCount, 0));
+	VK_CHECK(vkGetSwapchainImagesKHR(device, swapchain, &imageCount, nullptr));
 
 	std::vector<VkImage> images(imageCount);
 	VK_CHECK(vkGetSwapchainImagesKHR(device, swapchain, &imageCount, images.data()));
