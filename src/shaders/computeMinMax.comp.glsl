@@ -30,10 +30,11 @@ void main() {
     uvec3 voxelCoord = groupID * pc.blockDim + localID;
 
     // Load and clamp
-    float value = 0.25 + gl_LocalInvocationIndex * 0.001;
-//    if (all(lessThan(voxelCoord, uvec3(pc.volumeDim)))) {
-//        value = imageLoad(volume, ivec3(voxelCoord)).r;
-//    }
+//    float value = float(gl_LocalInvocationIndex) / 512.0;
+    float value = 0;
+    if (all(lessThan(voxelCoord, uvec3(pc.volumeDim)))) {
+        value = imageLoad(volume, ivec3(voxelCoord)).r;
+    }
 
     // Store each thread's value in shared memory
     sharedMin[localIndex] = value;

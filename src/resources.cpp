@@ -53,7 +53,7 @@ VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,VkIm
     VkImageViewCreateInfo createInfo = {
         VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     createInfo.image = image;
-    createInfo.viewType = viewType == VK_IMAGE_VIEW_TYPE_2D ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_3D;
+    createInfo.viewType = viewType == VK_IMAGE_TYPE_2D ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_3D;
     createInfo.format = format;
     createInfo.subresourceRange.aspectMask = aspectMask;
     createInfo.subresourceRange.baseMipLevel = mipLevel;
