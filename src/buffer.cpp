@@ -95,8 +95,8 @@ void copy1DBufferTo3DImage(Buffer stagingBuffer,
 {
     VkBufferImageCopy copyRegion = {};
     copyRegion.bufferOffset = 0;
-    copyRegion.bufferRowLength = 0;     // tightly packed
-    copyRegion.bufferImageHeight = 0;
+    copyRegion.bufferRowLength = width;
+    copyRegion.bufferImageHeight = height;
 
     copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copyRegion.imageSubresource.mipLevel = 0;

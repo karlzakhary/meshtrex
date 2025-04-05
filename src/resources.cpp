@@ -44,8 +44,7 @@ void pipelineBarrier(VkCommandBuffer commandBuffer,
     vkCmdPipelineBarrier2(commandBuffer, &dependencyInfo);
 }
 
-VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,
-                            uint32_t mipLevel, uint32_t levelCount)
+VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,VkImageType viewType, uint32_t mipLevel, uint32_t levelCount)
 {
     VkImageAspectFlags aspectMask = (format == VK_FORMAT_D32_SFLOAT)
                                         ? VK_IMAGE_ASPECT_DEPTH_BIT
@@ -54,7 +53,7 @@ VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,
     VkImageViewCreateInfo createInfo = {
         VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     createInfo.image = image;
-    createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    createInfo.viewType = viewType == VK_IMAGE_VIEW_TYPE_2D ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_3D;
     createInfo.format = format;
     createInfo.subresourceRange.aspectMask = aspectMask;
     createInfo.subresourceRange.baseMipLevel = mipLevel;
@@ -107,7 +106,7 @@ void createImage(Image& result, VkDevice device,
     VK_CHECK(vkBindImageMemory(device, image, memory, 0));
 
     result.image = image;
-    result.imageView = createImageView(device, image, format, 0, mipLevels);
+    result.imageView = createImageView(device, image, format, imageType, 0, mipLevels);
     result.memory = memory;
 }
 

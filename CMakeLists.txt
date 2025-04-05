@@ -55,6 +55,12 @@ else()
     set(GLSL_VALIDATOR "glslangValidator")
 endif()
 
+if(APPLE)
+    set(SPIRV_VULKAN_TARGET_ENV "vulkan1.2")
+else()
+    set(SPIRV_VULKAN_TARGET_ENV "vulkan1.3")
+endif ()
+
 # Thanks to: https://gist.github.com/evilactually/a0d191701cb48f157b05be7f74d79396
 set(SPIRV_OUTPUT_DIR "${PROJECT_BINARY_DIR}/spirv/")
 foreach(GLSL ${GLSL_SOURCE_FILES})
@@ -63,7 +69,7 @@ foreach(GLSL ${GLSL_SOURCE_FILES})
     add_custom_command(
             OUTPUT ${SPIRV}
             COMMAND ${CMAKE_COMMAND} -E make_directory "${SPIRV_OUTPUT_DIR}"
-            COMMAND ${GLSL_VALIDATOR} -V --target-env vulkan1.2 --quiet ${GLSL} -o ${SPIRV}
+            COMMAND ${GLSL_VALIDATOR} -V --target-env "${SPIRV_VULKAN_TARGET_ENV}" --quiet ${GLSL} -o ${SPIRV}
             DEPENDS ${GLSL} ${GLSL_HEADER_FILES})
     list(APPEND SPIRV_BINARY_FILES ${SPIRV})
 endforeach()

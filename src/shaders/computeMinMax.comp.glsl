@@ -1,59 +1,60 @@
 #version 460
 
-#extension GL_EXT_shader_atomic_float2: require
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
-// Binding 0: input 3D volume (e.g., VK_FORMAT_R8_UNORM)
+// Binding 0: volume data (VK_FORMAT_R8_UNORM → normalized to [0,1])
 layout(binding = 0, r8) uniform readonly image3D volume;
 
-// Binding 1: output buffer, 1 vec2(min, max) per block
-layout(std430, binding = 1) buffer MinMaxBuffer {
+// Binding 1: output buffer storing vec2(min, max) per block
+layout(binding = 1, std430) buffer MinMaxBuffer {
     vec2 minMax[];
 };
 
-// Push constants for dimensions
+// Push constants
 layout(push_constant) uniform PushConstants {
-    ivec3 volumeDim;     // e.g. 256, 256, 225
-    ivec3 blockDim;      // e.g. 8, 8, 8
-    ivec3 blockGridDim;  // e.g. 32, 32, 29
+    ivec3 volumeDim;     // e.g. (256, 256, 225)
+    ivec3 blockDim;      // e.g. (8, 8, 8)
+    ivec3 blockGridDim;  // e.g. (32, 32, 29)
 } pc;
 
-// Shared memory for parallel reduction
-shared float s_min;
-shared float s_max;
+// Shared memory to store local thread values
+shared float sharedMin[512];  // 8x8x8 = 512 threads
+shared float sharedMax[512];
 
 void main() {
     uvec3 localID = gl_LocalInvocationID;
-    uvec3 blockID = gl_WorkGroupID;
+    uvec3 groupID = gl_WorkGroupID;
+    uint localIndex = gl_LocalInvocationIndex;
 
-    uvec3 blockOffset = blockID * pc.blockDim;
-    uvec3 voxelCoord = blockOffset + localID;
+    // Compute voxel coordinate
+    uvec3 voxelCoord = groupID * pc.blockDim + localID;
 
-    // Handle out-of-bound threads
-    if (any(greaterThanEqual(voxelCoord, uvec3(pc.volumeDim)))) {
-        return;
-    }
+    // Load and clamp
+    float value = 0.25 + gl_LocalInvocationIndex * 0.001;
+//    if (all(lessThan(voxelCoord, uvec3(pc.volumeDim)))) {
+//        value = imageLoad(volume, ivec3(voxelCoord)).r;
+//    }
 
-    float v = imageLoad(volume, ivec3(voxelCoord)).r;
-
-    // First thread initializes shared memory
-    if (gl_LocalInvocationIndex == 0) {
-        s_min = v;
-        s_max = v;
-    }
+    // Store each thread's value in shared memory
+    sharedMin[localIndex] = value;
+    sharedMax[localIndex] = value;
     memoryBarrierShared();
     barrier();
 
-    // Parallel min/max update
-    atomicMin(s_min, v);
-    atomicMax(s_max, v);
+    // Perform parallel reduction for min and max
+    for (uint offset = 256; offset > 0; offset >>= 1) {
+        if (localIndex < offset && (localIndex + offset) < 512) {
+            sharedMin[localIndex] = min(sharedMin[localIndex], sharedMin[localIndex + offset]);
+            sharedMax[localIndex] = max(sharedMax[localIndex], sharedMax[localIndex + offset]);
+        }
+        memoryBarrierShared();
+        barrier();
+    }
 
-    barrier();
-
-    // Write result
-    if (gl_LocalInvocationIndex == 0) {
-        uint flatBlockIndex = blockID.z * pc.blockGridDim.x * pc.blockGridDim.y +
-        blockID.y * pc.blockGridDim.x + blockID.x;
-        minMax[flatBlockIndex] = vec2(s_min, s_max);
+    // Thread 0 writes the final result
+    if (localIndex == 0) {
+        uint flatIndex = groupID.z * pc.blockGridDim.x * pc.blockGridDim.y +
+        groupID.y * pc.blockGridDim.x + groupID.x;
+        minMax[flatIndex] = vec2(sharedMin[0], sharedMax[0]);
     }
 }

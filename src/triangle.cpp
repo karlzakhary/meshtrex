@@ -159,7 +159,7 @@ void drawTriangle(char **argv)
                     vkDestroyImageView(device, swapchainImageViews[i], 0);
 
                 swapchainImageViews[i] = createImageView(
-                    device, swapchain.images[i], swapchainFormat, 0, 1);
+                    device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
             }
         }
 
