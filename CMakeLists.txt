@@ -78,3 +78,11 @@ add_custom_command(
         ${CMAKE_BINARY_DIR}/meshes
         COMMENT "Copying meshes folder to build directory"
 )
+
+add_custom_command(
+        TARGET meshtrex POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_SOURCE_DIR}/raw_volumes
+        ${CMAKE_BINARY_DIR}/raw_volumes
+        COMMENT "Copying meshes folder to build directory"
+)

@@ -1,10 +1,10 @@
 #include <iostream>
 
-#include "objViewer.h"
+#include "blockFiltering.h"
 
 int main(int argc, char **argv)
 {
-    drawObject(argv, "meshes/kitten.obj");
+    filterUnoccupiedBlocks(argv, "raw_volumes/aneurism_256x256x256_uint8.raw");
     std::cout << "Hello, World!" << std::endl;
     return 0;
 }

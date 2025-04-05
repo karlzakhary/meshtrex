@@ -89,6 +89,33 @@ void uploadBuffer(VkDevice device, VkCommandPool commandPool,
     VK_CHECK(vkDeviceWaitIdle(device));
 }
 
+void copy1DBufferTo3DImage(Buffer stagingBuffer,
+    VkCommandBuffer commandBuffer,VkImage volumeImage,
+    uint32_t width, uint32_t height, uint32_t depth)
+{
+    VkBufferImageCopy copyRegion = {};
+    copyRegion.bufferOffset = 0;
+    copyRegion.bufferRowLength = 0;     // tightly packed
+    copyRegion.bufferImageHeight = 0;
+
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.mipLevel = 0;
+    copyRegion.imageSubresource.baseArrayLayer = 0;
+    copyRegion.imageSubresource.layerCount = 1;
+
+    copyRegion.imageOffset = {0, 0, 0};
+    copyRegion.imageExtent = {width, height, depth};
+
+    vkCmdCopyBufferToImage(
+    commandBuffer,
+    stagingBuffer.buffer,
+    volumeImage,
+    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    1,
+    &copyRegion
+);
+}
+
 void destroyBuffer(const Buffer& buffer, VkDevice device)
 {
     vkDestroyBuffer(device, buffer.buffer, 0);

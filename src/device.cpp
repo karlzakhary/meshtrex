@@ -273,6 +273,16 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
     features13.synchronization2 = true;
     features13.maintenance4 = true;
 
+    VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT floatAtomicFeatures = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT
+    };
+    VkPhysicalDeviceFeatures2 features2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &floatAtomicFeatures
+    };
+
+    vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+    assert(floatAtomicFeatures.shaderBufferFloat32AtomicMinMax);
     // This will only be used if meshShadingSupported=true (see below)
     VkPhysicalDeviceMeshShaderFeaturesEXT featuresMesh = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};

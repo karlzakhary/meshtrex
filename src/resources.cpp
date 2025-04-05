@@ -69,14 +69,15 @@ VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,
 
 void createImage(Image& result, VkDevice device,
                  const VkPhysicalDeviceMemoryProperties& memoryProperties,
-                 uint32_t width, uint32_t height, uint32_t mipLevels,
+                 VkImageType imageType,
+                 uint32_t width, uint32_t height, uint32_t depth, uint32_t mipLevels,
                  VkFormat format, VkImageUsageFlags usage)
 {
     VkImageCreateInfo createInfo = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
 
-    createInfo.imageType = VK_IMAGE_TYPE_2D;
+    createInfo.imageType = imageType;
     createInfo.format = format;
-    createInfo.extent = {width, height, 1};
+    createInfo.extent = {width, height, depth};
     createInfo.mipLevels = mipLevels;
     createInfo.arrayLayers = 1;
     createInfo.samples = VK_SAMPLE_COUNT_1_BIT;
