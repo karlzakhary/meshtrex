@@ -1,61 +1,139 @@
-#version 460
+#version 450 // Minimum version for subgroup operations
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+// Required extensions for subgroup operations (check device support)
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require // For subgroupMin/Max (alternative)
+#extension GL_KHR_shader_subgroup_shuffle : require // For subgroupShuffleDown
 
-// Binding 0: volume data (VK_FORMAT_R8_UNORM → normalized to [0,1])
-layout(binding = 0, r8) uniform readonly image3D volume;
+// --- Configuration Constants ---
+// These should ideally be passed via specialization constants, UBOs, or push constants
+// for flexibility, but are defined here for direct translation.
 
-// Binding 1: output buffer storing vec2(min, max) per block
-layout(binding = 1, std430) buffer MinMaxBuffer {
+// Local workgroup size (matches CUDA block dimensions)
+#define BLOCK_DIM_X 8
+#define BLOCK_DIM_Y 8
+#define BLOCK_DIM_Z 8
+
+// Define the size of the scalar field volume (adjust to your data)
+// This should match the dimensions of the input image3D
+#define VOLUME_DIM_X 256
+#define VOLUME_DIM_Y 256
+#define VOLUME_DIM_Z 256
+
+// Define grid dimensions (number of workgroups) - needed for global index calculation
+// These would typically come from a UBO or push constants in a real app.
+// Example values if the volume is 256^3 and block is 8^3:
+#define GRID_DIM_X (VOLUME_DIM_X / BLOCK_DIM_X) // 32
+#define GRID_DIM_Y (VOLUME_DIM_Y / BLOCK_DIM_Y) // 32
+#define GRID_DIM_Z (VOLUME_DIM_Z / BLOCK_DIM_Z) // 32
+
+// --- Layout Definitions ---
+
+// Define the local workgroup size
+layout (local_size_x = BLOCK_DIM_X, local_size_y = BLOCK_DIM_Y, local_size_z = BLOCK_DIM_Z) in;
+
+// Input scalar field data using a 3D image texture
+// Format r8ui contains unsigned 8-bit integer data [0, 255].
+layout(binding = 0, r8ui) uniform readonly uimage3D volume; // Use r8ui for unsigned int access
+
+// Output min/max pairs for each block (using SSBO)
+// Stores normalized float values [0.0, 1.0] as vec2.
+layout(binding = 1, std430) buffer MinMaxBuffer { // Renamed buffer, uses vec2
     vec2 minMax[];
 };
 
-// Push constants
-layout(push_constant) uniform PushConstants {
-    ivec3 volumeDim;     // e.g. (256, 256, 225)
-    ivec3 blockDim;      // e.g. (8, 8, 8)
-    ivec3 blockGridDim;  // e.g. (32, 32, 29)
-} pc;
+// --- Shared Memory ---
+// Shared memory for intermediate min/max values per subgroup (warp).
+// Still uses uvec2 internally as calculations are based on uint input.
+const uint totalInvocations = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+// Allocate based on a minimum subgroup size of 32 (adjust if needed)
+shared uvec2 s_subgroupMinMax[totalInvocations / 32];
 
-// Shared memory to store local thread values
-shared float sharedMin[512];  // 8x8x8 = 512 threads
-shared float sharedMax[512];
 
 void main() {
-    uvec3 localID = gl_LocalInvocationID;
-    uvec3 groupID = gl_WorkGroupID;
-    uint localIndex = gl_LocalInvocationIndex;
+    // Calculate the 3D index of the current workgroup (block)
+    const uvec3 workGroupID = gl_WorkGroupID; // Equivalent to blockIdx
 
-    // Compute voxel coordinate
-    uvec3 voxelCoord = groupID * pc.blockDim + localID;
+    // Calculate the 1D global index for the output array
+    const uint globalBlockIdx = workGroupID.z * (GRID_DIM_X * GRID_DIM_Y) +
+    workGroupID.y * GRID_DIM_X +
+    workGroupID.x;
 
-    // Load and clamp
-//    float value = float(gl_LocalInvocationIndex) / 512.0;
-    float value = 0;
-    if (all(lessThan(voxelCoord, uvec3(pc.volumeDim)))) {
-        value = imageLoad(volume, ivec3(voxelCoord)).r;
+    // Calculate thread's local invocation ID within the workgroup
+    const uvec3 localInvocationID = gl_LocalInvocationID; // Equivalent to threadIdx
+    const uint localInvocationIndex = gl_LocalInvocationIndex; // 1D version of threadIdx
+
+    // Calculate subgroup ID and invocation ID within the subgroup
+    const uint subgroupId = gl_SubgroupID;
+    const uint subgroupInvocationId = gl_SubgroupInvocationID; // Equivalent to laneId
+
+    // Calculate the global 3D integer coordinates for imageLoad
+    const ivec3 imageCoord = ivec3(workGroupID * gl_WorkGroupSize + localInvocationID);
+
+    // Initialize min/max values for this invocation (using uint for r8ui)
+    uint invocationMin = 0xFFFFFFFFu; // UINT_MAX
+    uint invocationMax = 0u;          // UINT_MIN
+
+    // Check boundary conditions: ensure the coordinates are within the image dimensions
+    if (imageCoord.x < imageSize(volume).x &&
+    imageCoord.y < imageSize(volume).y &&
+    imageCoord.z < imageSize(volume).z) {
+
+        // Read the scalar value using imageLoad (fetches from r8ui format as uint)
+        const uint scalarValue = imageLoad(volume, imageCoord).x;
+
+        // Update invocation's local min/max
+        invocationMin = scalarValue;
+        invocationMax = scalarValue;
     }
 
-    // Store each thread's value in shared memory
-    sharedMin[localIndex] = value;
-    sharedMax[localIndex] = value;
-    memoryBarrierShared();
+    // --- Step 1: Subgroup-level reduction using subgroupShuffleDown ---
+    // Reduce uint values within the subgroup
+    for (uint offset = gl_SubgroupSize / 2; offset > 0; offset /= 2) {
+        uint downMin = subgroupShuffleDown(invocationMin, offset);
+        uint downMax = subgroupShuffleDown(invocationMax, offset);
+        invocationMin = min(invocationMin, downMin);
+        invocationMax = max(invocationMax, downMax);
+    }
+
+    // --- Step 2: Write partial results (subgroup min/max) to shared memory ---
+    if (subgroupInvocationId == 0) {
+        if (subgroupId < (totalInvocations / 32)) {
+            s_subgroupMinMax[subgroupId] = uvec2(invocationMin, invocationMax); // Store uvec2
+        }
+    }
+
+    // Synchronize all invocations within the workgroup
     barrier();
 
-    // Perform parallel reduction for min and max
-    for (uint offset = 256; offset > 0; offset >>= 1) {
-        if (localIndex < offset && (localIndex + offset) < 512) {
-            sharedMin[localIndex] = min(sharedMin[localIndex], sharedMin[localIndex + offset]);
-            sharedMax[localIndex] = max(sharedMax[localIndex], sharedMax[localIndex + offset]);
-        }
-        memoryBarrierShared();
-        barrier();
-    }
+    // --- Step 3: Final reduction using the first subgroup ---
+    if (subgroupId == 0) {
+        // Load the appropriate subgroup's min/max result (uvec2) from shared memory
+        uvec2 subgroupResult = uvec2(0xFFFFFFFFu, 0u); // Initialize safely for uint min/max
 
-    // Thread 0 writes the final result
-    if (localIndex == 0) {
-        uint flatIndex = groupID.z * pc.blockGridDim.x * pc.blockGridDim.y +
-        groupID.y * pc.blockGridDim.x + groupID.x;
-        minMax[flatIndex] = vec2(sharedMin[0], sharedMax[0]);
+        uint sharedMemIndex = subgroupInvocationId;
+        uint numSubgroups = totalInvocations / gl_SubgroupSize;
+        if(sharedMemIndex < numSubgroups && sharedMemIndex < (totalInvocations / 32) ) {
+            subgroupResult = s_subgroupMinMax[sharedMemIndex];
+        }
+
+        // Perform the final reduction *within the first subgroup*.
+        for (uint offset = gl_SubgroupSize / 2; offset > 0; offset /= 2) {
+            uint downMin = subgroupShuffleDown(subgroupResult.x, offset);
+            uint downMax = subgroupShuffleDown(subgroupResult.y, offset);
+            subgroupResult.x = min(subgroupResult.x, downMin);
+            subgroupResult.y = max(subgroupResult.y, downMax);
+        }
+
+        // --- Step 4: Normalize and Write final block result ---
+        // The first invocation of the first subgroup (subgroupInvocationId == 0)
+        // normalizes the uint min/max result and writes it to the output buffer.
+        if (subgroupInvocationId == 0) {
+            // Normalize the uint values [0, 255] to float [0.0, 1.0]
+            vec2 normalizedResult = vec2(subgroupResult) / 255.0f;
+
+            // Write the normalized vec2 result to the output buffer
+            minMax[globalBlockIdx] = normalizedResult;
+        }
     }
 }

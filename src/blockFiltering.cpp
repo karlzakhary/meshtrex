@@ -43,7 +43,12 @@ std::tuple<glm::uvec3, std::string, std::vector<uint8_t>> loadVolume(const char 
         static_cast<size_t>(volume_dims.x) * static_cast<size_t>(volume_dims.y) * static_cast<size_t>(volume_dims.z);
     std::vector<uint8_t> volume_data(volume_bytes, 0);
     std::ifstream fin(file.c_str(), std::ios::binary);
-    fin.read(reinterpret_cast<char*>(volume_data.data()), volume_data.size());
+    if (!fin) {
+        std::cerr << "Failed to open " << file << "\n";
+    }
+    if (!fin.read(reinterpret_cast<char *>(volume_data.data()), volume_bytes)) {
+        std::cerr << "Failed to read volume data\n";
+    }
     return std::make_tuple(volume_dims, volume_type, volume_data);
 }
 
@@ -196,6 +201,55 @@ void validateMinMaxBuffer(VkDevice device, VkPhysicalDeviceMemoryProperties memo
     destroyBuffer(readbackBuffer, device);
 }
 
+// Helper to read back a 3D volume image to CPU from GPU memory
+// Requires the image to be in VK_IMAGE_LAYOUT_GENERAL and of VK_FORMAT_R8_UNORM
+std::vector<uint8_t> downloadVolumeImage(VkDevice device, VkPhysicalDeviceMemoryProperties memoryProperties,
+                                         VkCommandPool commandPool, VkQueue queue,
+                                         VkImage volumeImage, VkExtent3D extent)
+{
+    VkDeviceSize volumeSize = extent.width * extent.height * extent.depth * sizeof(uint8_t);
+
+    // Create destination buffer (host visible)
+    Buffer readbackBuffer;
+    createBuffer(readbackBuffer, device, memoryProperties, volumeSize,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    // Create command buffer to copy image to buffer
+    VkCommandBuffer cmd = beginSingleTimeCommands(device, commandPool);
+
+    // Transition image to TRANSFER_SRC layout
+    transitionImage(cmd, volumeImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    VkBufferImageCopy copyRegion = {};
+    copyRegion.bufferOffset = 0;
+    copyRegion.bufferRowLength = extent.width;
+    copyRegion.bufferImageHeight = extent.height;
+
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.mipLevel = 0;
+    copyRegion.imageSubresource.baseArrayLayer = 0;
+    copyRegion.imageSubresource.layerCount = 1;
+
+    copyRegion.imageOffset = {0, 0, 0};
+    copyRegion.imageExtent = extent;
+
+    vkCmdCopyImageToBuffer(cmd, volumeImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           readbackBuffer.buffer, 1, &copyRegion);
+
+    // Transition back to GENERAL for continued use
+    transitionImage(cmd, volumeImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+
+    endSingleTimeCommands(device, commandPool, queue, cmd);
+
+    // Copy to std::vector
+    std::vector<uint8_t> result(volumeSize);
+    memcpy(result.data(), readbackBuffer.data, volumeSize);
+
+    destroyBuffer(readbackBuffer, device);
+    return result;
+}
+
 void filterUnoccupiedBlocks(char **argv, const char *path)
 {
     VK_CHECK(volkInitialize());
@@ -206,7 +260,9 @@ void filterUnoccupiedBlocks(char **argv, const char *path)
     else
         spath = spath.substr(0, pos + 1);
     spath += path;
-    auto [volume_dims, volume_type, volume_data] = loadVolume(spath.c_str());
+
+    glm::uvec3 volume_dims; std::string volume_type; std::vector<uint8_t> volume_data;
+    std::tie(volume_dims, volume_type, volume_data) = loadVolume(spath.c_str());
 
     int rc = glfwInit();
     assert(rc);
@@ -334,29 +390,24 @@ void filterUnoccupiedBlocks(char **argv, const char *path)
 
     uploadVolumeImage(commandBuffer, volImage.image, stagingBuffer, extent);
 
+
+    PushConstants pushConstants = {};
+    pushConstants.volumeDim = glm::ivec3(volume_dims.x, volume_dims.y, volume_dims.z);
+    pushConstants.blockDim = glm::ivec3(8, 8, 8);
+    pushConstants.blockGridDim = (pushConstants.volumeDim + pushConstants.blockDim - 1) / pushConstants.blockDim;
+
+    vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
+
     // Create output buffer for compute shader results
-    VkDeviceSize minMaxSize = (volume_dims.x / 16) * (volume_dims.y / 16) * (volume_dims.z / 16) * sizeof(glm::vec2);
+    int totalBlocks = pushConstants.blockGridDim.x * pushConstants.blockGridDim.y * pushConstants.blockGridDim.z;
+    VkDeviceSize minMaxSize = totalBlocks * sizeof(glm::vec2);
     Buffer minMaxBuffer;
     createBuffer(minMaxBuffer, device, memoryProperties,
                  minMaxSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-
-    endSingleTimeCommands(device, commandPool, queue, commandBuffer);
-
-    VK_CHECK(vkResetCommandPool(device, commandPool, 0));
-
-    commandBuffer = beginSingleTimeCommands(device, commandPool);
-
-    // Bind the compute pipeline and dispatch
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computeMinMaxPipeline);
-
-    PushConstants pushConstants = {};
-    pushConstants.volumeDim = glm::ivec3(volume_dims.x, volume_dims.y, volume_dims.z);
-    pushConstants.blockDim = glm::ivec3(16, 16, 16); // Example block size
-    pushConstants.blockGridDim = glm::ivec3((volume_dims.x + 15) / 16, (volume_dims.y + 15) / 16, (volume_dims.z + 15) / 16);
-
-    vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
+    // Bind the compute pipeline and dispatch
 
     VkDescriptorImageInfo imageInfo = {
         .sampler = VK_NULL_HANDLE,
@@ -388,25 +439,13 @@ void filterUnoccupiedBlocks(char **argv, const char *path)
 
     vkCmdDispatch(commandBuffer, pushConstants.blockGridDim.x, pushConstants.blockGridDim.y, pushConstants.blockGridDim.z);
 
-    VK_CHECK(vkEndCommandBuffer(commandBuffer));
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    VkSubmitInfo submitInfo = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        // .waitSemaphoreCount = 1,
-        // .pWaitSemaphores = &acquireSemaphore,
-        .pWaitDstStageMask = &waitStage,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &commandBuffer,
-        // .signalSemaphoreCount = 1,
-        // .pSignalSemaphores = &releaseSemaphore
-    };
+    endSingleTimeCommands(device, commandPool, queue, commandBuffer);
 
-    // VK_CHECK(vkWaitForFences(device, 1, &frameFence, VK_TRUE, UINT64_MAX));
-    VK_CHECK(vkResetFences(device, 1, &frameFence));
-    VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
+    VK_CHECK(vkResetCommandPool(device, commandPool, 0));
 
     VK_CHECK(vkDeviceWaitIdle(device));
     validateMinMaxBuffer(device, memoryProperties, commandPool, queue, minMaxBuffer, minMaxSize, pushConstants.blockGridDim);
+
     // Add to filterUnoccupiedBlocks function.
     std::cout << "Block Dim: " << pushConstants.blockDim.x << ", " << pushConstants.blockDim.y << ", " << pushConstants.blockDim.z << std::endl;
     std::cout << "Block Grid Dim: " << pushConstants.blockGridDim.x << ", " << pushConstants.blockGridDim.y << ", " << pushConstants.blockGridDim.z << std::endl;
