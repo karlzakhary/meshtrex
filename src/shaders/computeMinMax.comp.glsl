@@ -4,7 +4,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require // For subgroupMin/Max (alternative)
 #extension GL_KHR_shader_subgroup_shuffle : require // For subgroupShuffleDown
-
+#extension GL_KHR_shader_subgroup_shuffle_relative : require // Needed for subgroupShuffleDown/Up
 // --- Configuration Constants ---
 // These should ideally be passed via specialization constants, UBOs, or push constants
 // for flexibility, but are defined here for direct translation.

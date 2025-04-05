@@ -385,7 +385,7 @@ void filterUnoccupiedBlocks(char **argv, const char *path)
         memoryProperties,
         VK_IMAGE_TYPE_3D,
         volume_dims.x, volume_dims.y, volume_dims.z, 1,
-        VK_FORMAT_R8_UNORM,
+        VK_FORMAT_R8_UINT,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
     uploadVolumeImage(commandBuffer, volImage.image, stagingBuffer, extent);
