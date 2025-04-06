@@ -6,54 +6,40 @@
 #extension GL_KHR_shader_subgroup_shuffle : require // For basic subgroupShuffle
 #extension GL_KHR_shader_subgroup_shuffle_relative : require // Needed for subgroupShuffleDown/Up
 
-// --- Configuration Constants ---
-// Adjusted for typical Bonsai dataset (256^3) and 8^3 blocks.
-// Ideally, pass these dynamically via UBOs or Push Constants.
-
-// Local workgroup size (block dimension)
-
+// Push constants containing dimensions (matches C++ struct)
 layout(push_constant) uniform PushConstants {
-    uvec3 volumeDim;
-    uvec3 blockDim;
-    uvec3 blockGridDim;
+    uvec3 volumeDim;    // Actual dimensions of the input volume texture
+    uvec3 blockDim;     // Should match local_size (e.g., 8,8,8)
+    uvec3 blockGridDim; // Dimensions of the dispatch grid (and the output image)
 } pc;
-
-// Grid dimensions (number of workgroups for 256^3 volume / 8^3 blocks)
-#define GRID_DIM_X (pc.volumeDim.x / pc.blockDim.x) // 32
-#define GRID_DIM_Y (pc.volumeDim.y / pc.blockDim.y) // 32
-#define GRID_DIM_Z (pc.volumeDim.z / pc.blockDim.z) // 32
 
 // --- Layout Definitions ---
 
-// Define the local workgroup size
+// Define the local workgroup size (should match pc.blockDim)
 layout (local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
-// Input scalar field data using a 3D image texture
+// Binding 0: Input scalar field data using a 3D image texture
 // Assumes r8ui format for unsigned 8-bit integer data [0, 255].
 layout(binding = 0, r8ui) uniform readonly uimage3D volume;
 
-// Output min/max pairs for each block (using SSBO)
-// Stores raw unsigned integer min/max values [0, 255] as uvec2.
-layout(std430, binding = 1) writeonly buffer MinMaxBufferUint {
-    uvec2 blockMinMax[]; // Use uvec2 for unsigned int pairs
-};
+// Binding 1: Output min/max pairs using a 3D image texture
+// Format rg32ui stores two 32-bit unsigned integers (matching uvec2).
+// Dimensions match the block grid dimensions.
+layout(binding = 1, rg32ui) uniform writeonly uimage3D minMaxOutputVolume;
 
 // --- Shared Memory ---
 // Shared memory for intermediate min/max values per subgroup.
 // Uses uvec2 to store uint min/max values.
 const uint totalInvocations = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
 // Allocate based on a minimum subgroup size of 32 (adjust if needed for target hardware)
+// Ensure this allocation is sufficient for max subgroups per workgroup (totalInvocations / minSubgroupSize)
 shared uvec2 s_subgroupMinMax[totalInvocations / 32];
 
 
 void main() {
     // Calculate the 3D index of the current workgroup (block)
+    // This will be used as the coordinate to write the final result to the output image.
     const uvec3 workGroupID = gl_WorkGroupID;
-
-    // Calculate the 1D global index for the output array using adjusted GRID_DIM_*
-    const uint globalBlockIdx = workGroupID.z * (GRID_DIM_X * GRID_DIM_Y) +
-    workGroupID.y * GRID_DIM_X +
-    workGroupID.x;
 
     // Calculate thread's local invocation ID within the workgroup
     const uvec3 localInvocationID = gl_LocalInvocationID;
@@ -63,23 +49,20 @@ void main() {
     const uint subgroupId = gl_SubgroupID;
     const uint subgroupInvocationId = gl_SubgroupInvocationID;
 
-    // Calculate the global 3D integer coordinates for imageLoad
+    // Calculate the global 3D integer coordinates for reading the input volume
     // Use ivec3 for imageLoad coordinates
     const ivec3 imageCoord = ivec3(workGroupID * gl_WorkGroupSize + localInvocationID);
 
-    // Initialize min/max values for this invocation (using uint for r8ui)
+    // Initialize min/max values for this invocation (using uint for r8ui input)
     uint invocationMin = 0xFFFFFFFFu; // UINT_MAX
     uint invocationMax = 0u;          // UINT_MIN (0 for uint)
 
-    // Check boundary conditions using imageSize() for safety, though imageCoord
-    // calculation should be correct if dispatch dimensions match GRID_DIM_*
-    // Note: imageSize() returns int, cast imageCoord components if needed, but comparison works
+    // Check boundary conditions using volume dimensions from push constants
     if (imageCoord.x < imageSize(volume).x &&
     imageCoord.y < imageSize(volume).y &&
     imageCoord.z < imageSize(volume).z) {
 
         // Read the scalar value using imageLoad (fetches from r8ui format as uint)
-        // .x accesses the red channel, which holds the 8-bit value.
         const uint scalarValue = imageLoad(volume, imageCoord).x;
 
         // Update invocation's local min/max
@@ -133,12 +116,14 @@ void main() {
             subgroupResult.y = max(subgroupResult.y, downMax);
         }
 
-        // --- Step 4: Write final block result ---
+        // --- Step 4: Write final block result to Output Image ---
         // The first invocation of the first subgroup (subgroupInvocationId == 0)
-        // writes the final uint min/max pair for the workgroup (block) to the output buffer.
+        // writes the final uint min/max pair for the workgroup (block) to the output image.
         if (subgroupInvocationId == 0) {
-            // Write the raw uvec2 result (range typically 0-255 for bonsai)
-            blockMinMax[globalBlockIdx] = subgroupResult;
+            // Write the uvec2 result to the output image at the 3D coordinate
+            // corresponding to this workgroup's ID.
+            // imageStore requires ivec3 coordinates and uvec4 value for rg32ui format.
+            imageStore(minMaxOutputVolume, ivec3(workGroupID), uvec4(subgroupResult, 0, 0));
         }
     }
 }

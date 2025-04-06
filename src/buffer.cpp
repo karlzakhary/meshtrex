@@ -116,8 +116,33 @@ void copy1DBufferTo3DImage(Buffer stagingBuffer,
 );
 }
 
+void copy3DImageTo1DBuffer(Buffer readbackBuffer,
+    VkCommandBuffer cmd,VkImage volumeImage,
+    VkExtent3D extent)
+{
+    VkBufferImageCopy copyRegion = {};
+    copyRegion.bufferOffset = 0;
+    // Tightly packed buffer data assumed
+    copyRegion.bufferRowLength = 0; // Indicates tightly packed
+    copyRegion.bufferImageHeight = 0; // Indicates tightly packed
+
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.mipLevel = 0;
+    copyRegion.imageSubresource.baseArrayLayer = 0;
+    copyRegion.imageSubresource.layerCount = 1;
+
+    copyRegion.imageOffset = {0, 0, 0};
+    copyRegion.imageExtent = extent; // Use grid dimensions as image extent
+
+    // Execute copy
+    vkCmdCopyImageToBuffer(cmd, volumeImage,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           readbackBuffer.buffer, 1, &copyRegion);
+}
+
 void destroyBuffer(const Buffer& buffer, VkDevice device)
 {
+    vkUnmapMemory(device, buffer.memory);
     vkDestroyBuffer(device, buffer.buffer, 0);
     vkFreeMemory(device, buffer.memory, 0);
 }
