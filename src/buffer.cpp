@@ -44,7 +44,7 @@ void createBuffer(Buffer& result, VkDevice device,
 
     VK_CHECK(vkBindBufferMemory(device, buffer, memory, 0));
 
-    void *data = 0;
+    void *data = nullptr;
     if (memoryFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
         VK_CHECK(vkMapMemory(device, memory, 0, size, 0, &data));
 

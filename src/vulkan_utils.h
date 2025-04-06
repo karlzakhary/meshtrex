@@ -52,3 +52,40 @@ inline VkFence createFence(VkDevice device)
 
     return fence;
 }
+
+inline VkCommandBuffer beginSingleTimeCommands(VkDevice device, VkCommandPool commandPool) {
+    VkCommandBufferAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = commandPool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+
+    VkCommandBuffer commandBuffer;
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer));
+
+    VkCommandBufferBeginInfo beginInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
+
+    return commandBuffer;
+}
+
+// Helper to end and submit a single-use command buffer
+inline void endSingleTimeCommands(VkDevice device, VkCommandPool commandPool,
+                           VkQueue queue, VkCommandBuffer commandBuffer) {
+    VK_CHECK(vkEndCommandBuffer(commandBuffer));
+
+    VkSubmitInfo submitInfo = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &commandBuffer
+    };
+
+    VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(queue));
+
+    vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+}
