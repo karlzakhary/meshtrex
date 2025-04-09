@@ -244,7 +244,7 @@ uint32_t runOccupiedBlockFiltering(
 
     // --- Load Shader & Create Pipeline ---
     Shader filterCS{};
-    assert(loadShader(filterCS, device, argv[0], "spirv/occupiedBlockFiltering.comp.spv"));
+    assert(loadShader(filterCS, device, argv[0], "spirv/occupiedBlockPrefixSum.comp.spv"));
     VkPipeline computePipeline = createComputePipeline(device, nullptr, filterCS, pipelineLayout);
     std::cout << "Filtering pipeline created." << std::endl;
 

@@ -2,7 +2,6 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_ballot : require
-// Add other subgroup extensions if using different scan techniques (e.g., shuffle)
 
 // --- Push Constants / Uniforms ---
 // Assumes uint isovalue is passed for integer comparison
@@ -78,7 +77,6 @@ void main() {
     uint subgroupPrefixSum = subgroupExclusiveAdd(activeFlag);
     // Calculate total active count within this subgroup efficiently
     // subgroupAdd(activeFlag) sums across the subgroup.
-    // Alternatively, ballot+bitCount, or read last lane's inclusive scan result.
     uint subgroupTotal = subgroupAdd(activeFlag); // Total count for this subgroup
 
     // Stage 2: Store Subgroup Totals in Shared Memory
@@ -113,12 +111,12 @@ void main() {
             s_subgroupScanResult[gl_SubgroupInvocationID] = scanOfTotals;
         }
 
-        // The first thread (local index 0) calculates and stores the workgroup's total active count
+        // All threads in block 0 calculate and store the workgroup's total active count
+        uint workgroupTotal = subgroupAdd(totalToScan); // Total sum of subgroup totals
         if (gl_LocalInvocationIndex == 0) { // Equivalent to gl_SubgroupInvocationID == 0 here
             // Workgroup total = scan result for the last subgroup + total of the last subgroup
             uint lastSubgroupID = (gl_WorkGroupSize.x / gl_SubgroupSize) - 1;
             // Need the total count from the scan operation within subgroup 0
-            uint workgroupTotal = subgroupAdd(totalToScan); // Total sum of subgroup totals
             s_workgroupTotalActiveCount = workgroupTotal;
         }
     }
