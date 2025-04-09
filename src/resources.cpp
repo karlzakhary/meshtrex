@@ -27,6 +27,34 @@ VkImageMemoryBarrier2 imageBarrier(
     return result;
 }
 
+void transitionImage(VkCommandBuffer cmd, VkImage image,
+                     VkImageLayout oldLayout, VkImageLayout newLayout,
+                     VkPipelineStageFlags2 srcStageMask, VkAccessFlags2 srcAccessMask,
+                     VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask) {
+    VkImageMemoryBarrier2 barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcStageMask = srcStageMask;
+    barrier.srcAccessMask = srcAccessMask;
+    barrier.dstStageMask = dstStageMask;
+    barrier.dstAccessMask = dstAccessMask;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+
+    VkDependencyInfo depInfo = {
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier
+    };
+
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+}
+
 void pipelineBarrier(VkCommandBuffer commandBuffer,
                      VkDependencyFlags dependencyFlags,
                      size_t bufferBarrierCount,

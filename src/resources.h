@@ -34,6 +34,11 @@ void pipelineBarrier(VkCommandBuffer commandBuffer,
                      size_t imageBarrierCount,
                      const VkImageMemoryBarrier2 *imageBarriers);
 
+void transitionImage(VkCommandBuffer cmd, VkImage image,
+                     VkImageLayout oldLayout, VkImageLayout newLayout,
+                     VkPipelineStageFlags2 srcStageMask, VkAccessFlags2 srcAccessMask,
+                     VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask);
+
 VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,VkImageType viewType, uint32_t mipLevel, uint32_t levelCount);
 
 void createImage(Image& result, VkDevice device,

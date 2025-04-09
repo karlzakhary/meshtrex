@@ -5,4 +5,4 @@ struct MinMaxResult {
     uint32_t maxVal;
 };
 
-std::vector<MinMaxResult> filterUnoccupiedBlocks(char **argv, const char *path);
+int filterUnoccupiedBlocks(char **argv, const char *path);

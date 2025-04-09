@@ -8,9 +8,10 @@
 
 // Push constants containing dimensions (matches C++ struct)
 layout(push_constant) uniform PushConstants {
-    uvec3 volumeDim;    // Actual dimensions of the input volume texture
-    uvec3 blockDim;     // Should match local_size (e.g., 8,8,8)
-    uvec3 blockGridDim; // Dimensions of the dispatch grid (and the output image)
+    uvec4 volumeDim;    // Actual dimensions of the input volume texture
+    uvec4 blockDim;     // Should match local_size (e.g., 8,8,8)
+    uvec4 blockGridDim; // Dimensions of the dispatch grid (and the output image)
+    float isovalue;     // The target isovalue
 } pc;
 
 // --- Layout Definitions ---

@@ -138,28 +138,29 @@ inline std::vector<MinMaxResult> computeMinMaxFromFile(const std::string& filePa
     return results;  // Return vector of {uint8_t, uint8_t} structs
 }
 
-inline int compareMinMaxResults(
-    const std::vector<MinMaxResult>& gpuResults,
-    const std::vector<MinMaxResult>& cpuResults,
-    int maxErrorsToPrint = 10)
+inline int compareMinMaxResults(const std::vector<MinMaxResult>& gpuResults,
+                                const std::vector<MinMaxResult>& cpuResults,
+                                int maxErrorsToPrint = 10)
 {
     std::cout << "\nComparing GPU vs CPU results..." << std::endl;
 
     // 1. Check sizes
     if (gpuResults.size() != cpuResults.size()) {
         std::cerr << "Error: GPU result count (" << gpuResults.size()
-                  << ") does not match CPU result count (" << cpuResults.size() << ")." << std::endl;
-        return -1; // Indicate error
+                  << ") does not match CPU result count (" << cpuResults.size()
+                  << ")." << std::endl;
+        return -1;  // Indicate error
     }
 
     if (cpuResults.empty()) {
-        std::cout << "Result vectors are empty, nothing to compare." << std::endl;
-        return 0; // No errors found
+        std::cout << "Result vectors are empty, nothing to compare."
+                  << std::endl;
+        return 0;  // No errors found
     }
 
     int mismatchCount = 0;
     int errorsPrinted = 0;
-    size_t totalBlocks = cpuResults.size(); // Should match gpuResults.size()
+    size_t totalBlocks = cpuResults.size();  // Should match gpuResults.size()
 
     // 2. Compare element by element
     for (size_t i = 0; i < totalBlocks; ++i) {
@@ -171,38 +172,75 @@ inline int compareMinMaxResults(
             if (errorsPrinted < maxErrorsToPrint) {
                 // Calculate 3D block index from 1D index i
                 // Ensure gridDimX/Y are non-zero to avoid division by zero
-                int planeSize =  GRID_DIM_X * GRID_DIM_Y;
+                int planeSize = GRID_DIM_X * GRID_DIM_Y;
                 int bz = (planeSize > 0) ? (i / planeSize) : 0;
                 int remainder = (planeSize > 0) ? (i % planeSize) : i;
                 int by = (GRID_DIM_X > 0) ? (remainder / GRID_DIM_X) : 0;
-                int bx = (GRID_DIM_X > 0) ? (remainder % GRID_DIM_X) : remainder;
+                int bx =
+                    (GRID_DIM_X > 0) ? (remainder % GRID_DIM_X) : remainder;
 
-
-                std::cerr << "Mismatch found at Block [" << bx << ", " << by << ", " << bz << "] (Index " << i << "):" << std::endl;
+                std::cerr << "Mismatch found at Block [" << bx << ", " << by
+                          << ", " << bz << "] (Index " << i
+                          << "):" << std::endl;
                 if (!minMatch) {
-                    // Cast uint8_t to int for printing to avoid ASCII interpretation
-                    std::cerr << "  Min mismatch: GPU=" << static_cast<int>(gpuResults[i].minVal)
-                              << ", CPU=" << static_cast<int>(cpuResults[i].minVal) << std::endl;
+                    // Cast uint8_t to int for printing to avoid ASCII
+                    // interpretation
+                    std::cerr
+                        << "  Min mismatch: GPU="
+                        << static_cast<int>(gpuResults[i].minVal)
+                        << ", CPU=" << static_cast<int>(cpuResults[i].minVal)
+                        << std::endl;
                 }
                 if (!maxMatch) {
-                     // Cast uint8_t to int for printing
-                     std::cerr << "  Max mismatch: GPU=" << static_cast<int>(gpuResults[i].maxVal)
-                               << ", CPU=" << static_cast<int>(cpuResults[i].maxVal) << std::endl;
+                    // Cast uint8_t to int for printing
+                    std::cerr
+                        << "  Max mismatch: GPU="
+                        << static_cast<int>(gpuResults[i].maxVal)
+                        << ", CPU=" << static_cast<int>(cpuResults[i].maxVal)
+                        << std::endl;
                 }
                 errorsPrinted++;
             } else if (errorsPrinted == maxErrorsToPrint) {
-                 std::cerr << "... (further mismatch details suppressed)" << std::endl;
-                 errorsPrinted++; // Prevent printing this message again
+                std::cerr << "... (further mismatch details suppressed)"
+                          << std::endl;
+                errorsPrinted++;  // Prevent printing this message again
             }
         }
     }
 
     // 3. Report results
     if (mismatchCount == 0) {
-        std::cout << "Success: All " << totalBlocks << " block results match!" << std::endl;
+        std::cout << "Success: All " << totalBlocks << " block results match!"
+                  << std::endl;
     } else {
-        std::cout << "Comparison finished: Found " << mismatchCount << " mismatches out of " << totalBlocks << " blocks." << std::endl;
+        std::cout << "Comparison finished: Found " << mismatchCount
+                  << " mismatches out of " << totalBlocks << " blocks."
+                  << std::endl;
     }
 
     return mismatchCount;
+}
+
+inline uint32_t computeActiveBlockCountCPU(const std::vector<MinMaxResult>& minMaxResults, float isovalue) {
+    std::cout << "\nCPU: Calculating active block count for isovalue " << isovalue << "..." << std::endl;
+    uint32_t activeCount = 0;
+    for (const auto& result : minMaxResults) {
+        // Apply the EXACT SAME logic as the filtering shader
+        bool blockIsActive = false;
+        // Check if min and max are different to avoid trivial blocks (matches shader)
+        if (result.minVal != result.maxVal) {
+            // Check if isovalue is within the range [min, max]
+            // Cast uint32_t min/max (which hold 0-255 range) to float for comparison
+            blockIsActive = (isovalue >= static_cast<float>(result.minVal) &&
+                             isovalue <= static_cast<float>(result.maxVal));
+        }
+        // If you used the simpler check in the shader, use it here too:
+        // blockIsActive = (isovalue >= static_cast<float>(result.minVal) && isovalue <= static_cast<float>(result.maxVal));
+
+        if (blockIsActive) {
+            activeCount++;
+        }
+    }
+    std::cout << "CPU: Active block count calculation finished. Found: " << activeCount << std::endl;
+    return activeCount;
 }
