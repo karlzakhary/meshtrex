@@ -7,7 +7,7 @@
 
 int main(int argc, char* argv[]) {
     // Compute Min/Max for all blocks by calling the single function
-    std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("../cmake-build-debug/raw_volumes/aneurism_256x256x256_uint8.raw");
+    std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("../cmake-build-debug/raw_volumes/bonsai_256x256x256_uint8.raw");
 
     // std::vector<MinMaxResult> gpudata = filterUnoccupiedBlocks(
     //     argv, "raw_volumes/aneurism_256x256x256_uint8.raw");
@@ -23,7 +23,7 @@ int main(int argc, char* argv[]) {
     //     minMaxImage, pushData, compactedBlockIdBuffer, activeBlockCountBuffer
     // );
     uint32_t gpuActiveCount = filterUnoccupiedBlocks(
-        argv, "raw_volumes/aneurism_256x256x256_uint8.raw"); // Placeholder - replace with actual GPU result
+        argv, "raw_volumes/bonsai_256x256x256_uint8.raw"); // Placeholder - replace with actual GPU result
     std::cout << "\nGPU: Occupied Block Filtering finished. Active blocks found: " << gpuActiveCount << " (Placeholder)" << std::endl;
 
 
