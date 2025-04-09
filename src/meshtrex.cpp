@@ -1,11 +1,13 @@
 #include <vector>
-
+#ifndef __APPLE__
+#include <cstdint>
+#endif
 #include "blockFiltering.h"
 #include "testMinMax.h"
 
 int main(int argc, char* argv[]) {
     // Compute Min/Max for all blocks by calling the single function
-    std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("/Users/kzy/tum/thesis/meshtrex/cmake-build-debug/raw_volumes/aneurism_256x256x256_uint8.raw");
+    std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("../cmake-build-debug/raw_volumes/aneurism_256x256x256_uint8.raw");
 
     // std::vector<MinMaxResult> gpudata = filterUnoccupiedBlocks(
     //     argv, "raw_volumes/aneurism_256x256x256_uint8.raw");

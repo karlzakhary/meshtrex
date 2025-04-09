@@ -699,9 +699,9 @@ int filterUnoccupiedBlocks(char **argv, const char *path)
 
     // Push constants
     PushConstants pushConstants = {};
-    pushConstants.volumeDim    = glm::uvec4(volume.volume_dims, 0); // Pad W with 0
-    pushConstants.blockDim     = glm::uvec4(8, 8, 8, 0);      // Pad W with 0
-    pushConstants.blockGridDim = glm::uvec4(glm::uvec3((pushConstants.volumeDim + pushConstants.blockDim - 1u) / pushConstants.blockDim), 0);       // Pad W with 0
+    pushConstants.volumeDim    = glm::uvec4(volume.volume_dims, 1); // Pad W with 0
+    pushConstants.blockDim     = glm::uvec4(8, 8, 8, 1);      // Pad W with 0
+    pushConstants.blockGridDim = glm::uvec4(glm::uvec3((pushConstants.volumeDim + pushConstants.blockDim - 1u) / pushConstants.blockDim), 1);       // Pad W with 0
     pushConstants.isovalue     = 60;
 
     // --- Prepare Buffers and Images ---
