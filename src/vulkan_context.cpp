@@ -34,10 +34,6 @@ VulkanContext::VulkanContext(bool requestMeshShading)
         throw std::runtime_error("Failed to initialize Volk");
     }
 
-    vkCmdBeginRendering = vkCmdBeginRenderingKHR;
-    vkCmdEndRendering = vkCmdEndRenderingKHR;
-    vkCmdPipelineBarrier2 = vkCmdPipelineBarrier2KHR;
-
     // --- 2. Create Instance (using external function) ---
     instance_ = createInstance(); // Calls function from device.cpp
     if (!instance_) {
@@ -89,6 +85,10 @@ VulkanContext::VulkanContext(bool requestMeshShading)
         throw std::runtime_error("Failed to create logical device (check device.cpp logs)");
     }
     volkLoadDevice(device_);
+
+    vkCmdBeginRendering = vkCmdBeginRenderingKHR;
+    vkCmdEndRendering = vkCmdEndRenderingKHR;
+    vkCmdPipelineBarrier2 = vkCmdPipelineBarrier2KHR;
 
     // --- 7. Get Device Queue ---
     vkGetDeviceQueue(device_, graphicsFamilyIndex_, 0, &queue_);
