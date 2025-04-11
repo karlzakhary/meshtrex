@@ -1,23 +1,10 @@
 #pragma once
 
-struct Image {
-    VkImage image;
-    VkImageView imageView;
-    VkDeviceMemory memory;
-};
-
-static uint32_t selectMemoryType(
-    const VkPhysicalDeviceMemoryProperties& memoryProperties,
-    uint32_t memoryTypeBits, VkMemoryPropertyFlags flags)
-{
-    for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i)
-        if ((memoryTypeBits & (1 << i)) != 0 &&
-            (memoryProperties.memoryTypes[i].propertyFlags & flags) == flags)
-            return i;
-
-    assert(!"No compatible memory type found");
-    return ~0u;
-}
+VkBufferMemoryBarrier2 bufferBarrier(
+    VkBuffer buffer,
+    VkPipelineStageFlags2 srcStageMask, VkAccessFlags2 srcAccessMask,
+    VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask,
+    VkDeviceSize offset, VkDeviceSize size);
 
 VkImageMemoryBarrier2 imageBarrier(
     VkImage image, VkPipelineStageFlags2 srcStageMask,
@@ -38,12 +25,3 @@ void transitionImage(VkCommandBuffer cmd, VkImage image,
                      VkImageLayout oldLayout, VkImageLayout newLayout,
                      VkPipelineStageFlags2 srcStageMask, VkAccessFlags2 srcAccessMask,
                      VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask);
-
-VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,VkImageType viewType, uint32_t mipLevel, uint32_t levelCount);
-
-void createImage(Image& result, VkDevice device,
-                 const VkPhysicalDeviceMemoryProperties& memoryProperties,
-                 VkImageType imageType,
-                 uint32_t width, uint32_t height, uint32_t depth, uint32_t mipLevels,
-                 VkFormat format, VkImageUsageFlags usage);
-void destroyImage(const Image& image, VkDevice device);

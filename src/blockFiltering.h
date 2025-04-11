@@ -5,4 +5,4 @@ struct MinMaxResult {
     uint32_t maxVal;
 };
 
-int filterUnoccupiedBlocks(char **argv, const char *path);
+uint32_t filterUnoccupiedBlocks(char **argv, const char *path);

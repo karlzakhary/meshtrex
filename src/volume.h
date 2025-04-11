@@ -6,8 +6,24 @@ struct Volume {
     std::vector<uint8_t> volume_data;
 };
 
-Volume loadVolume(const char *path)
+struct alignas(16) PushConstants {
+    glm::uvec4 volumeDim;    // Offset 0, Size 16. Shader uses .xyz
+    glm::uvec4 blockDim;     // Offset 16, Size 16. Shader uses .xyz
+    glm::uvec4 blockGridDim; // Offset 32, Size 16. Shader uses .xyz
+    float      isovalue;     // Offset 48, Size 4.
+};
+
+
+inline Volume loadVolume(char **argv, const char *path)
 {
+    std::string spath = argv[0];
+    std::string::size_type pos = spath.find_last_of("/\\");
+    if (pos == std::string::npos)
+        spath = "";
+    else
+        spath = spath.substr(0, pos + 1);
+    spath += path;
+
     Volume volume = {};
     const std::string file = path;
     //const float isovalue = std::stof(argv[2]);

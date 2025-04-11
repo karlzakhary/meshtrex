@@ -4,7 +4,7 @@
 
 #include <cstring>
 
-#include "resources.h"
+#include "vulkan_utils.h"
 
 void createBuffer(Buffer& result, VkDevice device,
                   const VkPhysicalDeviceMemoryProperties& memoryProperties,
@@ -39,7 +39,7 @@ void createBuffer(Buffer& result, VkDevice device,
         flagInfo.deviceMask = 1;
     }
 
-    VkDeviceMemory memory = 0;
+    VkDeviceMemory memory = nullptr;
     VK_CHECK(vkAllocateMemory(device, &allocateInfo, 0, &memory));
 
     VK_CHECK(vkBindBufferMemory(device, buffer, memory, 0));
@@ -142,9 +142,19 @@ void copy3DImageTo1DBuffer(Buffer readbackBuffer,
 
 void destroyBuffer(const Buffer& buffer, VkDevice device)
 {
-    vkUnmapMemory(device, buffer.memory);
-    vkDestroyBuffer(device, buffer.buffer, 0);
-    vkFreeMemory(device, buffer.memory, 0);
+    // Only unmap if memory was previously mapped (data pointer is not null)
+    if (buffer.data != nullptr) {
+        vkUnmapMemory(device, buffer.memory);
+        // Optional: Set buffer.data = nullptr; if the Buffer object might live on
+    }
+
+    // Always destroy buffer and free memory if they were allocated
+    if (buffer.buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device, buffer.buffer, 0);
+    }
+    if (buffer.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, buffer.memory, 0);
+    }
 }
 
 VkDeviceAddress getBufferAddress(const Buffer& buffer, VkDevice device)

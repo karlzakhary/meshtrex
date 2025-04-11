@@ -89,3 +89,38 @@ inline void endSingleTimeCommands(VkDevice device, VkCommandPool commandPool,
 
     vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
 }
+
+static uint32_t selectMemoryType(
+    const VkPhysicalDeviceMemoryProperties& memoryProperties,
+    uint32_t memoryTypeBits, VkMemoryPropertyFlags flags)
+{
+    for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i)
+        if ((memoryTypeBits & (1 << i)) != 0 &&
+            (memoryProperties.memoryTypes[i].propertyFlags & flags) == flags)
+            return i;
+
+    assert(!"No compatible memory type found");
+    return ~0u;
+}
+
+inline VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,VkImageType viewType, uint32_t mipLevel, uint32_t levelCount)
+{
+    VkImageAspectFlags aspectMask = (format == VK_FORMAT_D32_SFLOAT)
+                                        ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                        : VK_IMAGE_ASPECT_COLOR_BIT;
+
+    VkImageViewCreateInfo createInfo = {
+        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    createInfo.image = image;
+    createInfo.viewType = viewType == VK_IMAGE_TYPE_2D ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_3D;
+    createInfo.format = format;
+    createInfo.subresourceRange.aspectMask = aspectMask;
+    createInfo.subresourceRange.baseMipLevel = mipLevel;
+    createInfo.subresourceRange.levelCount = levelCount;
+    createInfo.subresourceRange.layerCount = 1;
+
+    VkImageView view = 0;
+    VK_CHECK(vkCreateImageView(device, &createInfo, 0, &view));
+
+    return view;
+}

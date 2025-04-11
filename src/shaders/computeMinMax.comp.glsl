@@ -1,6 +1,5 @@
-#version 450 // Minimum version for subgroup operations
+#version 450
 
-// Required extensions for subgroup operations (check device support)
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require // For subgroupMin/Max (alternative)
 #extension GL_KHR_shader_subgroup_shuffle : require // For basic subgroupShuffle
@@ -74,7 +73,7 @@ void main() {
 
 
     // --- Step 1: Subgroup-level reduction using subgroupShuffleDown ---
-    // Reduce uint values within the subgroup. Requires GL_KHR_shader_subgroup_shuffle_relative.
+    // Reduce uint values within the subgroup.
     for (uint offset = gl_SubgroupSize / 2; offset > 0; offset /= 2) {
         uint downMin = subgroupShuffleDown(invocationMin, offset);
         uint downMax = subgroupShuffleDown(invocationMax, offset);
