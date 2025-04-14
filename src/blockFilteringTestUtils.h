@@ -129,10 +129,7 @@ inline std::vector<MinMaxResult> mapTestResultBuffer(VkDevice device, VkPhysical
  */
 inline bool testMinMaxReadback(
     char** argv,
-    VkDevice device,
-    VkQueue computeQueue,
-    VkCommandPool commandPool,
-    VkPhysicalDeviceMemoryProperties memoryProperties,
+    VulkanContext &context,
     const Image& minMaxImage,
     const PushConstants& pushData) // Only blockGridDim is strictly needed here
 {
@@ -152,7 +149,7 @@ inline bool testMinMaxReadback(
         VkDeviceSize outputBufferSize = totalBlocks * sizeof(MinMaxResult); // uvec2 size
 
         // --- Create Test Output Buffer ---
-        createBuffer(testOutputBuffer, device, memoryProperties, outputBufferSize,
+        createBuffer(testOutputBuffer, context.getDevice(), context.getMemoryProperties(), outputBufferSize,
                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, // Shader writes, we read back
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
@@ -171,7 +168,7 @@ inline bool testMinMaxReadback(
         layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
         layoutInfo.bindingCount = 2;
         layoutInfo.pBindings = bindings;
-        VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &testSetLayout));
+        VK_CHECK(vkCreateDescriptorSetLayout(context.getDevice(), &layoutInfo, nullptr, &testSetLayout));
 
         VkPushConstantRange pcRange = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants)};
         VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -179,17 +176,17 @@ inline bool testMinMaxReadback(
         pipelineLayoutCreateInfo.pSetLayouts = &testSetLayout;
         pipelineLayoutCreateInfo.pushConstantRangeCount = 1;
         pipelineLayoutCreateInfo.pPushConstantRanges = &pcRange;
-        VK_CHECK(vkCreatePipelineLayout(device, &pipelineLayoutCreateInfo, nullptr, &testPipelineLayout));
+        VK_CHECK(vkCreatePipelineLayout(context.getDevice(), &pipelineLayoutCreateInfo, nullptr, &testPipelineLayout));
 
         // --- Load Test Shader & Create Test Pipeline ---
         // Ensure TestMinMaxRead.comp is compiled to SPIR-V
-        assert(loadShader(testCS, device, /* path_prefix? */ argv[0], "spirv/testReadingMinMax.comp.spv"));
-        testPipeline = createComputePipeline(device, nullptr, testCS, testPipelineLayout);
+        assert(loadShader(testCS, context.getDevice(), argv[0], "spirv/testReadingMinMax.comp.spv"));
+        testPipeline = createComputePipeline(context.getDevice(), nullptr, testCS, testPipelineLayout);
         assert(testPipeline != VK_NULL_HANDLE);
         std::cout << "Test pipeline created." << std::endl;
 
         // --- Dispatch Test Shader ---
-        VkCommandBuffer cmd = beginSingleTimeCommands(device, commandPool);
+        VkCommandBuffer cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, testPipeline);
 
@@ -278,20 +275,20 @@ inline bool testMinMaxReadback(
             0,
             {}
         );
-        endSingleTimeCommands(device, commandPool, computeQueue, cmd);
-        VK_CHECK(vkDeviceWaitIdle(device)); // Wait for test shader to finish
+        endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
+        VK_CHECK(vkDeviceWaitIdle(context.getDevice())); // Wait for test shader to finish
         std::cout << "Test shader dispatched and finished." << std::endl;
-        vkResetCommandPool(device, commandPool, 0);
+        vkResetCommandPool(context.getDevice(), context.getCommandPool(), 0);
         // 2. Read back results directly from the minMaxImage (using existing function)
         std::vector<MinMaxResult> directImageResults = mapMinMaxImage(
-            device, memoryProperties, commandPool, computeQueue,
+            context.getDevice(), context.getMemoryProperties(), context.getCommandPool(), context.getQueue(),
             minMaxImage, gridExtent, outputBufferSize // outputBufferSize is same as minMaxTotalBytes
         );
 
         // --- Verification ---
         // 1. Read back results from the test shader's output buffer
         std::vector<MinMaxResult> testShaderResults = mapTestResultBuffer(
-            device, memoryProperties, commandPool, computeQueue,
+            context.getDevice(), context.getMemoryProperties(), context.getCommandPool(), context.getQueue(),
             testOutputBuffer, outputBufferSize, totalBlocks
         );
 
@@ -336,12 +333,12 @@ inline bool testMinMaxReadback(
     }
 
     // --- Cleanup Test Resources ---
-    if (device) {
-        if (testPipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, testPipeline, nullptr);
-        if (testPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, testPipelineLayout, nullptr);
-        if (testSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, testSetLayout, nullptr);
-        if (testCS.module != VK_NULL_HANDLE) vkDestroyShaderModule(device, testCS.module, nullptr);
-        destroyBuffer(testOutputBuffer, device); // Destroy the buffer created in this function
+    if (context.getDevice()) {
+        if (testPipeline != VK_NULL_HANDLE) vkDestroyPipeline(context.getDevice(), testPipeline, nullptr);
+        if (testPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(context.getDevice(), testPipelineLayout, nullptr);
+        if (testSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(context.getDevice(), testSetLayout, nullptr);
+        if (testCS.module != VK_NULL_HANDLE) vkDestroyShaderModule(context.getDevice(), testCS.module, nullptr);
+        destroyBuffer(testOutputBuffer, context.getDevice()); // Destroy the buffer created in this function
     }
      std::cout << "--- Finished MinMax Image Read Test ---" << std::endl;
     return success;

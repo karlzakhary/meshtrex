@@ -110,14 +110,15 @@ void main() {
         if (gl_SubgroupInvocationID < MAX_SUBGROUPS) {
             s_subgroupScanResult[gl_SubgroupInvocationID] = scanOfTotals;
         }
-
+        memoryBarrierShared(); // Ensure shared memory writes are visible
+        barrier();             // Synchronize workgroup execution
         // All threads in block 0 calculate and store the workgroup's total active count
         uint workgroupTotal = subgroupAdd(totalToScan); // Total sum of subgroup totals
-        if (gl_LocalInvocationIndex == 0) { // Equivalent to gl_SubgroupInvocationID == 0 here
+        if (gl_SubgroupInvocationID == 0 && gl_SubgroupID == 0) { // Equivalent to gl_SubgroupInvocationID == 0 here
             // Workgroup total = scan result for the last subgroup + total of the last subgroup
             uint lastSubgroupID = (gl_WorkGroupSize.x / gl_SubgroupSize) - 1;
             // Need the total count from the scan operation within subgroup 0
-            s_workgroupTotalActiveCount = workgroupTotal;
+            s_workgroupTotalActiveCount = subgroupBroadcastFirst(workgroupTotal);
         }
     }
 

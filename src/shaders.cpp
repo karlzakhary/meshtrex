@@ -2,7 +2,7 @@
 
 #include "shaders.h"
 
-#include <stdio.h>
+#include <cstdio>
 
 #include <string>
 #include <vector>
@@ -276,7 +276,7 @@ static VkDescriptorSetLayout createSetLayout(VkDevice device, Shaders shaders)
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     setCreateInfo.flags =
         VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-    setCreateInfo.bindingCount = uint32_t(setBindings.size());
+    setCreateInfo.bindingCount = static_cast<uint32_t>(setBindings.size());
     setCreateInfo.pBindings = setBindings.data();
 
     VkDescriptorSetLayout setLayout = 0;
@@ -302,7 +302,7 @@ static VkPipelineLayout createPipelineLayout(
 
     if (pushConstantSize) {
         pushConstantRange.stageFlags = pushConstantStages;
-        pushConstantRange.size = uint32_t(pushConstantSize);
+        pushConstantRange.size = static_cast<uint32_t>(pushConstantSize);
 
         createInfo.pushConstantRangeCount = 1;
         createInfo.pPushConstantRanges = &pushConstantRange;
@@ -378,7 +378,7 @@ bool loadShader(Shader& shader, VkDevice device, const char *base,
     assert(buffer);
 
     size_t rc = fread(buffer, 1, length, file);
-    assert(rc == size_t(length));
+    assert(rc == static_cast<size_t>(length));
     fclose(file);
 
     VkShaderModuleCreateInfo createInfo = {
@@ -386,8 +386,8 @@ bool loadShader(Shader& shader, VkDevice device, const char *base,
     createInfo.codeSize = length;  // note: this needs to be a number of bytes!
     createInfo.pCode = reinterpret_cast<const uint32_t *>(buffer);
 
-    VkShaderModule shaderModule = 0;
-    VK_CHECK(vkCreateShaderModule(device, &createInfo, 0, &shaderModule));
+    VkShaderModule shaderModule = nullptr;
+    VK_CHECK(vkCreateShaderModule(device, &createInfo, nullptr, &shaderModule));
 
     assert(length % 4 == 0);
     parseShader(shader, reinterpret_cast<const uint32_t *>(buffer), length / 4);
@@ -403,10 +403,10 @@ static VkSpecializationInfo fillSpecializationInfo(
     std::vector<VkSpecializationMapEntry>& entries, const Constants& constants)
 {
     for (size_t i = 0; i < constants.size(); ++i)
-        entries.push_back({uint32_t(i), uint32_t(i * 4), 4});
+        entries.push_back({static_cast<uint32_t>(i), static_cast<uint32_t>(i * 4), 4});
 
     VkSpecializationInfo result = {};
-    result.mapEntryCount = uint32_t(entries.size());
+    result.mapEntryCount = static_cast<uint32_t>(entries.size());
     result.pMapEntries = entries.data();
     result.dataSize = constants.size() * sizeof(int);
     result.pData = constants.begin();
@@ -583,7 +583,7 @@ VkDescriptorSetLayout createDescriptorArrayLayout(VkDevice device)
     VkShaderStageFlags stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutBinding setBinding = {
         0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, DESCRIPTOR_LIMIT,
-        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        stageFlags, nullptr};
 
     VkDescriptorBindingFlags bindingFlags =
         VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
@@ -602,9 +602,9 @@ VkDescriptorSetLayout createDescriptorArrayLayout(VkDevice device)
     setCreateInfo.bindingCount = 1;
     setCreateInfo.pBindings = &setBinding;
 
-    VkDescriptorSetLayout setLayout = 0;
+    VkDescriptorSetLayout setLayout = nullptr;
     VK_CHECK(
-        vkCreateDescriptorSetLayout(device, &setCreateInfo, 0, &setLayout));
+        vkCreateDescriptorSetLayout(device, &setCreateInfo, nullptr, &setLayout));
 
     return setLayout;
 }
@@ -636,7 +636,7 @@ std::pair<VkDescriptorPool, VkDescriptorSet> createDescriptorArray(
     setAllocateInfo.descriptorSetCount = 1;
     setAllocateInfo.pSetLayouts = &layout;
 
-    VkDescriptorSet set = 0;
+    VkDescriptorSet set = nullptr;
     VK_CHECK(vkAllocateDescriptorSets(device, &setAllocateInfo, &set));
 
     return std::make_pair(pool, set);

@@ -1,3 +1,5 @@
+#pragma once
+
 #include <cmath>      // For std::ceil
 #include <cstdint>    // For uint8_t
 #include <fstream>    // For file operations
@@ -6,6 +8,7 @@
 #include <stdexcept>  // For exceptions
 
 #include "blockFiltering.h"
+#include "glm/vec3.hpp"
 
 /**
  * @brief Reads a raw uint8 volume file and computes the min/max value for each block.
