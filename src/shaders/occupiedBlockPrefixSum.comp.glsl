@@ -4,7 +4,6 @@
 #extension GL_KHR_shader_subgroup_ballot : require
 
 // --- Push Constants / Uniforms ---
-// Assumes uint isovalue is passed for integer comparison
 layout(push_constant) uniform PushConstants {
     uvec4 volumeDim;
     uvec4 blockDim;
