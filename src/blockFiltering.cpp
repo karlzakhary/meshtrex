@@ -3,16 +3,13 @@
 
 #include <cstring>
 #include <fstream>
-#include <regex>
 #include <GLFW/glfw3.h>
 #include <GLFW/glfw3native.h>
 
 #include <iostream>
 #include <vector>
-#include <stdexcept>
 
 #include "buffer.h"
-#include "device.h"
 #include "mesh.h"
 #include "resources.h"
 #include "shaders.h"
@@ -76,10 +73,6 @@ std::tuple<VkPipelineLayout, VkDescriptorSetLayout> createComputeMinMaxPipelineL
 std::tuple<VkPipelineLayout, VkDescriptorSetLayout> createComputeOccupiedBlockFilteringPipelineLayout(
     VkDevice device)
 {
-    // This layout needs bindings for:
-    // binding 0: input minMaxImage (Storage Image)
-    // binding 1: output compactedBlockIdBuffer (Storage Buffer)
-    // binding 2: output activeBlockCountBuffer (Storage Buffer)
     VkDescriptorSetLayoutBinding bindings[3] = {};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; // MinMax Input
@@ -184,205 +177,6 @@ void pushOccupiedBlockFilteringDescriptorSets(
 
     // Push Constants (including isovalue)
     vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushData);
-}
-
-
-std::vector<uint32_t> mapUintBuffer(VkDevice device, VkPhysicalDeviceMemoryProperties memoryProperties,
-                                   VkCommandPool commandPool, VkQueue queue,
-                                   const Buffer& gpuBuffer, VkDeviceSize bufferSize, size_t expectedElements)
-{
-    std::cout << "\nReading back GPU uint32_t buffer..." << std::endl;
-    Buffer readbackBuffer = {};
-    createBuffer(readbackBuffer, device, memoryProperties, bufferSize,
-                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-    VkCommandBuffer cmd = beginSingleTimeCommands(device, commandPool);
-    VkBufferCopy region = {0, 0, bufferSize};
-    vkCmdCopyBuffer(cmd, gpuBuffer.buffer, readbackBuffer.buffer, 1, &region);
-    endSingleTimeCommands(device, commandPool, queue, cmd);
-    VK_CHECK(vkDeviceWaitIdle(device)); // Ensure copy is finished
-
-    void* mappedData = readbackBuffer.data;
-    if (mappedData == nullptr) {
-        destroyBuffer(readbackBuffer, device);
-        throw std::runtime_error("Readback buffer is not mapped!");
-    }
-
-    size_t numElements = bufferSize / sizeof(uint32_t);
-    if (numElements != expectedElements) {
-         std::cerr << "Warning: Uint buffer element count (" << numElements
-                   << ") does not match expected count (" << expectedElements << ")" << std::endl;
-         // Decide how to handle - using smaller count might hide errors
-         // numElements = std::min(numElements, expectedElements);
-         // Or maybe just read the expected amount if buffer is large enough?
-         if (bufferSize < expectedElements * sizeof(uint32_t)) {
-              std::cerr << "Error: Buffer is too small for expected elements!" << std::endl;
-              numElements = bufferSize / sizeof(uint32_t); // Read only what's possible
-         } else {
-              numElements = expectedElements; // Read the expected number
-         }
-
-    }
-
-    std::vector<uint32_t> results(numElements);
-    memcpy(results.data(), mappedData, numElements * sizeof(uint32_t));
-
-    destroyBuffer(readbackBuffer, device);
-    std::cout << "GPU uint32_t buffer readback complete (" << numElements << " elements)." << std::endl;
-    return results;
-}
-
-
-std::vector<uint32_t> computeCompactedBlockIDsCPU(
-    const std::vector<MinMaxResult>& minMaxResults,
-    float isovalue,
-    const glm::uvec3& blockGridDim)
-{
-    std::cout << "\nCPU: Generating compacted active block ID list for isovalue " << isovalue << "..." << std::endl;
-    uint32_t totalBlocks = blockGridDim.x * blockGridDim.y * blockGridDim.z;
-    if (minMaxResults.size() != totalBlocks) {
-        throw std::runtime_error("CPU Error: Mismatch between minMaxResults size and grid dimensions.");
-    }
-
-    std::vector<uint32_t> activeBlockIDs;
-    activeBlockIDs.reserve(totalBlocks / 4); // Pre-allocate some space (heuristic)
-
-    uint32_t isovalue_uint = static_cast<uint32_t>(std::round(isovalue)); // Use same rounding
-
-    // Iterate through all blocks in the expected 1D order
-    for (uint32_t blockID1D = 0; blockID1D < totalBlocks; ++blockID1D) {
-        const auto& result = minMaxResults[blockID1D];
-
-        // Apply the EXACT SAME logic as the filtering shader
-        bool blockIsActive = false;
-        if (result.minVal != result.maxVal) {
-            blockIsActive = (isovalue_uint >= result.minVal && isovalue_uint <= result.maxVal);
-        }
-
-        if (blockIsActive) {
-            activeBlockIDs.push_back(blockID1D); // Add active block ID to the list
-        }
-    }
-    std::cout << "CPU: Compacted ID list generation finished. Found: " << activeBlockIDs.size() << " active blocks." << std::endl;
-    return activeBlockIDs;
-}
-
-int compareCompactedIDs(
-    const std::vector<uint32_t>& gpuIDs,
-    uint32_t gpuCount,
-    const std::vector<uint32_t>& cpuIDs,
-    int maxErrorsToPrint = 20)
-{
-     std::cout << "\nComparing GPU vs CPU Compacted Block ID lists..." << std::endl;
-
-     // 1. Check if counts match first (essential prerequisite)
-     if (gpuCount != cpuIDs.size()) {
-         std::cerr << "Error: GPU active count (" << gpuCount
-                   << ") does not match CPU active count (" << cpuIDs.size()
-                   << "). Cannot compare ID lists reliably." << std::endl;
-         return -1; // Indicate error
-     }
-
-     // 2. Check if GPU buffer readback size is sufficient
-     if (gpuIDs.size() < gpuCount) {
-          std::cerr << "Error: GPU ID buffer readback size (" << gpuIDs.size()
-                    << ") is smaller than the reported GPU active count (" << gpuCount
-                    << "). Cannot perform full comparison." << std::endl;
-         // Compare only up to the available size
-         gpuCount = gpuIDs.size();
-     }
-
-     if (gpuCount == 0) {
-         std::cout << "Both CPU and GPU report 0 active blocks. Lists match." << std::endl;
-         return 0; // No errors
-     }
-
-     int mismatchCount = 0;
-     int errorsPrinted = 0;
-
-     // 3. Compare the first 'gpuCount' elements
-     // Assumes the GPU shader produced an ordered list matching the CPU iteration order
-     for (size_t i = 0; i < gpuCount; ++i) {
-         if (gpuIDs[i] != cpuIDs[i]) {
-             mismatchCount++;
-             if (errorsPrinted < maxErrorsToPrint) {
-                  std::cerr << "Mismatch found at Index " << i << ": "
-                            << "GPU ID=" << gpuIDs[i] << ", "
-                            << "CPU ID=" << cpuIDs[i] << std::endl;
-                 errorsPrinted++;
-             } else if (errorsPrinted == maxErrorsToPrint) {
-                  std::cerr << "... (further mismatch details suppressed)" << std::endl;
-                  errorsPrinted++; // Prevent printing again
-             }
-         }
-     }
-
-     // 4. Report results
-     if (mismatchCount == 0) {
-         std::cout << "Success: All " << gpuCount << " active block IDs match between GPU and CPU!" << std::endl;
-     } else {
-         std::cout << "Comparison finished: Found " << mismatchCount << " ID mismatches out of " << gpuCount << " active blocks." << std::endl;
-     }
-
-     return mismatchCount;
-}
-
-int testCompactBuffer(VulkanContext &context, Buffer compactedBlockIdBuffer, uint32_t gpuActiveCount) {
-
-    float isovalue = 60.0f;
-
-    // Placeholder for GPU results
-    std::vector<uint32_t> gpuCompactedIDs;
-    // --- End Vulkan Setup Placeholder ---
-
-
-    try {
-        // 1. Compute Min/Max results on CPU
-        // Assuming volume dims are known or read from Volume struct
-        glm::uvec3 volumeDims = {256, 256, 256}; // Example, use actual dims
-        std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("../cmake-build-debug/raw_volumes/bonsai_256x256x256_uint8.raw");
-
-        // 2. Compute Active Block Count on CPU
-        uint32_t cpuActiveCount = computeActiveBlockCountCPU(cpuMinMaxResults, isovalue);
-
-        // 3. Compute Compacted Block ID list on CPU
-        glm::uvec3 blockGridDim = (volumeDims + glm::uvec3(8,8,8) - 1u) / glm::uvec3(8,8,8);
-        std::vector<uint32_t> cpuActiveIDs = computeCompactedBlockIDsCPU(cpuMinMaxResults, isovalue, blockGridDim);
-
-        // --- Read Back GPU Compacted IDs (Placeholder) ---
-        // Need to read back the 'compactedBlockIdBuffer' into gpuCompactedIDs
-        // The buffer contains uint32_t values. Only need to read 'gpuActiveCount' elements.
-        VkDeviceSize gpuCompactedDataSize = gpuActiveCount * sizeof(uint32_t);
-        if (gpuActiveCount > 0) {
-            gpuCompactedIDs = mapUintBuffer(context.getDevice(), context.getMemoryProperties(), context.getCommandPool(), context.getQueue(),
-                                           compactedBlockIdBuffer, gpuCompactedDataSize, gpuActiveCount);
-        }
-        // --- End Read Back ---
-
-
-        // --- Comparison ---
-        std::cout << "\n--- FINAL COMPARISON ---" << std::endl;
-        std::cout << "CPU Active Block Count : " << cpuActiveCount << std::endl;
-        std::cout << "GPU Active Block Count : " << gpuActiveCount << " (Placeholder)" << std::endl;
-
-        if (cpuActiveCount == gpuActiveCount) {
-            std::cout << "Counts Match!" << std::endl;
-            // Now compare the actual ID lists
-            compareCompactedIDs(gpuCompactedIDs, gpuActiveCount, cpuActiveIDs);
-        } else {
-            std::cerr << "Error: Active counts do not match! Cannot reliably compare ID lists." << std::endl;
-        }
-
-    } catch (const std::runtime_error& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
-    } catch (...) {
-        std::cerr << "An unexpected error occurred." << std::endl;
-        return 1;
-    }
-
-    return 0;
 }
 
 // --- Function to set up and run the filtering pass ---
@@ -517,13 +311,7 @@ uint32_t runOccupiedBlockFiltering(
     destroyBuffer(countReadbackBuffer, context.getDevice()); // Clean up staging buffer
 
     std::cout << "Occupied Block Filtering finished. Active blocks found: " << activeCount << std::endl;
-    // testCompactBuffer(context, compactedBlockIdBuffer, activeCount);
-    VkDeviceSize gpuCompactedDataSize = activeCount * sizeof(uint32_t);
-    std::vector<uint32_t> gpuCompactedIDs;
-    if (activeCount > 0) {
-        gpuCompactedIDs = mapUintBuffer(context.getDevice(), context.getMemoryProperties(), context.getCommandPool(), context.getQueue(),
-                                       compactedBlockIdBuffer, gpuCompactedDataSize, activeCount);
-    }
+    testCompactBuffer(context, compactedBlockIdBuffer, activeCount);
     // --- Cleanup ---
     // Destroy pipeline, layout, shader module, descriptor set layout
     vkDestroyPipeline(context.getDevice(), computePipeline, nullptr);
@@ -715,30 +503,3 @@ uint32_t filterUnoccupiedBlocks(char **argv, const char *path)
 
     return blocks;
 }
-
-void compareCPUvsGPUBlocks(char **argv) {
-    // Compute Min/Max for all blocks by calling the single function
-    std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("../cmake-build-debug/raw_volumes/bonsai_256x256x256_uint8.raw");
-
-    // 2. Compute Active Block Count on CPU using the min/max results
-    uint32_t cpuActiveCount = computeActiveBlockCountCPU(cpuMinMaxResults, 60);
-
-    // 3. Run the GPU Occupied Block Filtering pass
-    // This function should return the count read back from the GPU
-    uint32_t gpuActiveCount = filterUnoccupiedBlocks(
-        argv, "raw_volumes/bonsai_256x256x256_uint8.raw");
-    std::cout << "\nGPU: Occupied Block Filtering finished. Active blocks found: " << gpuActiveCount << " (Placeholder)" << std::endl;
-
-
-    // // 4. Compare the counts
-    std::cout << "\n--- Comparison ---" << std::endl;
-    std::cout << "CPU Active Block Count: " << cpuActiveCount << std::endl;
-    std::cout << "GPU Active Block Count: " << gpuActiveCount << std::endl;
-    if (cpuActiveCount == gpuActiveCount) {
-        std::cout << "Success: CPU and GPU active block counts match!" << std::endl;
-    } else {
-        std::cerr << "Error: CPU and GPU active block counts DO NOT match!" << std::endl;
-    }
-}
-
-
