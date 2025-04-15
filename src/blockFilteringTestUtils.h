@@ -1,4 +1,5 @@
 #pragma once
+#include <cstring>
 #include "testMinMax.h"
 
 // NEW Function: Reads back the MinMax data from a VkImage via a staging buffer

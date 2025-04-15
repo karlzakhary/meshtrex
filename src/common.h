@@ -2,6 +2,7 @@
 
 #include <volk.h>
 
+#include <string>
 #include <vector>
 #include "glmMath.h"
 
