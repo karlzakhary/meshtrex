@@ -18,7 +18,6 @@
 #include "image.h"
 #include "vulkan_context.h"
 #include "blockFilteringTestUtils.h"
-#include "testMinMax.h"
 
 std::tuple<VkPipelineLayout, VkDescriptorSetLayout> createComputeMinMaxPipelineLayout(
     VkDevice device)
@@ -232,7 +231,7 @@ uint32_t runOccupiedBlockFiltering(
 
     // --- Load Shader & Create Pipeline ---
     Shader filterCS{};
-    assert(loadShader(filterCS, context.getDevice(), argv[0], "spirv/occupiedBlockPrefixSum.comp.spv"));
+    assert(loadShader(filterCS, context.getDevice(), "spirv/occupiedBlockPrefixSum.comp.spv"));
     VkPipeline computePipeline = createComputePipeline(context.getDevice(), nullptr, filterCS, pipelineLayout);
     std::cout << "Filtering pipeline created." << std::endl;
 
@@ -374,7 +373,7 @@ uint32_t filterUnoccupiedBlocks(char **argv, const char *path)
     VkPipelineCache pipelineCache = nullptr;
 
     // Push constants
-    Volume volume = loadVolume(argv, path);
+    Volume volume = loadVolume(path);
     PushConstants pushConstants = {};
     pushConstants.volumeDim    = glm::uvec4(volume.volume_dims, 1); // Pad W with 1
     pushConstants.blockDim     = glm::uvec4(8, 8, 8, 1);      // Pad W with 1
@@ -385,7 +384,7 @@ uint32_t filterUnoccupiedBlocks(char **argv, const char *path)
     VkCommandBuffer commandBuffer = beginSingleTimeCommands(device, context.getCommandPool());
 
     Shader minMaxCS{};
-    assert(loadShader(minMaxCS, device, argv[0], "spirv/computeMinMax.comp.spv"));
+    assert(loadShader(minMaxCS, device, "spirv/computeMinMax.comp.spv"));
 
     auto [pipelineLayout, setLayout] = createComputeMinMaxPipelineLayout(device);
 

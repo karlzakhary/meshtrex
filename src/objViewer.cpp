@@ -132,10 +132,10 @@ void drawObject(char **argv, const char *path)
     vkGetDeviceQueue(device, familyIndex, 0, &queue);
 
     Shader triangleVS{};
-    assert(loadShader(triangleVS, device, argv[0], "spirv/objViewer.vert.spv"));
+    assert(loadShader(triangleVS, device, "/spirv/objViewer.vert.spv"));
 
     Shader triangleFS{};
-    assert(loadShader(triangleFS, device, argv[0], "spirv/objViewer.frag.spv"));
+    assert(loadShader(triangleFS, device, "/spirv/objViewer.frag.spv"));
 
     VkPipelineCache pipelineCache = nullptr;
     VkPipelineRenderingCreateInfo renderingInfo = {

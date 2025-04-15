@@ -193,7 +193,7 @@ inline bool testMinMaxReadback(
 
         // --- Load Test Shader & Create Test Pipeline ---
         // Ensure TestMinMaxRead.comp is compiled to SPIR-V
-        assert(loadShader(testCS, context.getDevice(), argv[0],
+        assert(loadShader(testCS, context.getDevice(),
                           "spirv/testReadingMinMax.comp.spv"));
         testPipeline = createComputePipeline(context.getDevice(), nullptr,
                                              testCS, testPipelineLayout);
@@ -472,8 +472,8 @@ inline std::vector<uint32_t> computeCompactedBlockIDsCPU(
 }
 
 inline int compareCompactedIDs(std::vector<uint32_t>& gpuIDs, uint32_t gpuCount,
-                        const std::vector<uint32_t>& cpuIDs,
-                        int maxErrorsToPrint = 1000)
+                               const std::vector<uint32_t>& cpuIDs,
+                               int maxErrorsToPrint = 1000)
 {
     std::sort(gpuIDs.begin(), gpuIDs.end());
     std::cout << "\nComparing GPU vs CPU Compacted Block ID lists..."
@@ -539,7 +539,7 @@ inline int compareCompactedIDs(std::vector<uint32_t>& gpuIDs, uint32_t gpuCount,
     return mismatchCount;
 }
 
-inline int testCompactBuffer(VulkanContext &context, Buffer compactedBlockIdBuffer, uint32_t gpuActiveCount) {
+inline void testCompactBuffer(VulkanContext &context, Buffer &compactedBlockIdBuffer, uint32_t gpuActiveCount) {
 
     float isovalue = 60.0f;
 
@@ -585,11 +585,7 @@ inline int testCompactBuffer(VulkanContext &context, Buffer compactedBlockIdBuff
 
     } catch (const std::runtime_error& e) {
         std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
     } catch (...) {
         std::cerr << "An unexpected error occurred." << std::endl;
-        return 1;
     }
-
-    return 0;
 }

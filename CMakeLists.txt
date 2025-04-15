@@ -76,6 +76,7 @@ endforeach()
 
 add_custom_target(compile_shaders DEPENDS ${SPIRV_BINARY_FILES})
 add_dependencies(meshtrex compile_shaders)
+add_definitions(-DROOT_BUILD_PATH="${CMAKE_BINARY_DIR}")
 
 add_custom_command(
         TARGET meshtrex POST_BUILD
