@@ -31,9 +31,9 @@ std::tuple<VkPipelineLayout, VkDescriptorSetLayout> createObjectPipelineLayout(
     setCreateInfo.bindingCount = std::size(setBindings);
     setCreateInfo.pBindings = setBindings;
 
-    VkDescriptorSetLayout setLayout = 0;
+    VkDescriptorSetLayout setLayout = nullptr;
     VK_CHECK(
-        vkCreateDescriptorSetLayout(device, &setCreateInfo, 0, &setLayout));
+        vkCreateDescriptorSetLayout(device, &setCreateInfo, nullptr, &setLayout));
 
     VkPipelineLayoutCreateInfo createInfo = {
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -208,7 +208,7 @@ void drawObject(char **argv, const char *path)
                     vkDestroyImageView(device, swapchainImageViews[i], 0);
 
                 swapchainImageViews[i] = createImageView(
-                    device, swapchain.images[i], swapchainFormat, 0, 1);
+                    device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
             }
         }
 

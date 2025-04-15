@@ -1,4 +1,5 @@
 #include "common.h"
+
 #include "device.h"
 
 #include <stdio.h>

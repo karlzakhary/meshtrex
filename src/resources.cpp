@@ -1,12 +1,32 @@
 #include "common.h"
 #include "resources.h"
 
-VkImageMemoryBarrier2 imageBarrier(
-    VkImage image, VkPipelineStageFlags2 srcStageMask,
-    VkAccessFlags2 srcAccessMask, VkImageLayout oldLayout,
+VkBufferMemoryBarrier2 bufferBarrier(
+    VkBuffer buffer,
+    VkPipelineStageFlags2 srcStageMask, VkAccessFlags2 srcAccessMask,
     VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask,
-    VkImageLayout newLayout, VkImageAspectFlags aspectMask,
-    uint32_t baseMipLevel, uint32_t levelCount)
+    VkDeviceSize offset, VkDeviceSize size)
+{
+    VkBufferMemoryBarrier2 result = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+
+    result.buffer = buffer;
+    result.srcAccessMask = srcAccessMask;
+    result.dstAccessMask = dstAccessMask;
+    result.srcStageMask = srcStageMask;
+    result.dstStageMask = dstStageMask;
+    result.offset = offset;
+    result.size = size;
+
+    return result;
+}
+
+VkImageMemoryBarrier2 imageBarrier(
+    VkImage image,
+    VkPipelineStageFlags2 srcStageMask,VkAccessFlags2 srcAccessMask,
+    VkImageLayout oldLayout,
+    VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask,
+    VkImageLayout newLayout,
+    VkImageAspectFlags aspectMask, uint32_t baseMipLevel, uint32_t levelCount)
 {
     VkImageMemoryBarrier2 result = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
 
@@ -27,6 +47,34 @@ VkImageMemoryBarrier2 imageBarrier(
     return result;
 }
 
+void transitionImage(VkCommandBuffer cmd, VkImage image,
+                     VkImageLayout oldLayout, VkImageLayout newLayout,
+                     VkPipelineStageFlags2 srcStageMask, VkAccessFlags2 srcAccessMask,
+                     VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask) {
+    VkImageMemoryBarrier2 barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcStageMask = srcStageMask;
+    barrier.srcAccessMask = srcAccessMask;
+    barrier.dstStageMask = dstStageMask;
+    barrier.dstAccessMask = dstAccessMask;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+
+    VkDependencyInfo depInfo = {
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier
+    };
+
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+}
+
 void pipelineBarrier(VkCommandBuffer commandBuffer,
                      VkDependencyFlags dependencyFlags,
                      size_t bufferBarrierCount,
@@ -36,83 +84,10 @@ void pipelineBarrier(VkCommandBuffer commandBuffer,
 {
     VkDependencyInfo dependencyInfo = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     dependencyInfo.dependencyFlags = dependencyFlags;
-    dependencyInfo.bufferMemoryBarrierCount = unsigned(bufferBarrierCount);
+    dependencyInfo.bufferMemoryBarrierCount = static_cast<unsigned>(bufferBarrierCount);
     dependencyInfo.pBufferMemoryBarriers = bufferBarriers;
-    dependencyInfo.imageMemoryBarrierCount = unsigned(imageBarrierCount);
+    dependencyInfo.imageMemoryBarrierCount = static_cast<unsigned>(imageBarrierCount);
     dependencyInfo.pImageMemoryBarriers = imageBarriers;
 
     vkCmdPipelineBarrier2(commandBuffer, &dependencyInfo);
-}
-
-VkImageView createImageView(VkDevice device, VkImage image, VkFormat format,
-                            uint32_t mipLevel, uint32_t levelCount)
-{
-    VkImageAspectFlags aspectMask = (format == VK_FORMAT_D32_SFLOAT)
-                                        ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                        : VK_IMAGE_ASPECT_COLOR_BIT;
-
-    VkImageViewCreateInfo createInfo = {
-        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    createInfo.image = image;
-    createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    createInfo.format = format;
-    createInfo.subresourceRange.aspectMask = aspectMask;
-    createInfo.subresourceRange.baseMipLevel = mipLevel;
-    createInfo.subresourceRange.levelCount = levelCount;
-    createInfo.subresourceRange.layerCount = 1;
-
-    VkImageView view = 0;
-    VK_CHECK(vkCreateImageView(device, &createInfo, 0, &view));
-
-    return view;
-}
-
-void createImage(Image& result, VkDevice device,
-                 const VkPhysicalDeviceMemoryProperties& memoryProperties,
-                 uint32_t width, uint32_t height, uint32_t mipLevels,
-                 VkFormat format, VkImageUsageFlags usage)
-{
-    VkImageCreateInfo createInfo = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-
-    createInfo.imageType = VK_IMAGE_TYPE_2D;
-    createInfo.format = format;
-    createInfo.extent = {width, height, 1};
-    createInfo.mipLevels = mipLevels;
-    createInfo.arrayLayers = 1;
-    createInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    createInfo.usage = usage;
-    createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    VkImage image = nullptr;
-    VK_CHECK(vkCreateImage(device, &createInfo, 0, &image));
-
-    VkMemoryRequirements memoryRequirements;
-    vkGetImageMemoryRequirements(device, image, &memoryRequirements);
-
-    uint32_t memoryTypeIndex =
-        selectMemoryType(memoryProperties, memoryRequirements.memoryTypeBits,
-                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    assert(memoryTypeIndex != ~0u);
-
-    VkMemoryAllocateInfo allocateInfo = {
-        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocateInfo.allocationSize = memoryRequirements.size;
-    allocateInfo.memoryTypeIndex = memoryTypeIndex;
-
-    VkDeviceMemory memory = nullptr;
-    VK_CHECK(vkAllocateMemory(device, &allocateInfo, 0, &memory));
-
-    VK_CHECK(vkBindImageMemory(device, image, memory, 0));
-
-    result.image = image;
-    result.imageView = createImageView(device, image, format, 0, mipLevels);
-    result.memory = memory;
-}
-
-void destroyImage(const Image& image, VkDevice device)
-{
-    vkDestroyImageView(device, image.imageView, nullptr);
-    vkDestroyImage(device, image.image, nullptr);
-    vkFreeMemory(device, image.memory, nullptr);
 }

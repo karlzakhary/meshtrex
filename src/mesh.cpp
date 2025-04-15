@@ -1,8 +1,9 @@
+#include "common.h"
+
 #include "mesh.h"
 
 #include <fast_obj.h>
 
-#include "common.h"
 #include "meshoptimizer.h"
 
 bool loadObj(std::vector<Vertex>& vertices, const char *path)

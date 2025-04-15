@@ -1,10 +1,12 @@
-#include <iostream>
+#include <vector>
+#ifndef __APPLE__
+#include <cstdint>
+#endif
+#include "blockFiltering.h"
+#include "testMinMax.h"
 
-#include "objViewer.h"
-
-int main(int argc, char **argv)
-{
-    drawObject(argv, "meshes/kitten.obj");
-    std::cout << "Hello, World!" << std::endl;
+int main(int argc, char* argv[]) {
+    uint32_t gpuActiveCount = filterUnoccupiedBlocks(
+       argv, "raw_volumes/bonsai_256x256x256_uint8.raw"); // Placeholder - replace with actual GPU result
     return 0;
 }
