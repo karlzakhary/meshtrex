@@ -33,6 +33,21 @@ struct alignas(16) PushConstants {
     float isovalue;           // Offset 48, Size 4.
 };
 
+struct SceneUniforms { // Data changing per frame (usually)
+    glm::mat4 viewProjectionMatrix;
+    glm::mat4 modelMatrix; // Or pass via push constants if it changes per object
+    glm::vec3 cameraPos_world;
+    // Add other frequently changing params if any
+};
+
+struct LightingUniforms { // Data changing less frequently
+    glm::vec4 lightPosition_world; // Using vec4 for alignment (w=1 for point, 0 for directional)
+    glm::vec4 lightColor;        // Using vec4 for alignment
+    float ambientIntensity;
+    // Add padding if needed for std140/std430 alignment
+    // Add other light properties, material properties etc.
+};
+
 inline std::string getFullPath(const char *base, const char *path)
 {
     std::string fullPath = base;

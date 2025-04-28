@@ -5,7 +5,6 @@
 #include "buffer.h"
 #include "resources.h" // Defines Image and Buffer structs
 #include <cstdint>
-#include <vulkan/vulkan.h> // Include Vulkan headers if Image/Buffer don't
 
 // Structure to hold the results and persistent resources from the filtering process
 struct FilteringOutput {

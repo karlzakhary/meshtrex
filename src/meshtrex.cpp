@@ -7,19 +7,24 @@
 
 #include "common.h"
 #include "filteringManager.h"
+#include "extractionManager.h"
 
 
 #include "vulkan_context.h"
 
 int main(int argc, char** argv) {
     try {
-        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/bonsai_256x256x256_uint8.raw");
+        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/aneurism_256x256x256_uint8.raw");
         VulkanContext context(false);
-        FilteringOutput filteringResult = filterActiveBlocks(context, volumePath.c_str());
+        std::cout << "Vulkan context initialized for filtering." << std::endl;
+
+        Volume volume = loadVolume(volumePath.c_str());
+        std::cout << "Volume " << volumePath.c_str() << " is loaded.";
+        FilteringOutput filteringResult = filterActiveBlocks(context, volume);
 
         std::cout << "Filtering complete. Received handles." << std::endl;
         std::cout << "Active blocks: " << filteringResult.activeBlockCount << std::endl;
-
+        extractMeshletDescriptors(context, filteringResult);
         // --- Now use the results in the next stage ---
         // Example: Setting up descriptors for a task/mesh shader
         // VkDescriptorBufferInfo activeBlockCountInfo = { filteringResult.activeBlockCountBuffer.buffer, 0, VK_WHOLE_SIZE };

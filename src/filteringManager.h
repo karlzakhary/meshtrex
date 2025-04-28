@@ -1,7 +1,8 @@
 #pragma once
 
 #include "filteringOutput.h"
+#include "volume.h"
 
 class VulkanContext;
 
-FilteringOutput filterActiveBlocks(VulkanContext &vulkanContext, const char* volumePath);
+FilteringOutput filterActiveBlocks(VulkanContext &vulkanContext, Volume volume);

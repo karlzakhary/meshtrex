@@ -1,7 +1,6 @@
 #include "filteringManager.h"
 #include "common.h"
 
-#include "volume.h"
 #include "vulkan_context.h"
 #include "resources.h"
 #include "buffer.h"
@@ -59,12 +58,8 @@ void uploadVolumeData(VkCommandBuffer commandBuffer,
 
 // --- Modified Main Orchestrating Function ---
 // Returns a struct containing handles to persistent resources
-FilteringOutput filterActiveBlocks(VulkanContext &context, const char* volumePath)
+FilteringOutput filterActiveBlocks(VulkanContext &context, Volume volume)
 {
-    std::cout << "Vulkan context initialized for filtering." << std::endl;
-
-    // --- Load Volume and Define Parameters ---
-    Volume volume = loadVolume(volumePath);
     PushConstants pushConstants = {};
     // ... (Setup pushConstants as before) ...
     pushConstants.volumeDim = glm::uvec4(volume.volume_dims, 1);
@@ -76,7 +71,7 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, const char* volumePat
         1);
     pushConstants.isovalue = 60;
 
-    std::cout << "Volume loaded: " << volumePath << " ("
+    std::cout << "Loaded volume dims: ("
               << pushConstants.volumeDim.x << "x" << pushConstants.volumeDim.y << "x" << pushConstants.volumeDim.z << ")" << std::endl;
     std::cout << "Block grid: " << pushConstants.blockGridDim.x << "x" << pushConstants.blockGridDim.y << "x" << pushConstants.blockGridDim.z << std::endl;
 
