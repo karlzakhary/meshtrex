@@ -246,15 +246,31 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
 
         pipelineBarrier(cmd, {}, preBufferBarriers.size(), preBufferBarriers.data(), preImageBarriers.size(), preImageBarriers.data());
 
+        VkRenderingInfo renderingInfo = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+        renderingInfo.layerCount = 1;
+        // Since rasterization is disabled, we don't *need* attachments.
+        // Setting renderArea to 1x1 is minimal. The actual dispatch dimensions
+        // are controlled by vkCmdDrawMeshTasksEXT, not the render area.
+        renderingInfo.renderArea = {{0, 0}, {1, 1}}; // Minimal render area
+        renderingInfo.colorAttachmentCount = 0;       // No color attachments
+        renderingInfo.pColorAttachments = nullptr;
+        renderingInfo.pDepthAttachment = nullptr;       // No depth attachment
+        renderingInfo.pStencilAttachment = nullptr;
+
+        vkCmdBeginRendering(cmd, &renderingInfo);
         // --- Bind Pipeline & Descriptors ---
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, extractionPipeline.pipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, extractionPipeline.pipelineLayout_, 0, 1, &extractionPipeline.descriptorSet_, 0, nullptr);
-
+        VkViewport viewport = { 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+        VkRect2D scissor = {{0, 0}, {1, 1}};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
         // --- Dispatch ---
         // Dispatch one task workgroup per active block found in the previous stage
         uint32_t taskCount = filterOutput.activeBlockCount;
         std::cout << "Dispatching " << taskCount << " mesh tasks..." << std::endl;
         vkCmdDrawMeshTasksEXT(cmd, taskCount, 1, 1); // One task per active block ID
+        vkCmdEndRendering(cmd);
 
         // --- Barriers After Extraction ---
         // Ensure mesh shader writes are finished before subsequent reads (e.g., rendering or copy)

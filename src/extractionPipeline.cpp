@@ -100,7 +100,7 @@ void ExtractionPipeline::releaseResources() {
 void ExtractionPipeline::createPipelineLayout()
 {
     // --- Create Descriptor Set Layout ---
-    std::vector<VkDescriptorSetLayoutBinding> bindings(6);
+    std::vector<VkDescriptorSetLayoutBinding> bindings(7);
     bindings[0] = {
         .binding = 0,
         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -320,8 +320,8 @@ bool ExtractionPipeline::setup(
     device_ = device;
 
     // --- Load Shaders ---
-    std::string taskShaderPath = "/spirv/extract.task.glsl";
-    std::string meshShaderPath = "/spirv/extract.mesh.glsl";
+    std::string taskShaderPath = "/spirv/extract.task.spv";
+    std::string meshShaderPath = "/spirv/extract.mesh.spv";
 
     assert(loadShader(taskShader_, device_, taskShaderPath.c_str()));
     assert(loadShader(meshShader_, device_, meshShaderPath.c_str()));

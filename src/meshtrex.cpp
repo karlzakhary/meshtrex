@@ -16,7 +16,11 @@ int main(int argc, char** argv) {
     try {
         std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/aneurism_256x256x256_uint8.raw");
         float isovalue = 60;
-        VulkanContext context(false);
+        bool requestMeshShading = false;
+#ifndef __APPLE__
+        requestMeshShading = true;
+#endif
+        VulkanContext context(requestMeshShading);
         std::cout << "Vulkan context initialized for filtering." << std::endl;
 
         Volume volume = loadVolume(volumePath.c_str());

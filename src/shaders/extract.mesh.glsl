@@ -41,7 +41,7 @@ layout(set = 0, binding = 0, scalar) uniform ExtractionConstantsUBO {
 // Add other constants if needed
 } ubo;
 
-layout(set = 0, binding = 1, r8) uniform readonly image3D volumeTexture;
+layout(set = 0, binding = 1, r8ui) uniform readonly uimage3D volumeTexture;
 
 layout(set = 0, binding = 3, scalar) buffer MarchingCubesTable { int triTable[]; }; // MC triTable[256][16]
 

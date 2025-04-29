@@ -298,11 +298,16 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
     createInfo.pNext = &features;
     features.pNext = &features11;
     features11.pNext = &features12;
+#ifndef __APPLE__
+    features12.pNext = &features13;
+
+    void **ppNext = &features13.pNext;
+#else
     features12.pNext = &featuresDynamicRendering;
     featuresDynamicRendering.pNext = &featuresSynchronization2;
 
     void **ppNext = &featuresSynchronization2.pNext;
-
+#endif
     if (meshShadingSupported) {
         *ppNext = &featuresMesh;
         ppNext = &featuresMesh.pNext;

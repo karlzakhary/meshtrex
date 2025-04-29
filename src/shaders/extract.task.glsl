@@ -28,7 +28,7 @@ layout(set = 0, binding = 0, scalar) uniform ExtractionConstantsUBO {
 // Add other constants if needed (e.g. blockDim if not hardcoded)
 } ubo;
 
-layout(set = 0, binding = 1, r8) uniform readonly image3D volumeTexture; // Volume Data (uint8)
+layout(set = 0, binding = 1, r8ui) uniform readonly uimage3D volumeTexture; // Volume Data (uint8)
 
 layout(set = 0, binding = 2, scalar) buffer CompactedBlockIDs { uint blockIDs[]; }; // Input block IDs
 
