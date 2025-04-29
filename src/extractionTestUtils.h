@@ -25,3 +25,8 @@ CPUExtractionOutput extractMeshletsCPU(
     FilteringOutput& filteringOutput, // Contains active block count & buffer handle
     float isovalue
 );
+
+bool compareExtractionOutputs(
+    VulkanContext& context,
+    const ExtractionOutput& gpuOutput,      // Results from GPU Extraction
+    const CPUExtractionOutput& cpuOutput);

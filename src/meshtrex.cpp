@@ -8,7 +8,8 @@
 #include "common.h"
 #include "filteringManager.h"
 #include "extractionManager.h"
-
+#include "blockFilteringTestUtils.h"
+#include "extractionTestUtils.h"
 
 #include "vulkan_context.h"
 
@@ -44,7 +45,17 @@ int main(int argc, char** argv) {
 
         std::cout << "Filtering complete. Received handles." << std::endl;
         std::cout << "Active blocks: " << filteringResult.activeBlockCount << std::endl;
-        ExtractionOutput extractionResult = extractMeshletDescriptors(context, filteringResult, pushConstants);
+        ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, filteringResult, pushConstants);
+        CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
+
+        // Perform the comparison
+        bool match = compareExtractionOutputs(context, extractionResultGPU, extractionResultCPU);
+
+        if (match) {
+            std::cout << "Verification Passed!" << std::endl;
+        } else {
+            std::cout << "Verification Failed!" << std::endl;
+        }
         // --- Now use the results in the next stage ---
         // Example: Setting up descriptors for a task/mesh shader
         // VkDescriptorBufferInfo activeBlockCountInfo = { filteringResult.activeBlockCountBuffer.buffer, 0, VK_WHOLE_SIZE };

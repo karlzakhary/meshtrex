@@ -1,20 +1,23 @@
 #include "extractionTestUtils.h"
-#include "blockFilteringTestUtils.h" // For mapUintBuffer
-#include "mc_tables.h"               // For MarchingCubes::triTable
-#include "vulkan_utils.h"          // For helper functions if needed (not strictly necessary here)
 
-#include <vector>
-#include <cstdint>
 #include <cmath>
-#include <unordered_map>
+#include <cstdint>
+#include <functional>  // For std::hash
 #include <iostream>
 #include <stdexcept>
-#include <functional> // For std::hash
+#include <unordered_map>
+#include <vector>
+
+#include "blockFilteringTestUtils.h"  // For mapUintBuffer
+#define GLM_ENABLE_EXPERIMENTAL
+#include "glm/gtx/string_cast.hpp"
+#include "mc_tables.h"  // For MarchingCubes::triTable
+#include "vulkan_utils.h"  // For helper functions if needed (not strictly necessary here)
 
 // --- Constants (match shader/C++ setup) ---
-const int BLOCK_DIM_X = 8;
-const int BLOCK_DIM_Y = 8;
-const int BLOCK_DIM_Z = 8;
+const int BLOCK_DIM_X_1 = 8;
+const int BLOCK_DIM_Y_1 = 8;
+const int BLOCK_DIM_Z_1 = 8;
 const int MAX_MESHLET_VERTICES = 128;
 const int MAX_MESHLET_PRIMITIVES = 256;
 
@@ -358,8 +361,8 @@ CPUExtractionOutput extractMeshletsCPU(
     cpuOutput.meshlets.reserve(activeBlockIDs.size() * 2); // Account for potential splits
 
     // Get block grid dimensions (needed for coordinate conversion and estimates)
-    glm::uvec3 blockGridDim = (volume.volume_dims + glm::uvec3(BLOCK_DIM_X, BLOCK_DIM_Y, BLOCK_DIM_Z) - 1u)
-                              / glm::uvec3(BLOCK_DIM_X, BLOCK_DIM_Y, BLOCK_DIM_Z);
+    glm::uvec3 blockGridDim = (volume.volume_dims + glm::uvec3(BLOCK_DIM_X_1, BLOCK_DIM_Y_1, BLOCK_DIM_Z_1) - 1u)
+                              / glm::uvec3(BLOCK_DIM_X_1, BLOCK_DIM_Y_1, BLOCK_DIM_Z_1);
 
     // 2. Iterate through active blocks
     for (uint32_t blockIndex1D : activeBlockIDs) {
@@ -368,15 +371,15 @@ CPUExtractionOutput extractMeshletsCPU(
         blockCoord.x = blockIndex1D % blockGridDim.x;
         blockCoord.y = (blockIndex1D / blockGridDim.x) % blockGridDim.y;
         blockCoord.z = blockIndex1D / (blockGridDim.x * blockGridDim.y);
-        glm::uvec3 blockOrigin = blockCoord * glm::uvec3(BLOCK_DIM_X, BLOCK_DIM_Y, BLOCK_DIM_Z);
+        glm::uvec3 blockOrigin = blockCoord * glm::uvec3(BLOCK_DIM_X_1, BLOCK_DIM_Y_1, BLOCK_DIM_Z_1);
 
         // 3. Mimic Task Shader Partitioning Decision
         uint32_t totalEstVertices = 0;
         uint32_t totalEstPrims = 0;
         // Estimate geometry for the whole 8x8x8 block
-        for(int z=0; z<BLOCK_DIM_Z; ++z) {
-            for(int y=0; y<BLOCK_DIM_Y; ++y) {
-                for(int x=0; x<BLOCK_DIM_X; ++x) {
+        for(int z=0; z<BLOCK_DIM_Z_1; ++z) {
+            for(int y=0; y<BLOCK_DIM_Y_1; ++y) {
+                for(int x=0; x<BLOCK_DIM_X_1; ++x) {
                     glm::ivec3 globalCellCoord = glm::ivec3(blockOrigin) + glm::ivec3(x,y,z);
                     uint32_t mc_case = 0;
                     // Calculate case (simplified, assumes corners are in bounds)
@@ -401,7 +404,7 @@ CPUExtractionOutput extractMeshletsCPU(
         // 4. Generate Meshlet(s) for the block/sub-blocks
         if (splitBlock) {
             // Split into 8 sub-blocks (4x4x4)
-            glm::uvec3 subBlockDim(BLOCK_DIM_X / 2, BLOCK_DIM_Y / 2, BLOCK_DIM_Z / 2);
+            glm::uvec3 subBlockDim(BLOCK_DIM_X_1 / 2, BLOCK_DIM_Y_1 / 2, BLOCK_DIM_Z_1 / 2);
             for (uint32_t i = 0; i < 8; ++i) {
                 glm::uvec3 subBlockOffset(
                     (i & 1) * subBlockDim.x,
@@ -414,7 +417,7 @@ CPUExtractionOutput extractMeshletsCPU(
             }
         } else if (totalEstVertices > 0) { // Check if block actually generated geometry estimate
             // Process the whole block as one meshlet
-            generateMeshletForSubBlockCPU(blockOrigin, glm::uvec3(0), glm::uvec3(BLOCK_DIM_X, BLOCK_DIM_Y, BLOCK_DIM_Z),
+            generateMeshletForSubBlockCPU(blockOrigin, glm::uvec3(0), glm::uvec3(BLOCK_DIM_X_1, BLOCK_DIM_Y_1, BLOCK_DIM_Z_1),
                                         volume, isovalue,
                                         cpuOutput, globalVertexCounter, globalIndexCounter);
         }
@@ -426,4 +429,170 @@ CPUExtractionOutput extractMeshletsCPU(
     std::cout << "CPU: Total Indices: " << cpuOutput.indices.size() << std::endl;
 
     return cpuOutput;
+}
+
+// Function to compare GPU results against CPU simulation
+// Returns true if basic checks pass, false otherwise.
+bool compareExtractionOutputs(
+    VulkanContext& context,
+    const ExtractionOutput& gpuOutput,      // Results from GPU Extraction
+    const CPUExtractionOutput& cpuOutput) // Results from CPU Simulation
+{
+    std::cout << "\n--- Comparing GPU vs CPU Extraction Results ---" << std::endl;
+    bool overallMatch = true;
+
+    // --- 1. Read back GPU Counts ---
+    uint32_t gpuVertexCount = 0;
+    uint32_t gpuIndexCount = 0;
+    uint32_t gpuMeshletCount = 0; // Number of descriptors written
+
+    try {
+        gpuVertexCount = mapCounterBuffer(context, gpuOutput.vertexBuffer);
+        gpuIndexCount = mapCounterBuffer(context, gpuOutput.indexBuffer);
+        gpuMeshletCount = mapCounterBuffer(context, gpuOutput.meshletDescriptorBuffer);
+
+        std::cout << "GPU Readback Counts:" << std::endl;
+        std::cout << "  - Vertex Count:    " << gpuVertexCount << std::endl;
+        std::cout << "  - Index Count:     " << gpuIndexCount << std::endl;
+        std::cout << "  - Meshlet Count:   " << gpuMeshletCount << std::endl; // Descriptors
+
+    } catch (const std::runtime_error& e) {
+        std::cerr << "Error reading back GPU counters: " << e.what() << std::endl;
+        return false; // Cannot proceed without counts
+    }
+
+    // --- 2. Compare Counts ---
+    std::cout << "\nCPU Generated Counts:" << std::endl;
+    std::cout << "  - Vertex Count:    " << cpuOutput.vertices.size() << std::endl;
+    std::cout << "  - Index Count:     " << cpuOutput.indices.size() << std::endl;
+    std::cout << "  - Meshlet Count:   " << cpuOutput.meshlets.size() << std::endl;
+
+    if (gpuVertexCount != cpuOutput.vertices.size()) {
+        std::cerr << "MISMATCH: Vertex counts differ (GPU: " << gpuVertexCount << ", CPU: " << cpuOutput.vertices.size() << ")" << std::endl;
+        overallMatch = false;
+    }
+    if (gpuIndexCount != cpuOutput.indices.size()) {
+        std::cerr << "MISMATCH: Index counts differ (GPU: " << gpuIndexCount << ", CPU: " << cpuOutput.indices.size() << ")" << std::endl;
+        overallMatch = false;
+    }
+     if (gpuMeshletCount != cpuOutput.meshlets.size()) {
+        std::cerr << "MISMATCH: Meshlet descriptor counts differ (GPU: " << gpuMeshletCount << ", CPU: " << cpuOutput.meshlets.size() << ")" << std::endl;
+        overallMatch = false;
+    }
+
+    if (!overallMatch) {
+         std::cerr << "Count mismatch detected. Further comparison might be unreliable." << std::endl;
+         // return false; // Option to exit early
+    } else {
+         std::cout << "Counts match!" << std::endl;
+    }
+
+
+    // --- 3. Read back GPU Descriptors and Compare ---
+    std::vector<MeshletDescriptor> gpuMeshlets;
+    try {
+        gpuMeshlets = mapMeshletDescriptorBuffer(context, gpuOutput.meshletDescriptorBuffer, gpuMeshletCount);
+        std::cout << "Read back " << gpuMeshlets.size() << " meshlet descriptors from GPU." << std::endl;
+    } catch (const std::runtime_error& e) {
+        std::cerr << "Error reading back GPU meshlet descriptors: " << e.what() << std::endl;
+        return false; // Cannot compare descriptors
+    }
+
+    uint32_t compareCount = std::min((uint32_t)cpuOutput.meshlets.size(), gpuMeshletCount);
+    uint32_t descriptorMismatches = 0;
+    std::cout << "\nComparing Meshlet Descriptors (up to " << compareCount << "):" << std::endl;
+    for (uint32_t i = 0; i < compareCount; ++i) {
+        const auto& cpuDesc = cpuOutput.meshlets[i];
+        const auto& gpuDesc = gpuMeshlets[i]; // Direct comparison assumes order matches for now
+        bool mismatch = false;
+
+        if (cpuDesc.vertexCount != gpuDesc.vertexCount) { std::cerr << "  Desc[" << i << "] vertexCount mismatch (CPU=" << cpuDesc.vertexCount << ", GPU=" << gpuDesc.vertexCount << ")\n"; mismatch = true; }
+        if (cpuDesc.primitiveCount != gpuDesc.primitiveCount) { std::cerr << "  Desc[" << i << "] primitiveCount mismatch (CPU=" << cpuDesc.primitiveCount << ", GPU=" << gpuDesc.primitiveCount << ")\n"; mismatch = true; }
+        // Offsets *might* differ if allocation order differs slightly, but should be consistent if counts match
+        if (cpuDesc.vertexOffset != gpuDesc.vertexOffset) { std::cerr << "  Desc[" << i << "] vertexOffset mismatch (CPU=" << cpuDesc.vertexOffset << ", GPU=" << gpuDesc.vertexOffset << ")\n"; mismatch = true; }
+        if (cpuDesc.indexOffset != gpuDesc.indexOffset) { std::cerr << "  Desc[" << i << "] indexOffset mismatch (CPU=" << cpuDesc.indexOffset << ", GPU=" << gpuDesc.indexOffset << ")\n"; mismatch = true; }
+
+        if (mismatch) {
+            descriptorMismatches++;
+            overallMatch = false;
+            if (descriptorMismatches > 20) { // Limit output
+                 std::cerr << "  ... further descriptor mismatches suppressed." << std::endl;
+                 break;
+            }
+        }
+    }
+
+    if (descriptorMismatches == 0 && compareCount > 0) {
+         std::cout << "Meshlet descriptors match!" << std::endl;
+    } else if (compareCount > 0) {
+         std::cerr << descriptorMismatches << " Meshlet descriptor mismatches found." << std::endl;
+    }
+
+
+    // --- 4. Compare Vertices/Indices (Basic Check - Order Dependent!) ---
+    // WARNING: This basic comparison assumes vertex/index order generated by CPU/GPU
+    //          is IDENTICAL, which is often NOT the case due to parallelism.
+    //          A more robust check would compare geometry meshlet by meshlet,
+    //          potentially using spatial hashing or sorting, which is complex.
+    //          Only perform this if descriptor comparison passes.
+
+    if (overallMatch && gpuVertexCount > 0 && gpuIndexCount > 0) {
+         std::cout << "\nAttempting basic Vertex/Index comparison (order-dependent, use with caution):" << std::endl;
+         bool geometryMatch = true;
+        try {
+            std::vector<glm::vec3> gpuVertices = mapVec3Buffer(context, gpuOutput.vertexBuffer, gpuVertexCount);
+            std::vector<uint32_t> gpuIndices = mapUintBuffer(
+                context.getDevice(),
+                context.getMemoryProperties(),
+                context.getCommandPool(),
+                context.getQueue(),
+                gpuOutput.indexBuffer,
+                gpuIndexCount * sizeof(uint32_t),
+                gpuIndexCount
+                ); // Read indices after counter
+
+            // Compare Vertices (using epsilon)
+            float epsilon = 1e-4f; // Tolerance for float comparison
+            uint32_t vertexMismatches = 0;
+            for (size_t i = 0; i < gpuVertexCount; ++i) {
+                if (glm::distance(gpuVertices[i], cpuOutput.vertices[i]) > epsilon) {
+                    vertexMismatches++;
+                     if (vertexMismatches <= 10) std::cerr << "  Vertex[" << i << "] mismatch (GPU=" << glm::to_string(gpuVertices[i]) << ", CPU=" << glm::to_string(cpuOutput.vertices[i]) << ")\n";
+                }
+            }
+             if (vertexMismatches > 10) std::cerr << "  ... further vertex mismatches suppressed.\n";
+             if (vertexMismatches > 0) { std::cerr << vertexMismatches << " vertex mismatches found.\n"; geometryMatch = false;}
+             else {std::cout << "Vertices appear to match (order-dependent check).\n"; }
+
+             // Compare Indices (direct comparison)
+            uint32_t indexMismatches = 0;
+             for (size_t i = 0; i < gpuIndexCount; ++i) {
+                  if (gpuIndices[i] != cpuOutput.indices[i]) {
+                      indexMismatches++;
+                       if (indexMismatches <= 10) std::cerr << "  Index[" << i << "] mismatch (GPU=" << gpuIndices[i] << ", CPU=" << cpuOutput.indices[i] << ")\n";
+                  }
+             }
+             if (indexMismatches > 10) std::cerr << "  ... further index mismatches suppressed.\n";
+             if (indexMismatches > 0) { std::cerr << indexMismatches << " index mismatches found.\n"; geometryMatch = false;}
+             else {std::cout << "Indices appear to match (order-dependent check).\n"; }
+
+
+        } catch (const std::runtime_error& e) {
+             std::cerr << "Error during GPU geometry readback: " << e.what() << std::endl;
+             geometryMatch = false;
+        }
+         overallMatch = overallMatch && geometryMatch; // Update overall match status
+    } else if (overallMatch) {
+        std::cout << "\nSkipping vertex/index comparison due to zero counts or prior mismatches." << std::endl;
+    }
+
+
+    std::cout << "\n--- Comparison Summary ---" << std::endl;
+    if (overallMatch) {
+        std::cout << "SUCCESS: CPU and GPU outputs appear to match based on performed checks." << std::endl;
+    } else {
+        std::cout << "FAILURE: Mismatches found between CPU and GPU outputs." << std::endl;
+    }
+
+    return overallMatch;
 }
