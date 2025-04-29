@@ -5,4 +5,4 @@
 
 class VulkanContext;
 
-FilteringOutput filterActiveBlocks(VulkanContext &vulkanContext, Volume volume);
+FilteringOutput filterActiveBlocks(VulkanContext &vulkanContext, Volume volume, PushConstants& pushConstants);

@@ -58,24 +58,8 @@ void uploadVolumeData(VkCommandBuffer commandBuffer,
 
 // --- Modified Main Orchestrating Function ---
 // Returns a struct containing handles to persistent resources
-FilteringOutput filterActiveBlocks(VulkanContext &context, Volume volume)
+FilteringOutput filterActiveBlocks(VulkanContext &context, Volume volume, PushConstants& pushConstants)
 {
-    PushConstants pushConstants = {};
-    // ... (Setup pushConstants as before) ...
-    pushConstants.volumeDim = glm::uvec4(volume.volume_dims, 1);
-    pushConstants.blockDim = glm::uvec4(8, 8, 8, 1);
-    pushConstants.blockGridDim = glm::uvec4(
-        (volume.volume_dims.x + pushConstants.blockDim.x - 1) / pushConstants.blockDim.x,
-        (volume.volume_dims.y + pushConstants.blockDim.y - 1) / pushConstants.blockDim.y,
-        (volume.volume_dims.z + pushConstants.blockDim.z - 1) / pushConstants.blockDim.z,
-        1);
-    pushConstants.isovalue = 60;
-
-    std::cout << "Loaded volume dims: ("
-              << pushConstants.volumeDim.x << "x" << pushConstants.volumeDim.y << "x" << pushConstants.volumeDim.z << ")" << std::endl;
-    std::cout << "Block grid: " << pushConstants.blockGridDim.x << "x" << pushConstants.blockGridDim.y << "x" << pushConstants.blockGridDim.z << std::endl;
-
-
     // --- Create Pass Objects ---
     std::string minMaxShaderPath = "/spirv/computeMinMax.comp.spv";
     std::string filterShaderPath = "/spirv/occupiedBlockPrefixSum.comp.spv";

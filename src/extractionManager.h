@@ -4,4 +4,4 @@
 #include "filteringOutput.h"
 #include "vulkan_context.h"
 
-void extractMeshletDescriptors(VulkanContext &vulkanContext, FilteringOutput &filterOutput );
+ExtractionOutput extractMeshletDescriptors(VulkanContext &vulkanContext, FilteringOutput &filterOutput, PushConstants& pushConstants);

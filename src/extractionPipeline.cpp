@@ -107,13 +107,14 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // UBO (isovalue?)
+    };  // UBO (ExtractionConstants)
 
     bindings[1] = {
         .binding = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT,
+        .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
     };  // Volume
 
     bindings[2] = {
@@ -128,29 +129,33 @@ void ExtractionPipeline::createPipelineLayout()
         .binding = 3,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT,
+        .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
     };  // MC Table
 
     bindings[4] = {
         .binding = 4,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT,
+        .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
     };  // output Vertex Buffer (Storage Buffer)
 
     bindings[5] = {
         .binding = 5,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT,
+        .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
     };  // output Index Buffer (Storage Buffer)
 
     bindings[6] = {
         .binding = 6,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // output Indirect Draw Buffer
+        .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
+    };  // Output Meshlet Descriptor Buffer (Storage Write)
 
     VkDescriptorSetLayoutCreateInfo layoutInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -281,7 +286,7 @@ void ExtractionPipeline::createDescriptorPool()
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1});  // UBO
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});   // Volume
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                         5});  // IDs + MC Table + VB + IB + IndirectDraw(opt)
+                         5});  // IDs + MC Table + VB + IB + Meshlet Descriptor
     VkDescriptorPoolCreateInfo poolInfo = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
