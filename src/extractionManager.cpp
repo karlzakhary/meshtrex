@@ -16,27 +16,40 @@
 #include <cmath>
 #include <stdexcept>
 #include <cstring>
+#include <utility> // For std::move if needed later
 
-// --- Helper Function to Create Marching Cubes Table Buffer (Example) ---
-// You'll need to provide the actual table data.
+// --- Helper Function to Create Marching Cubes Table Buffer (Revised) ---
 Buffer createMCTableBuffer(VulkanContext& context) {
     Buffer mcTableBuffer = {};
-    // Use the triTable defined in mc_tables.h
-    const int* tableData = *MarchingCubes::triTable;
-    // Each of the 256 cases has 16 integer entries (vertex indices or -1)
+    const int* tableData = &MarchingCubes::triTable[0][0];
     VkDeviceSize bufferSize = 256 * 16 * sizeof(int);
     Buffer stagingBuffer = {};
     createBuffer(stagingBuffer, context.getDevice(), context.getMemoryProperties(),
                  bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+     // Check if staging buffer creation succeeded
+     if (stagingBuffer.buffer == VK_NULL_HANDLE) {
+         throw std::runtime_error("Failed to create staging buffer for MC Table.");
+     }
+     if (stagingBuffer.data == nullptr) {
+          destroyBuffer(stagingBuffer, context.getDevice()); // Clean up before throwing
+          throw std::runtime_error("Failed to map staging buffer for MC Table.");
+     }
+
 
     // Copy table data to staging buffer
-    memcpy(stagingBuffer.data, tableData, bufferSize);
+    memcpy(stagingBuffer.data, tableData, bufferSize); // Use correct pointer
 
     // Create device-local buffer for the table
     createBuffer(mcTableBuffer, context.getDevice(), context.getMemoryProperties(),
                  bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+     // Check if device buffer creation succeeded
+      if (mcTableBuffer.buffer == VK_NULL_HANDLE) {
+          destroyBuffer(stagingBuffer, context.getDevice()); // Clean up staging buffer
+          throw std::runtime_error("Failed to create device buffer for MC Table.");
+      }
+
 
     // Copy from staging to device-local
     VkCommandBuffer cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
@@ -44,10 +57,12 @@ Buffer createMCTableBuffer(VulkanContext& context) {
     vkCmdCopyBuffer(cmd, stagingBuffer.buffer, mcTableBuffer.buffer, 1, &copyRegion);
 
     // Barrier to ensure transfer completes before shader access
+    // *** Corrected: Added TASK shader stage to dstStageMask ***
     VkBufferMemoryBarrier2 transferCompleteBarrier = bufferBarrier(
         mcTableBuffer.buffer,
         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, // Assuming next use is Mesh Shader read
+        VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, // Task & Mesh read
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
         0, VK_WHOLE_SIZE);
     pipelineBarrier(cmd, {}, 1, &transferCompleteBarrier, 0, {});
 
@@ -60,27 +75,41 @@ Buffer createMCTableBuffer(VulkanContext& context) {
     return mcTableBuffer;
 }
 
+// Define the structure expected by the UBO binding in the shaders
 struct ExtractionConstants {
     alignas(16) glm::uvec4 volumeDim;
     alignas(16) glm::uvec4 blockGridDim;
     alignas(4) float isovalue;
+    // Add padding or other constants if needed
 };
 
-Buffer createConstantsUBO(VulkanContext& context, const FilteringOutput& filterOutput, PushConstants& pushConstants) {
+// Helper to create UBO - revised to take necessary values directly
+Buffer createConstantsUBO(VulkanContext& context, const glm::uvec4& volDim, const glm::uvec4& gridDim, float isoVal) {
     Buffer constantsUBO = {};
     VkDeviceSize bufferSize = sizeof(ExtractionConstants);
 
     createBuffer(constantsUBO, context.getDevice(), context.getMemoryProperties(),
-                 bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                 bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, // Add DST for potential future updates via staging
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); // Keep HOST_VISIBLE for easy update
+
+    if (constantsUBO.buffer == VK_NULL_HANDLE) {
+        throw std::runtime_error("Failed to create constants UBO buffer.");
+    }
+    if (constantsUBO.data == nullptr) {
+         destroyBuffer(constantsUBO, context.getDevice());
+         throw std::runtime_error("Failed to map constants UBO buffer.");
+    }
+
 
     // Map and copy data
     ExtractionConstants constantsData = {};
-    constantsData.volumeDim = pushConstants.volumeDim;
-    constantsData.blockGridDim = pushConstants.blockGridDim;
-    constantsData.isovalue = pushConstants.isovalue;
+    constantsData.volumeDim = volDim;
+    constantsData.blockGridDim = gridDim;
+    constantsData.isovalue = isoVal;
 
     memcpy(constantsUBO.data, &constantsData, bufferSize);
+
+    // If not using HOST_COHERENT, need vkFlushMappedMemoryRanges here
 
     std::cout << "Constants UBO created and updated." << std::endl;
     return constantsUBO;
@@ -89,234 +118,192 @@ Buffer createConstantsUBO(VulkanContext& context, const FilteringOutput& filterO
 
 // --- Main Extraction Function Implementation ---
 
-// Returns populated ExtractionOutput struct. Throws on critical error.
-ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, FilteringOutput& filterOutput, PushConstants& pushConstants) {
+ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, FilteringOutput& filterOutput, PushConstants& pushConstants) { // Assuming PushConstants still holds relevant dims/isovalue
     std::cout << "\n--- Starting Meshlet Extraction ---" << std::endl;
     if (filterOutput.activeBlockCount == 0) {
         std::cout << "No active blocks found. Skipping meshlet extraction." << std::endl;
-        return {}; // Return empty output
+        return {};
     }
 
     VkDevice device = vulkanContext.getDevice();
-    ExtractionPipeline extractionPipeline; // RAII object for pipeline state
-    ExtractionOutput extractionOutput = {}; // RAII object for output buffers
-    extractionOutput.device = device; // Store device for cleanup in destructor
+    ExtractionPipeline extractionPipeline;
+    ExtractionOutput extractionOutput = {};
+    extractionOutput.device = device; // Store device handle for RAII cleanup
 
-    Buffer constantsUBO = {}; // Keep UBO handle for cleanup
-    Buffer mcTableBuffer = {}; // Keep MC table handle for cleanup
+    Buffer constantsUBO = {};
+    Buffer mcTableBuffer = {};
 
     try {
         // 1. Setup Extraction Pipeline State
-        if (!extractionPipeline.setup(device, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED)) {
+        // Ensure formats passed are compatible with device/swapchain if validation complains
+        if (!extractionPipeline.setup(device, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_D32_SFLOAT)) {
             throw std::runtime_error("Failed to setup Extraction Pipeline.");
         }
 
         // 2. Create Output Buffers (Sizing is critical and heuristic)
-        // Estimate max vertices: active_blocks * max_vertices_per_block (e.g., from paper ~128)
-        // Estimate max primitives: active_blocks * max_primitives_per_block (e.g., ~248)
-        // Estimate max indices: max_primitives * 3
-        // Estimate max descriptors: active_blocks (potentially fewer if tasks merge)
         const VkDeviceSize counterSize = sizeof(uint32_t);
-        constexpr uint32_t MAX_VERTS_PER_MESHLET_ESTIMATE = 128; // From paper/common practice
-        constexpr uint32_t MAX_PRIMS_PER_MESHLET_ESTIMATE = 256; // Higher end estimate
-        const VkDeviceSize MAX_TOTAL_VERTICES = static_cast<VkDeviceSize>(filterOutput.activeBlockCount) * MAX_VERTS_PER_MESHLET_ESTIMATE * sizeof(float) * 3; // Simplified: vec3 position
-        const VkDeviceSize MAX_TOTAL_INDICES = static_cast<VkDeviceSize>(filterOutput.activeBlockCount) * MAX_PRIMS_PER_MESHLET_ESTIMATE * 3 * sizeof(uint32_t); // Assuming uint32 indices for meshlets
-        const VkDeviceSize MAX_MESHLET_DESCRIPTORS = static_cast<VkDeviceSize>(filterOutput.activeBlockCount) * sizeof(MeshletDescriptor);
+        constexpr uint32_t MAX_VERTS_PER_MESHLET_ESTIMATE = 128;
+        constexpr uint32_t MAX_PRIMS_PER_MESHLET_ESTIMATE = 256;
+        constexpr uint32_t MAX_INDICES_PER_MESHLET = MAX_PRIMS_PER_MESHLET_ESTIMATE * 3;
+        constexpr uint32_t MAX_SUB_BLOCKS_PER_BLOCK = 8;
+        // Add some headroom to size estimations?
+        const VkDeviceSize MAX_TOTAL_VERTICES_BYTES = counterSize + static_cast<VkDeviceSize>(filterOutput.activeBlockCount) * MAX_SUB_BLOCKS_PER_BLOCK * MAX_VERTS_PER_MESHLET_ESTIMATE * sizeof(glm::vec3) * 2; // Pos+Norm
+        const VkDeviceSize MAX_TOTAL_INDICES_BYTES = counterSize + static_cast<VkDeviceSize>(filterOutput.activeBlockCount) * MAX_SUB_BLOCKS_PER_BLOCK * MAX_INDICES_PER_MESHLET * sizeof(uint32_t);
+        const VkDeviceSize MAX_MESHLET_DESCRIPTORS_BYTES = counterSize + static_cast<VkDeviceSize>(filterOutput.activeBlockCount) * MAX_SUB_BLOCKS_PER_BLOCK * sizeof(MeshletDescriptor);
 
-        std::cout << "Estimating output buffer sizes based on " << filterOutput.activeBlockCount << " active blocks:" << std::endl;
-        std::cout << "  - Max Vertices: " << MAX_TOTAL_VERTICES << " bytes" << std::endl;
-        std::cout << "  - Max Indices: " << MAX_TOTAL_INDICES << " bytes" << std::endl;
-        std::cout << "  - Max Descriptors: " << MAX_MESHLET_DESCRIPTORS << " bytes" << std::endl;
+        std::cout << "Requesting output buffer sizes (incl. counter) based on " << filterOutput.activeBlockCount << " active blocks:" << std::endl;
+        std::cout << "  - Vertex Buffer Size:       " << MAX_TOTAL_VERTICES_BYTES << " bytes" << std::endl;
+        std::cout << "  - Index Buffer Size:        " << MAX_TOTAL_INDICES_BYTES << " bytes" << std::endl;
+        std::cout << "  - Descriptor Buffer Size:   " << MAX_MESHLET_DESCRIPTORS_BYTES << " bytes" << std::endl;
 
-        // Create buffers with STORAGE usage for shader writes
         createBuffer(extractionOutput.vertexBuffer, device, vulkanContext.getMemoryProperties(),
-                     MAX_TOTAL_VERTICES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, // Add VERTEX if needed directly by renderer
+                     MAX_TOTAL_VERTICES_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (extractionOutput.vertexBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create vertexBuffer."); }
+
         createBuffer(extractionOutput.indexBuffer, device, vulkanContext.getMemoryProperties(),
-                     MAX_TOTAL_INDICES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, // Add INDEX if needed directly by renderer
+                     MAX_TOTAL_INDICES_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+         if (extractionOutput.indexBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create indexBuffer."); }
+
         createBuffer(extractionOutput.meshletDescriptorBuffer, device, vulkanContext.getMemoryProperties(),
-                     MAX_MESHLET_DESCRIPTORS, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     MAX_MESHLET_DESCRIPTORS_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+         if (extractionOutput.meshletDescriptorBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create meshletDescriptorBuffer."); }
 
-        // 3. Create and Update Descriptors
-        // Create UBO for constants (isovalue etc.) - Assuming Binding 0
-        constantsUBO = createConstantsUBO(vulkanContext, filterOutput, pushConstants);
+
+        // 3. Create UBO and MC Table
+        // Pass necessary values from pushConstants to UBO helper
+        constantsUBO = createConstantsUBO(vulkanContext, pushConstants.volumeDim, pushConstants.blockGridDim, pushConstants.isovalue);
+         if (constantsUBO.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create constants UBO."); }
         mcTableBuffer = createMCTableBuffer(vulkanContext);
+         if (mcTableBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create MC table buffer."); }
 
 
-        // --- Update Descriptor Set ---
-        if (extractionPipeline.descriptorSet_ == VK_NULL_HANDLE) {
-            throw std::runtime_error("Extraction pipeline descriptor set is null.");
-        }
+        // 4. Update Descriptors
+        if (extractionPipeline.descriptorSet_ == VK_NULL_HANDLE) { throw std::runtime_error("Extraction pipeline descriptor set is null."); }
         std::vector<VkWriteDescriptorSet> writes;
         VkDescriptorBufferInfo uboInfo = {constantsUBO.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorImageInfo volInfo = {VK_NULL_HANDLE, filterOutput.volumeImage.imageView, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo volInfo = {VK_NULL_HANDLE, filterOutput.volumeImage.imageView, VK_IMAGE_LAYOUT_GENERAL}; // Assuming GENERAL layout from filtering
         VkDescriptorBufferInfo blockIdInfo = {filterOutput.compactedBlockIdBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo mcTableInfo = {mcTableBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo vbInfo = {extractionOutput.vertexBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo descInfo = {extractionOutput.meshletDescriptorBuffer.buffer, 0, VK_WHOLE_SIZE};
 
-        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr});
-        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &volInfo, nullptr, nullptr});
-        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &blockIdInfo, nullptr});
-        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &mcTableInfo, nullptr});
-        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &vbInfo, nullptr});
-        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ibInfo, nullptr});
-        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &descInfo, nullptr});
+        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr});       // Binding 0: UBO
+        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &volInfo, nullptr, nullptr});         // Binding 1: Volume Image
+        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &blockIdInfo, nullptr});    // Binding 2: Block IDs
+        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &mcTableInfo, nullptr});     // Binding 3: MC Table
+        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &vbInfo, nullptr});        // Binding 4: Output Vertices
+        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ibInfo, nullptr});        // Binding 5: Output Indices
+        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipeline.descriptorSet_, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &descInfo, nullptr});       // Binding 7: Output Meshlet Descriptors
 
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-        std::cout << "Extraction pipeline descriptor set updated." << std::endl;
+        std::cout << "Extraction pipeline descriptor set updated (Meshlet Desc at Binding 7)." << std::endl;
 
-        // 4. Record Command Buffer
+        // 5. Record Command Buffer
         VkCommandBuffer cmd = beginSingleTimeCommands(device, vulkanContext.getCommandPool());
 
-        // --- Barriers Before Extraction ---
+        // --- Initialize Atomic Counters ---
         std::vector<VkBufferMemoryBarrier2> fillToComputeBarriers;
-
-        // Zero out the first uint (counter) in each output buffer
+        const VkPipelineStageFlags2 ATOMIC_SHADER_STAGES = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT;
+        const VkAccessFlags2 ATOMIC_ACCESS = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         vkCmdFillBuffer(cmd, extractionOutput.vertexBuffer.buffer, 0, counterSize, 0);
-        fillToComputeBarriers.push_back(bufferBarrier(
-            extractionOutput.vertexBuffer.buffer,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
-            0, counterSize // Barrier only for the counter part
-        ));
-
+        fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.vertexBuffer.buffer,VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS,0, counterSize ));
         vkCmdFillBuffer(cmd, extractionOutput.indexBuffer.buffer, 0, counterSize, 0);
-        fillToComputeBarriers.push_back(bufferBarrier(
-           extractionOutput.indexBuffer.buffer,
-           VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-           VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
-           0, counterSize
-       ));
-
+        fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.indexBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS, 0, counterSize ));
         vkCmdFillBuffer(cmd, extractionOutput.meshletDescriptorBuffer.buffer, 0, counterSize, 0);
-        fillToComputeBarriers.push_back(bufferBarrier(
-           extractionOutput.meshletDescriptorBuffer.buffer,
-           VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-           VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
-           0, counterSize
-       ));
-
-        // Ensure fill operations complete before shaders access the counters
+        fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.meshletDescriptorBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS, 0, counterSize ));
         pipelineBarrier(cmd, {}, fillToComputeBarriers.size(), fillToComputeBarriers.data(), 0, {});
         std::cout << "Atomic counters initialized." << std::endl;
 
+        // --- Barriers Before Extraction ---
         std::vector<VkBufferMemoryBarrier2> preBufferBarriers;
         std::vector<VkImageMemoryBarrier2> preImageBarriers;
+        const VkPipelineStageFlags2 EXTRACTION_SHADER_STAGES = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+        const VkAccessFlags2 EXTRACTION_WRITE_ACCESS = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        const VkAccessFlags2 EXTRACTION_READ_ACCESS = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT;
+        const VkAccessFlags2 EXTRACTION_ATOMIC_ACCESS = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
 
-        // Input Buffers/Images need to be readable by compute/task/mesh stages
-        preBufferBarriers.push_back(bufferBarrier(
-            filterOutput.compactedBlockIdBuffer.buffer,
-            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, // Assuming last op was copy/transfer read in filteringManager
-            VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-            0, VK_WHOLE_SIZE));
-        preImageBarriers.push_back(imageBarrier(
-            filterOutput.volumeImage.image,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, // Assuming last use was compute read
-             VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-            VK_IMAGE_LAYOUT_GENERAL, // Keep general layout
-            VK_IMAGE_ASPECT_COLOR_BIT));
-        preBufferBarriers.push_back(bufferBarrier(
-                mcTableBuffer.buffer,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, // Assuming last op was transfer write
-                VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-                0, VK_WHOLE_SIZE));
+        // Inputs Readable
+        preBufferBarriers.push_back(bufferBarrier(filterOutput.compactedBlockIdBuffer.buffer, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, 0, VK_WHOLE_SIZE));
+        // *** Assuming volume image is already in GENERAL layout from filtering pass ***
+        preImageBarriers.push_back(imageBarrier(filterOutput.volumeImage.image, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT));
+        preBufferBarriers.push_back(bufferBarrier(mcTableBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, 0, VK_WHOLE_SIZE));
+        // *** Added Barrier for UBO ***
+        preBufferBarriers.push_back(bufferBarrier(constantsUBO.buffer, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_UNIFORM_READ_BIT, 0, VK_WHOLE_SIZE));
 
-        // Output Buffers need to be writable by mesh shader
-        preBufferBarriers.push_back(bufferBarrier(
-            extractionOutput.vertexBuffer.buffer,
-            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            0, VK_WHOLE_SIZE));
-        preBufferBarriers.push_back(bufferBarrier(
-            extractionOutput.indexBuffer.buffer,
-            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            0, VK_WHOLE_SIZE));
-        preBufferBarriers.push_back(bufferBarrier(
-            extractionOutput.meshletDescriptorBuffer.buffer,
-            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            0, VK_WHOLE_SIZE));
-
+        // Outputs Writable (Simplified barrier after fill barrier)
+        preBufferBarriers.push_back(bufferBarrier(extractionOutput.vertexBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, EXTRACTION_SHADER_STAGES, EXTRACTION_WRITE_ACCESS | EXTRACTION_ATOMIC_ACCESS, 0, VK_WHOLE_SIZE ));
+        preBufferBarriers.push_back(bufferBarrier(extractionOutput.indexBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, EXTRACTION_SHADER_STAGES, EXTRACTION_WRITE_ACCESS | EXTRACTION_ATOMIC_ACCESS, 0, VK_WHOLE_SIZE ));
+        preBufferBarriers.push_back(bufferBarrier(extractionOutput.meshletDescriptorBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, EXTRACTION_SHADER_STAGES, EXTRACTION_WRITE_ACCESS | EXTRACTION_ATOMIC_ACCESS, 0, VK_WHOLE_SIZE ));
 
         pipelineBarrier(cmd, {}, preBufferBarriers.size(), preBufferBarriers.data(), preImageBarriers.size(), preImageBarriers.data());
 
+        // --- Begin Dynamic Rendering ---
         VkRenderingInfo renderingInfo = { VK_STRUCTURE_TYPE_RENDERING_INFO };
         renderingInfo.layerCount = 1;
-        // Since rasterization is disabled, we don't *need* attachments.
-        // Setting renderArea to 1x1 is minimal. The actual dispatch dimensions
-        // are controlled by vkCmdDrawMeshTasksEXT, not the render area.
-        renderingInfo.renderArea = {{0, 0}, {1, 1}}; // Minimal render area
-        renderingInfo.colorAttachmentCount = 0;       // No color attachments
+        renderingInfo.renderArea = {{0, 0}, {1, 1}};
+        renderingInfo.colorAttachmentCount = 0;
         renderingInfo.pColorAttachments = nullptr;
-        renderingInfo.pDepthAttachment = nullptr;       // No depth attachment
+        renderingInfo.pDepthAttachment = nullptr;
         renderingInfo.pStencilAttachment = nullptr;
-
         vkCmdBeginRendering(cmd, &renderingInfo);
+
         // --- Bind Pipeline & Descriptors ---
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, extractionPipeline.pipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, extractionPipeline.pipelineLayout_, 0, 1, &extractionPipeline.descriptorSet_, 0, nullptr);
+
+        // --- Set Dynamic State ---
         VkViewport viewport = { 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
         VkRect2D scissor = {{0, 0}, {1, 1}};
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &scissor);
+
         // --- Dispatch ---
-        // Dispatch one task workgroup per active block found in the previous stage
         uint32_t taskCount = filterOutput.activeBlockCount;
         std::cout << "Dispatching " << taskCount << " mesh tasks..." << std::endl;
-        vkCmdDrawMeshTasksEXT(cmd, taskCount, 1, 1); // One task per active block ID
+        vkCmdDrawMeshTasksEXT(cmd, taskCount, 1, 1);
+
+        // --- End Dynamic Rendering ---
         vkCmdEndRendering(cmd);
 
         // --- Barriers After Extraction ---
-        // Ensure mesh shader writes are finished before subsequent reads (e.g., rendering or copy)
         std::vector<VkBufferMemoryBarrier2> postBufferBarriers;
-        VkPipelineStageFlags2 dstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
-        VkAccessFlags2 dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
-        postBufferBarriers.push_back(bufferBarrier(extractionOutput.vertexBuffer.buffer, VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT, dstStageMask, dstAccessMask, 0, VK_WHOLE_SIZE));
-        postBufferBarriers.push_back(bufferBarrier(extractionOutput.indexBuffer.buffer, VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT, dstStageMask, dstAccessMask, 0, VK_WHOLE_SIZE));
-        postBufferBarriers.push_back(bufferBarrier(extractionOutput.meshletDescriptorBuffer.buffer, VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT, dstStageMask, dstAccessMask, 0, VK_WHOLE_SIZE));
+        VkPipelineStageFlags2 postSrcStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+        // *** Corrected: Use STORAGE_WRITE for srcAccessMask ***
+        VkAccessFlags2 postSrcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        VkPipelineStageFlags2 postDstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+        VkAccessFlags2 postDstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.vertexBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.indexBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.meshletDescriptorBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
 
         pipelineBarrier(cmd, {}, postBufferBarriers.size(), postBufferBarriers.data(), 0, {});
+        // *** Removed duplicate pipelineBarrier call ***
 
-
-
-         pipelineBarrier(cmd, {}, postBufferBarriers.size(), postBufferBarriers.data(), 0, {});
-
-
-        // 5. Submit and Wait
+        // 6. Submit and Wait
         endSingleTimeCommands(device, vulkanContext.getCommandPool(), vulkanContext.getQueue(), cmd);
-        VK_CHECK(vkDeviceWaitIdle(device)); // Ensure GPU is finished
-
+        VK_CHECK(vkDeviceWaitIdle(device));
         std::cout << "Meshlet extraction command buffer submitted and executed." << std::endl;
-
-        // Optionally read back meshlet count if needed (requires another buffer + atomic in shader)
-        // extractionOutput.meshletCount = readBackCountBuffer(...);
+        extractionOutput.meshletCount = filterOutput.activeBlockCount; // Still an upper bound
 
     } catch (const std::exception& e) {
         std::cerr << "Error during meshlet extraction: " << e.what() << std::endl;
-        // Cleanup partially created resources
-        extractionPipeline.cleanup(); // Uses RAII
-        extractionOutput.cleanup();   // Uses RAII
-        destroyBuffer(constantsUBO, device); // Manual cleanup for UBO
-        destroyBuffer(mcTableBuffer, device); // Manual cleanup for MC table
-        throw; // Re-throw the exception
+        // Cleanup is handled by RAII destructors for pipeline/output
+        // Need to manually clean up UBO/MC Table if created before throw
+        destroyBuffer(constantsUBO, device); // Safe to call even if null
+        destroyBuffer(mcTableBuffer, device); // Safe to call even if null
+        throw;
     }
 
-     // --- Cleanup Temporary Resources ---
-     // UBO and MC Table Buffer are temporary for this stage
-     destroyBuffer(constantsUBO, device);
-     destroyBuffer(mcTableBuffer, device);
-
-    // extractionPipeline goes out of scope and cleans itself up via RAII destructor
+    // Cleanup temporary UBO and MC table buffer
+    // RAII handles extractionPipeline and extractionOutput cleanup
+    destroyBuffer(constantsUBO, device);
+    destroyBuffer(mcTableBuffer, device);
 
     std::cout << "--- Finished Meshlet Extraction ---" << std::endl;
-
-    // extractionOutput now holds the results (buffers). Its destructor will clean them up when it goes out of scope.
-    // If you need to transfer ownership, use std::move.
     return extractionOutput;
 }

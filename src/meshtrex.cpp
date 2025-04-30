@@ -15,7 +15,7 @@
 
 int main(int argc, char** argv) {
     try {
-        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/aneurism_256x256x256_uint8.raw");
+        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/bonsai_256x256x256_uint8.raw");
         float isovalue = 60;
         bool requestMeshShading = false;
 #ifndef __APPLE__
