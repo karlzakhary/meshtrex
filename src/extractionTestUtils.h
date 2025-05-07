@@ -30,3 +30,9 @@ bool compareExtractionOutputs(
     VulkanContext& context,
     const ExtractionOutput& gpuOutput,      // Results from GPU Extraction
     const CPUExtractionOutput& cpuOutput);
+
+bool writeGPUExtractionToOBJ(
+    VulkanContext& context,
+    const ExtractionOutput& gpuOutput, // Contains GPU buffer handles
+    const std::string& filename
+);

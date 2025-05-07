@@ -100,7 +100,7 @@ void ExtractionPipeline::releaseResources() {
 void ExtractionPipeline::createPipelineLayout()
 {
     // --- Create Descriptor Set Layout ---
-    std::vector<VkDescriptorSetLayoutBinding> bindings(7);
+    std::vector<VkDescriptorSetLayoutBinding> bindings(9);
     bindings[0] = {
         .binding = 0,
         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -123,7 +123,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // Block IDs
+    };  // Active Block count
 
     bindings[3] = {
         .binding = 3,
@@ -131,7 +131,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // MC Table
+    };  // Block IDs
 
     bindings[4] = {
         .binding = 4,
@@ -139,7 +139,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // output Vertex Buffer (Storage Buffer)
+    };  // MC Triangle Table
 
     bindings[5] = {
         .binding = 5,
@@ -147,10 +147,26 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // output Index Buffer (Storage Buffer)
+    };  // MC NumVertices
 
     bindings[6] = {
         .binding = 6,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };  // output Vertex Buffer (Storage Buffer)
+
+    bindings[7] = {
+        .binding = 7,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };  // output Index Buffer (Storage Buffer)
+
+    bindings[8] = {
+        .binding = 8,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
@@ -286,7 +302,7 @@ void ExtractionPipeline::createDescriptorPool()
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1});  // UBO
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});   // Volume
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                         5});  // IDs + MC Table + VB + IB + Meshlet Descriptor
+                         7});  // Block count + IDs + MC Triangle Table + MC Number vertices + VB + IB + Meshlet Descriptor
     VkDescriptorPoolCreateInfo poolInfo = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;

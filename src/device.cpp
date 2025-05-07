@@ -55,7 +55,15 @@ VkInstance createInstance()
     } else {
         printf("Warning: Vulkan debug layers are not available\n");
     }
+    VkValidationFeaturesEXT validationFeatures = {};
+    validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
 
+    VkValidationFeatureEnableEXT enabledFeatures[] = {
+        VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT
+    };
+
+    validationFeatures.enabledValidationFeatureCount = 1;
+    validationFeatures.pEnabledValidationFeatures = enabledFeatures;
 #if SYNC_VALIDATION
     VkValidationFeatureEnableEXT enabledValidationFeatures[] = {
         VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
@@ -88,7 +96,7 @@ VkInstance createInstance()
 
     createInfo.ppEnabledExtensionNames = extensions;
     createInfo.enabledExtensionCount = std::size(extensions);
-
+    createInfo.pNext = &validationFeatures;
 #ifdef VK_USE_PLATFORM_METAL_EXT
     createInfo.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
 #endif
@@ -127,7 +135,7 @@ VkDebugReportCallbackEXT registerDebugCallback(VkInstance instance)
 
     VkDebugReportCallbackCreateInfoEXT createInfo = {
         VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT};
-    createInfo.flags = VK_DEBUG_REPORT_WARNING_BIT_EXT |
+    createInfo.flags = VK_DEBUG_REPORT_WARNING_BIT_EXT | VK_DEBUG_REPORT_INFORMATION_BIT_EXT | VK_DEBUG_REPORT_DEBUG_BIT_EXT |
                        VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT |
                        VK_DEBUG_REPORT_ERROR_BIT_EXT;
     createInfo.pfnCallback = debugReportCallback;
@@ -215,6 +223,7 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
     queueInfo.pQueuePriorities = queuePriorities;
 
     std::vector<const char *> extensions = {
+        VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME,
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         VK_KHR_16BIT_STORAGE_EXTENSION_NAME,

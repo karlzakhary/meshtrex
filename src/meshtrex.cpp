@@ -27,7 +27,6 @@ int main(int argc, char** argv) {
         Volume volume = loadVolume(volumePath.c_str());
         std::cout << "Volume " << volumePath.c_str() << " is loaded.";
         PushConstants pushConstants = {};
-        // ... (Setup pushConstants as before) ...
         pushConstants.volumeDim = glm::uvec4(volume.volume_dims, 1);
         pushConstants.blockDim = glm::uvec4(8, 8, 8, 1);
         pushConstants.blockGridDim = glm::uvec4(
@@ -46,7 +45,13 @@ int main(int argc, char** argv) {
         std::cout << "Filtering complete. Received handles." << std::endl;
         std::cout << "Active blocks: " << filteringResult.activeBlockCount << std::endl;
         ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, filteringResult, pushConstants);
+        bool res = writeGPUExtractionToOBJ(context, extractionResultGPU, "aikalam.obj");
         CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
+        try {
+            // CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
+        } catch (std::exception& e) {
+            std::cout << e.what() << std::endl;
+        }
 
         // Perform the comparison
         bool match = compareExtractionOutputs(context, extractionResultGPU, extractionResultCPU);
