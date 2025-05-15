@@ -378,7 +378,7 @@ uint32_t filterUnoccupiedBlocks(char **argv, const char *path)
     pushConstants.volumeDim    = glm::uvec4(volume.volume_dims, 1); // Pad W with 1
     pushConstants.blockDim     = glm::uvec4(8, 8, 8, 1);      // Pad W with 1
     pushConstants.blockGridDim = glm::uvec4(glm::uvec3((pushConstants.volumeDim + pushConstants.blockDim - 1u) / pushConstants.blockDim), 1);       // Pad W with 1
-    pushConstants.isovalue     = 60;
+    pushConstants.isovalue     = 80;
 
     // --- Prepare Buffers and Images ---
     VkCommandBuffer commandBuffer = beginSingleTimeCommands(device, context.getCommandPool());

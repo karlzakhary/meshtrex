@@ -21,8 +21,8 @@ const int BLOCK_DIM_X_MAX = 8; // Max dimensions the process starts with
 const int BLOCK_DIM_Y_MAX = 8;
 const int BLOCK_DIM_Z_MAX = 8;
 const int MIN_BLOCK_DIM = 2; // Smallest block size to recurse down to
-const int MAX_MESHLET_VERTICES = 128;
-const int MAX_MESHLET_PRIMITIVES = 256;
+const int MAX_MESHLET_VERTICES = 512;
+const int MAX_MESHLET_PRIMITIVES = 512;
 
 // --- Helper Structures ---
 struct CPUVertex { /* ... Same as before ... */
@@ -517,7 +517,7 @@ bool compareExtractionOutputs(
 }
 
 // --- UPDATED FUNCTION IMPLEMENTATION for GPU OBJ Export (Vertices & Faces) ---
-bool writeGPUExtractionToOBJ(
+bool writeGPUExtractionToOBJPrev(
     VulkanContext& context,
     const ExtractionOutput& gpuOutput, // Contains GPU buffer handles
     const std::string& filename
@@ -540,11 +540,11 @@ bool writeGPUExtractionToOBJ(
 
     try {
         if(gpuOutput.vertexBuffer.buffer != VK_NULL_HANDLE)
-            counterVertexCount = mapCounterBuffer(context, gpuOutput.vertexBuffer);
+            counterVertexCount = mapCounterBuffer(context, gpuOutput.vertexCountBuffer);
         if(gpuOutput.indexBuffer.buffer != VK_NULL_HANDLE)
-            counterIndexCount = mapCounterBuffer(context, gpuOutput.indexBuffer);
+            counterIndexCount = mapCounterBuffer(context, gpuOutput.indexCountBuffer);
         if(gpuOutput.meshletDescriptorBuffer.buffer != VK_NULL_HANDLE)
-            counterMeshletCount = mapCounterBuffer(context, gpuOutput.meshletDescriptorBuffer);
+            counterMeshletCount = mapCounterBuffer(context, gpuOutput.meshletDescriptorCountBuffer);
 
         std::cout << "GPU Atomic Counter Readback:" << std::endl;
         std::cout << "  - Vertex Counter:    " << counterVertexCount << std::endl;
@@ -727,4 +727,431 @@ bool writeGPUExtractionToOBJ(
         std::cerr << "Error writing GPU mesh to file " << filename << std::endl;
         return false;
     }
+}
+
+// Helper function to read a single uint32_t counter from a buffer
+uint32_t readCounterFromBuffer(VulkanContext& context, const Buffer& counterBuffer) {
+    if (counterBuffer.buffer == VK_NULL_HANDLE || counterBuffer.size < sizeof(uint32_t)) {
+        std::cerr << "Warning: Invalid or too small counter buffer provided." << std::endl;
+        return 0;
+    }
+
+    VkDevice device = context.getDevice();
+    Buffer readbackBuffer = {};
+    VkDeviceSize counterDataSize = sizeof(uint32_t);
+
+    createBuffer(readbackBuffer, device, context.getMemoryProperties(),
+                 counterDataSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    if (readbackBuffer.buffer == VK_NULL_HANDLE || readbackBuffer.data == nullptr) {
+        destroyBuffer(readbackBuffer, device); // Cleanup if partially created
+        throw std::runtime_error("Failed to create or map readback buffer for counter.");
+    }
+
+    VkCommandBuffer cmd = beginSingleTimeCommands(device, context.getCommandPool());
+
+    // Barrier: Ensure shader writes to the counter are finished before copy
+    // Assuming the counter was last written by a TASK_SHADER_BIT_EXT
+    VkBufferMemoryBarrier2 counterReadBarrier = bufferBarrier(
+        counterBuffer.buffer,
+        VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, // Source: Task shader atomic write
+        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,                  // Destination: Transfer read
+        0, counterDataSize);
+    pipelineBarrier(cmd, {}, 1, &counterReadBarrier, 0, {});
+
+    VkBufferCopy region = {0, 0, counterDataSize};
+    vkCmdCopyBuffer(cmd, counterBuffer.buffer, readbackBuffer.buffer, 1, &region);
+
+    // Barrier: Ensure copy to readback buffer is complete before host access
+    // (This is implicitly handled by endSingleTimeCommands waiting on the queue)
+
+    endSingleTimeCommands(device, context.getCommandPool(), context.getQueue(), cmd);
+    // vkDeviceWaitIdle(device); // Already done by endSingleTimeCommands
+
+    uint32_t count = 0;
+    memcpy(&count, readbackBuffer.data, sizeof(uint32_t));
+
+    destroyBuffer(readbackBuffer, device);
+    return count;
+}
+
+// Generic helper function to read an array of data from a GPU buffer
+template <typename T>
+std::vector<T> readDataBuffer(VulkanContext& context, const Buffer& dataBuffer, uint32_t elementCount) {
+    if (elementCount == 0) {
+        return {};
+    }
+    if (dataBuffer.buffer == VK_NULL_HANDLE) {
+        std::cerr << "Warning: Invalid data buffer provided for readback." << std::endl;
+        return {};
+    }
+
+    VkDevice device = context.getDevice();
+    VkDeviceSize elementSize = sizeof(T);
+    VkDeviceSize totalDataSize = elementCount * elementSize;
+
+    if (dataBuffer.size < totalDataSize) {
+         std::cerr << "Warning: Data buffer is smaller (" << dataBuffer.size
+                   << " bytes) than expected based on element count (" << elementCount
+                   << " elements * " << elementSize << " bytes/element = " << totalDataSize << " bytes)." << std::endl;
+        // Optionally, adjust elementCount or throw error
+        // For now, proceed with caution or return empty
+        return {};
+    }
+
+
+    Buffer readbackBuffer = {};
+    createBuffer(readbackBuffer, device, context.getMemoryProperties(),
+                 totalDataSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    if (readbackBuffer.buffer == VK_NULL_HANDLE || readbackBuffer.data == nullptr) {
+        destroyBuffer(readbackBuffer, device);
+        throw std::runtime_error("Failed to create or map readback buffer for data array.");
+    }
+
+    VkCommandBuffer cmd = beginSingleTimeCommands(device, context.getCommandPool());
+
+    // Barrier: Ensure shader writes to the data buffer are finished before copy
+    // Assuming data was last written by a MESH_SHADER_BIT_EXT
+    VkBufferMemoryBarrier2 dataReadBarrier = bufferBarrier(
+        dataBuffer.buffer,
+        VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, // Source: Mesh shader write
+        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,                   // Destination: Transfer read
+        0, totalDataSize); // Offset 0, as data starts from beginning of this buffer
+    pipelineBarrier(cmd, {}, 1, &dataReadBarrier, 0, {});
+
+
+    VkBufferCopy region = {0, 0, totalDataSize}; // Copy from offset 0
+    vkCmdCopyBuffer(cmd, dataBuffer.buffer, readbackBuffer.buffer, 1, &region);
+
+    endSingleTimeCommands(device, context.getCommandPool(), context.getQueue(), cmd);
+
+    std::vector<T> hostData(elementCount);
+    memcpy(hostData.data(), readbackBuffer.data, totalDataSize);
+
+    destroyBuffer(readbackBuffer, device);
+    return hostData;
+}
+
+
+void writeGPUExtractionToOBJ(
+    VulkanContext& context,
+    ExtractionOutput& extractionResult, // Pass by non-const ref if you intend to populate counts here
+    const char* filePath)
+{
+    std::cout << "Attempting to write GPU extraction output to OBJ: " << filePath << std::endl;
+
+    // 1. Read counts from their respective buffers
+    // These counts are the ACTUAL number of elements written by the shaders.
+    extractionResult.vertexCount = readCounterFromBuffer(context, extractionResult.vertexCountBuffer);
+    extractionResult.indexCount = readCounterFromBuffer(context, extractionResult.indexCountBuffer);
+    extractionResult.meshletCount = readCounterFromBuffer(context, extractionResult.meshletDescriptorCountBuffer);
+
+    std::cout << "  Read from GPU: Vertices = " << extractionResult.vertexCount
+              << ", Indices = " << extractionResult.indexCount
+              << ", Meshlets = " << extractionResult.meshletCount << std::endl;
+
+    if (extractionResult.vertexCount == 0 || extractionResult.indexCount == 0) {
+        std::cout << "  No vertices or indices to write. OBJ file will be empty or minimal." << std::endl;
+        // Create an empty file or just return
+        std::ofstream outFile(filePath);
+        if (!outFile.is_open()) {
+            std::cerr << "Error: Could not open OBJ file for writing: " << filePath << std::endl;
+        } // outFile will close on scope exit
+        return;
+    }
+
+    // 2. Read actual data from buffers
+    std::vector<VertexData> vertices = readDataBuffer<VertexData>(context, extractionResult.vertexBuffer, extractionResult.vertexCount);
+    std::vector<uint32_t> indices = readDataBuffer<uint32_t>(context, extractionResult.indexBuffer, extractionResult.indexCount);
+    std::vector<MeshletDescriptor> meshlets; // Only needed if you want to structure OBJ by meshlets (e.g., with 'g' tags)
+                                           // For a simple flat OBJ, we just need vertices and global indices.
+                                           // If you want to verify meshlet descriptors, read them here:
+    // meshlets = readDataBuffer<MeshletDescriptor>(context, extractionResult.meshletDescriptorBuffer, extractionResult.meshletCount);
+
+    std::vector<uint32_t> correctIndices;
+    if (vertices.empty() || indices.empty()) {
+        std::cout << "  Failed to read vertex or index data from GPU. OBJ will be incomplete." << std::endl;
+        return;
+    }
+
+    std::ofstream outFile(filePath);
+    if (!outFile.is_open()) {
+        std::cerr << "Error: Could not open OBJ file for writing: " << filePath << std::endl;
+        return;
+    }
+
+    // Set precision for floating point numbers
+    outFile << std::fixed << std::setprecision(6);
+
+    outFile << "# OBJ file generated from GPU extraction" << std::endl;
+    outFile << "# Vertices: " << extractionResult.vertexCount << std::endl;
+    outFile << "# Triangles: " << extractionResult.indexCount / 3 << std::endl;
+    outFile << "# Meshlets: " << extractionResult.meshletCount << std::endl;
+
+    // 3. Write Vertices (v) and Vertex Normals (vn)
+    // Since VertexData pairs position and normal, their indices will align.
+    size_t nonZero = 0;
+    for (size_t i = 0; i < vertices.size(); ++i) {
+        // Assuming VertexData.position and .normal are glm::vec4, use .xyz
+        if (vertices[i].position.x != 0 && vertices[i].position.y != 0 && vertices[i].position.z != 0) {
+            outFile << "v " << vertices[i].position.x << " " << vertices[i].position.y << " " << vertices[i].position.z << std::endl;
+            nonZero++;
+        }
+        // outFile << "v " << vertices[i].position.x << " " << vertices[i].position.y << " " << vertices[i].position.z << std::endl;
+    }
+    for (size_t i = 0; i <= nonZero; i = i+3 ) {
+        // Assuming VertexData.position and .normal are glm::vec4, use .xyz
+        outFile << " f " << i + 1 << " " << i + 2 << " " << i + 3 << std::endl;
+
+        // outFile << "v " << vertices[i].position.x << " " << vertices[i].position.y << " " << vertices[i].position.z << std::endl;
+    }
+
+    // 4. Write Faces (f)
+    // The `indices` buffer contains GLOBAL vertex indices.
+    // OBJ uses 1-based indexing.
+    if (extractionResult.indexCount % 3 != 0) {
+        std::cerr << "Warning: Index count (" << extractionResult.indexCount << ") is not a multiple of 3. Face data might be incorrect." << std::endl;
+    }
+
+    for (size_t i = 0; i < indices.size(); i += 3) {
+        // OBJ indices are 1-based
+        uint32_t v1_idx = indices[i+0] + 1;
+        uint32_t v2_idx = indices[i+1] + 1;
+        uint32_t v3_idx = indices[i+2] + 1;
+
+        if (
+            v1_idx != 1 && v2_idx != 1 && v3_idx != 1 &&
+            vertices[v1_idx].position.x != 0 &&
+            vertices[v1_idx].position.y != 0 &&
+            vertices[v1_idx].position.z != 0 &&
+            vertices[v2_idx].position.x != 0 &&
+            vertices[v2_idx].position.y != 0 &&
+            vertices[v2_idx].position.z != 0 &&
+            vertices[v3_idx].position.x != 0 &&
+            vertices[v3_idx].position.y != 0 &&
+            vertices[v3_idx].position.z != 0
+            )
+            {
+            // Format: f v1//vn1 v2//vn2 v3//vn3
+            // Since vertex and normal data are paired, their indices are the same.
+            // outFile << " f " << v1_idx << " " << v2_idx << " " << v3_idx << std::endl;
+        }
+    }
+
+    outFile.close();
+    std::cout << "Successfully wrote data to " << filePath << std::endl;
+}
+
+
+/////////////////////////////////////
+// Generic helper function to read a specific chunk of data from a GPU buffer
+template <typename T>
+std::vector<T> readDataChunkFromBuffer(VulkanContext& context, const Buffer& dataBuffer, VkDeviceSize offset, uint32_t elementCount) {
+    if (elementCount == 0) {
+        return {};
+    }
+    if (dataBuffer.buffer == VK_NULL_HANDLE) {
+        std::cerr << "Warning: Invalid data buffer provided for readDataChunkFromBuffer." << std::endl;
+        return {};
+    }
+
+    VkDevice device = context.getDevice();
+    VkDeviceSize elementSize = sizeof(T);
+    VkDeviceSize dataChunkSize = elementCount * elementSize;
+
+    if (dataBuffer.size < (offset + dataChunkSize)) {
+         std::cerr << "ERROR in readDataChunkFromBuffer: Read request (offset " << offset << ", size " << dataChunkSize
+                   << ") exceeds buffer actual size (" << dataBuffer.size << " bytes)." << std::endl;
+        return {}; // Critical error
+    }
+
+    Buffer readbackBuffer = {};
+    createBuffer(readbackBuffer, device, context.getMemoryProperties(),
+                 dataChunkSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    if (readbackBuffer.buffer == VK_NULL_HANDLE || readbackBuffer.data == nullptr) {
+        destroyBuffer(readbackBuffer, device);
+        throw std::runtime_error("Failed to create or map readback buffer for data chunk.");
+    }
+
+    VkCommandBuffer cmd = beginSingleTimeCommands(device, context.getCommandPool());
+
+    VkBufferMemoryBarrier2 dataReadBarrier = bufferBarrier(
+        dataBuffer.buffer,
+        VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+        offset, dataChunkSize); // Use the provided offset and chunk size
+    pipelineBarrier(cmd, {}, 1, &dataReadBarrier, 0, {});
+
+    VkBufferCopy region = {offset, 0, dataChunkSize}; // Copy from the specified offset
+    vkCmdCopyBuffer(cmd, dataBuffer.buffer, readbackBuffer.buffer, 1, &region);
+
+    endSingleTimeCommands(device, context.getCommandPool(), context.getQueue(), cmd);
+
+    std::vector<T> hostData(elementCount);
+    memcpy(hostData.data(), readbackBuffer.data, dataChunkSize);
+
+    destroyBuffer(readbackBuffer, device);
+    return hostData;
+}
+
+
+void writeExtractionOutputToOBJ_Revised(
+    VulkanContext& context,
+    ExtractionOutput& extractionResult,
+    const char* filePath)
+{
+    std::cout << "Attempting to write GPU extraction output to OBJ (Revised): " << filePath << std::endl;
+
+    // 1. Read the number of *actually written* meshlet descriptors
+    uint32_t actualMeshletCount = readCounterFromBuffer(context, extractionResult.meshletDescriptorCountBuffer);
+    extractionResult.meshletCount = actualMeshletCount;
+
+    std::cout << "  Actual Meshlet Descriptors generated by GPU: " << actualMeshletCount << std::endl;
+
+    if (actualMeshletCount == 0) {
+        std::cout << "  No meshlets generated. OBJ file will be empty." << std::endl;
+        std::ofstream outFile(filePath);
+        return;
+    }
+
+    // 2. Read ALL meshlet descriptors (even if some are empty)
+    std::vector<MeshletDescriptor> meshletDescriptors =
+        readDataChunkFromBuffer<MeshletDescriptor>(context, extractionResult.meshletDescriptorBuffer, 0, actualMeshletCount);
+
+    if (meshletDescriptors.empty() && actualMeshletCount > 0) {
+        std::cerr << "  Failed to read meshlet descriptors from GPU. Aborting OBJ write." << std::endl;
+        return;
+    }
+
+    // --- CPU-side lists for compact geometry ---
+    std::vector<VertexData> compactVertices;
+    std::vector<glm::uvec3> compactFaces; // Store triplets of new, compact indices
+    std::map<uint32_t, uint32_t> globalToLocalVertexIndexMap; // Map global GPU index to new compact CPU index
+    uint32_t nextCompactVertexIndex = 0;
+
+    uint32_t totalNonEmptyMeshlets = 0;
+    uint32_t totalActualVerticesFromDesc = 0;
+    uint32_t totalActualTrianglesFromDesc = 0;
+
+    // 3. Iterate through each meshlet descriptor
+    for (const auto& desc : meshletDescriptors) {
+        if (desc.vertexCount == 0 || desc.primitiveCount == 0) {
+            continue; // Skip empty meshlets
+        }
+        totalNonEmptyMeshlets++;
+        totalActualVerticesFromDesc += desc.vertexCount;
+        totalActualTrianglesFromDesc += desc.primitiveCount;
+
+        // 4. Read this meshlet's vertex data
+        std::vector<VertexData> meshletVertices =
+            readDataChunkFromBuffer<VertexData>(context, extractionResult.vertexBuffer,
+                                                desc.vertexOffset * sizeof(VertexData), // Byte offset
+                                                desc.vertexCount);
+
+        // 5. Read this meshlet's index data
+        std::vector<uint32_t> meshletIndices =
+            readDataChunkFromBuffer<uint32_t>(context, extractionResult.indexBuffer,
+                                               desc.indexOffset * sizeof(uint32_t), // Byte offset
+                                               desc.primitiveCount * 3);
+
+        if (meshletVertices.empty() || meshletIndices.empty()) {
+            std::cerr << "  Warning: Failed to read vertex or index data for a non-empty meshlet (VtxOffset: "
+                      << desc.vertexOffset << ", IdxOffset: " << desc.indexOffset
+                      << ", VtxCount: " << desc.vertexCount << ", PrimCount: " << desc.primitiveCount
+                      << "). Skipping this meshlet." << std::endl;
+            continue;
+        }
+
+        // 6. Process vertices and indices for this meshlet, re-indexing for the compact list
+        std::vector<uint32_t> currentMeshletCompactedIndices;
+        currentMeshletCompactedIndices.reserve(meshletIndices.size());
+
+        for (uint32_t globalGpuIndex : meshletIndices) {
+            // The indices from the GPU buffer (meshletIndices) are relative to the start of
+            // the ENTIRE vertexBuffer (i.e., they are already global offsets if written correctly by shader).
+            // However, the shader writes indices relative to its globalVtxBase.
+            // So, globalGpuIndex here is actually the global index.
+
+            auto it = globalToLocalVertexIndexMap.find(globalGpuIndex);
+            if (it == globalToLocalVertexIndexMap.end()) {
+                // Vertex not yet in our compact list, add it
+                // We need to fetch the actual VertexData for this globalGpuIndex.
+                // This requires reading from the correct position in the *original* meshletVertices chunk.
+                // The globalGpuIndex is an offset into the *entire* vertexBuffer.
+                // The meshletVertices vector is only `desc.vertexCount` long.
+                // The indices in `meshletIndices` are already global offsets from the shader.
+                // We need to find which vertex from `meshletVertices` this `globalGpuIndex` corresponds to.
+                // This implies `globalGpuIndex` should be between `desc.vertexOffset` and `desc.vertexOffset + desc.vertexCount -1`.
+                if (globalGpuIndex >= desc.vertexOffset && globalGpuIndex < (desc.vertexOffset + desc.vertexCount)) {
+                    uint32_t localIndexWithinMeshletChunk = globalGpuIndex - desc.vertexOffset;
+                    compactVertices.push_back(meshletVertices[localIndexWithinMeshletChunk]);
+                    globalToLocalVertexIndexMap[globalGpuIndex] = nextCompactVertexIndex;
+                    currentMeshletCompactedIndices.push_back(nextCompactVertexIndex);
+                    nextCompactVertexIndex++;
+                } else {
+                    std::cerr << "  Error: Index " << globalGpuIndex << " is out of range for current meshlet's vertices (Offset: "
+                              << desc.vertexOffset << ", Count: " << desc.vertexCount << "). Skipping index." << std::endl;
+                    // Push a dummy to keep face structure, or handle error differently
+                    currentMeshletCompactedIndices.push_back(0); // Or some error marker
+                }
+            } else {
+                // Vertex already added, use its existing compact index
+                currentMeshletCompactedIndices.push_back(it->second);
+            }
+        }
+
+        // Add faces using the new compacted indices
+        for (size_t i = 0; i < currentMeshletCompactedIndices.size(); i += 3) {
+            if (i + 2 < currentMeshletCompactedIndices.size()) {
+                compactFaces.push_back(glm::uvec3(currentMeshletCompactedIndices[i],
+                                                  currentMeshletCompactedIndices[i+1],
+                                                  currentMeshletCompactedIndices[i+2]));
+            }
+        }
+    }
+
+    std::cout << "  Processed " << totalNonEmptyMeshlets << " non-empty meshlets." << std::endl;
+    std::cout << "  Total vertices from descriptors: " << totalActualVerticesFromDesc << std::endl;
+    std::cout << "  Total triangles from descriptors: " << totalActualTrianglesFromDesc << std::endl;
+    std::cout << "  Compact OBJ Vertices: " << compactVertices.size() << std::endl;
+    std::cout << "  Compact OBJ Triangles: " << compactFaces.size() << std::endl;
+
+
+    if (compactVertices.empty() || compactFaces.empty()) {
+        std::cout << "  No geometry to write after processing meshlets. OBJ file will be minimal." << std::endl;
+        std::ofstream outFile(filePath);
+        return;
+    }
+
+    std::ofstream outFile(filePath);
+    if (!outFile.is_open()) {
+        std::cerr << "Error: Could not open OBJ file for writing: " << filePath << std::endl;
+        return;
+    }
+
+    outFile << std::fixed << std::setprecision(6);
+    outFile << "# OBJ file generated from GPU extraction (Revised)" << std::endl;
+    outFile << "# Compact Vertices: " << compactVertices.size() << std::endl;
+    outFile << "# Compact Triangles: " << compactFaces.size() << std::endl;
+    outFile << "# Processed Meshlets: " << totalNonEmptyMeshlets << std::endl;
+
+    for (const auto& vertex : compactVertices) {
+        outFile << "v " << vertex.position.x << " " << vertex.position.y << " " << vertex.position.z << std::endl;
+        outFile << "vn " << vertex.normal.x << " " << vertex.normal.y << " " << vertex.normal.z << std::endl;
+    }
+
+    for (const auto& face : compactFaces) {
+        // OBJ indices are 1-based
+        outFile << "f " << (face.x + 1) << "//" << (face.x + 1) << " "
+                        << (face.y + 1) << "//" << (face.y + 1) << " "
+                        << (face.z + 1) << "//" << (face.z + 1) << std::endl;
+    }
+
+    outFile.close();
+    std::cout << "Successfully wrote compact data to " << filePath << std::endl;
 }

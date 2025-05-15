@@ -546,7 +546,7 @@ inline int compareCompactedIDs(std::vector<uint32_t>& gpuIDs, uint32_t gpuCount,
 
 inline void testCompactBuffer(VulkanContext &context, Buffer &compactedBlockIdBuffer, uint32_t gpuActiveCount) {
 
-    float isovalue = 60.0f;
+    float isovalue = 80.0f;
 
     // Placeholder for GPU results
     std::vector<uint32_t> gpuCompactedIDs;
@@ -659,8 +659,8 @@ inline std::vector<glm::vec3> mapVec3Buffer(VulkanContext& context, const Buffer
     VkDeviceSize counterSize = sizeof(uint32_t);
     VkDeviceSize elementSize = sizeof(glm::vec3);
     VkDeviceSize dataSize = elementCount * elementSize;
-    VkDeviceSize requiredBufferSize = counterSize + dataSize;
-    VkDeviceSize bufferOffset = counterSize; // Start reading after the counter
+    VkDeviceSize requiredBufferSize =  dataSize;
+    VkDeviceSize bufferOffset = 0; // Start reading after the counter
 
     std::vector<glm::vec3> cpuData;
     cpuData.resize(elementCount); // Allocate space
@@ -724,8 +724,8 @@ inline std::vector<MeshletDescriptor> mapMeshletDescriptorBuffer(VulkanContext& 
     VkDeviceSize counterSize = sizeof(uint32_t);
     VkDeviceSize elementSize = sizeof(MeshletDescriptor);
     VkDeviceSize dataSize = elementCount * elementSize;
-    VkDeviceSize requiredBufferSize = counterSize + dataSize;
-    VkDeviceSize bufferOffset = counterSize; // Start reading after the counter
+    VkDeviceSize requiredBufferSize =  dataSize;
+    VkDeviceSize bufferOffset = 0; // Start reading after the counter
 
     std::vector<MeshletDescriptor> cpuData;
     cpuData.resize(elementCount);

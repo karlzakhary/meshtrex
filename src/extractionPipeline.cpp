@@ -100,14 +100,14 @@ void ExtractionPipeline::releaseResources() {
 void ExtractionPipeline::createPipelineLayout()
 {
     // --- Create Descriptor Set Layout ---
-    std::vector<VkDescriptorSetLayoutBinding> bindings(9);
+    std::vector<VkDescriptorSetLayoutBinding> bindings(12);
     bindings[0] = {
         .binding = 0,
         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // UBO (ExtractionConstants)
+    };  // UBO (PushConstants)
 
     bindings[1] = {
         .binding = 1,
@@ -163,15 +163,39 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // output Index Buffer (Storage Buffer)
+    };  // output Vertex count Buffer (Storage Buffer)
 
     bindings[8] = {
         .binding = 8,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };  // output Index Buffer (Storage Buffer)
+
+    bindings[9] = {
+        .binding = 9,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };  // output Index count Buffer (Storage Buffer)
+
+    bindings[10] = {
+        .binding = 10,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
     };  // Output Meshlet Descriptor Buffer (Storage Write)
+
+    bindings[11] = {
+        .binding = 11,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
+    };  // Output Meshlet Descriptor counter Buffer (Storage Write)
 
     VkDescriptorSetLayoutCreateInfo layoutInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -301,8 +325,9 @@ void ExtractionPipeline::createDescriptorPool()
     std::vector<VkDescriptorPoolSize> poolSizes;
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1});  // UBO
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});   // Volume
-    poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                         7});  // Block count + IDs + MC Triangle Table + MC Number vertices + VB + IB + Meshlet Descriptor
+    // Block count + IDs + MC Triangle Table + MC Number vertices + VB + VBC + IB + IBC + Meshlet Descriptor + Meshlet Descriptor Counter
+    poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10});
+
     VkDescriptorPoolCreateInfo poolInfo = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -336,8 +361,8 @@ bool ExtractionPipeline::setup(
     device_ = device;
 
     // --- Load Shaders ---
-    std::string taskShaderPath = "/spirv/extract.task.spv";
-    std::string meshShaderPath = "/spirv/extract.mesh.spv";
+    std::string taskShaderPath = "/spirv/testExtract.task.spv";
+    std::string meshShaderPath = "/spirv/testExtract.mesh.spv";
 
     assert(loadShader(taskShader_, device_, taskShaderPath.c_str()));
     assert(loadShader(meshShader_, device_, meshShaderPath.c_str()));

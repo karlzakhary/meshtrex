@@ -31,8 +31,12 @@ bool compareExtractionOutputs(
     const ExtractionOutput& gpuOutput,      // Results from GPU Extraction
     const CPUExtractionOutput& cpuOutput);
 
-bool writeGPUExtractionToOBJ(
+void writeGPUExtractionToOBJ(
     VulkanContext& context,
-    const ExtractionOutput& gpuOutput, // Contains GPU buffer handles
-    const std::string& filename
-);
+    ExtractionOutput& extractionResult, // Pass by non-const ref if you intend to populate counts here
+    const char* filePath);
+
+void writeExtractionOutputToOBJ_Revised(
+    VulkanContext& context,
+    ExtractionOutput& extractionResult,
+    const char* filePath);

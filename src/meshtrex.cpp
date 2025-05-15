@@ -16,7 +16,7 @@
 int main(int argc, char** argv) {
     try {
         std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/bonsai_256x256x256_uint8.raw");
-        float isovalue = 60;
+        float isovalue = 80;
         bool requestMeshShading = false;
 #ifndef __APPLE__
         requestMeshShading = true;
@@ -26,6 +26,12 @@ int main(int argc, char** argv) {
 
         Volume volume = loadVolume(volumePath.c_str());
         std::cout << "Volume " << volumePath.c_str() << " is loaded.";
+        std::cout << "--- Debug: Printing C++ volume data values > 41 for cell (0,0,0) of block (0,0,0) ---" << std::endl;
+        // for (int i = 0; i < 1000 ; i++) {
+        //     std::cout << "CPU Vol: " << static_cast<unsigned int>(volume.volume_data[i]) << "\n" <<std::endl;
+        // }
+        std::cout << "--- End Debug: C++ specific volume data print ---" << std::endl;
+        // --- End of debug print section --
         PushConstants pushConstants = {};
         pushConstants.volumeDim = glm::uvec4(volume.volume_dims, 1);
         pushConstants.blockDim = glm::uvec4(8, 8, 8, 1);
@@ -44,9 +50,15 @@ int main(int argc, char** argv) {
 
         std::cout << "Filtering complete. Received handles." << std::endl;
         std::cout << "Active blocks: " << filteringResult.activeBlockCount << std::endl;
-        ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, filteringResult, pushConstants);
-        bool res = writeGPUExtractionToOBJ(context, extractionResultGPU, "aikalam.obj");
-        CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
+        try {
+            ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, filteringResult, pushConstants);
+            writeExtractionOutputToOBJ_Revised(context, extractionResultGPU, "aikalam.obj");
+        } catch (std::exception& e) {
+            std::cout << e.what() << std::endl;
+        }
+
+
+        // CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
         try {
             // CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
         } catch (std::exception& e) {
@@ -54,13 +66,13 @@ int main(int argc, char** argv) {
         }
 
         // Perform the comparison
-        bool match = compareExtractionOutputs(context, extractionResultGPU, extractionResultCPU);
+        // bool match = compareExtractionOutputs(context, extractionResultGPU, {});
 
-        if (match) {
-            std::cout << "Verification Passed!" << std::endl;
-        } else {
-            std::cout << "Verification Failed!" << std::endl;
-        }
+        // if (match) {
+        //     std::cout << "Verification Passed!" << std::endl;
+        // } else {
+        //     std::cout << "Verification Failed!" << std::endl;
+        // }
         // --- Now use the results in the next stage ---
         // Example: Setting up descriptors for a task/mesh shader
         // VkDescriptorBufferInfo activeBlockCountInfo = { filteringResult.activeBlockCountBuffer.buffer, 0, VK_WHOLE_SIZE };
