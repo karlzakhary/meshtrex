@@ -59,7 +59,7 @@ layout(set = 0, binding = 8, std430) buffer Index_SSBO { uint indices[]; } indic
 layout(set = 0, binding = 10, std430) buffer MeshletDescOutput_SSBO { MeshletDescriptor meshletDescriptors[]; } meshletDescOutput;
 
 // Counter for ACTUALLY WRITTEN (filled) meshlet descriptors
-layout(set = 0, binding = 12, std430) buffer FilledMeshletDescCount_SSBO { uint filledMeshletCounter; } filledMeshletDescCount;
+//layout(set = 0, binding = 12, std430) buffer FilledMeshletDescCount_SSBO { uint filledMeshletCounter; } filledMeshletDescCount;
 
 
 // --- Mesh Shader Output ---
@@ -407,7 +407,8 @@ void main() {
     barrier();
     if (gl_LocalInvocationIndex == 0) {
         if (finalVertexCount > 0 && finalPrimitiveCount > 0) {
-            uint actualDescWriteIdx = atomicAdd(filledMeshletDescCount.filledMeshletCounter, 1u);
+//            uint actualDescWriteIdx = atomicAdd(filledMeshletDescCount.filledMeshletCounter, 1u);
+            uint actualDescWriteIdx = taskPayloadIn.globalMeshletDescOffset;
             uint effectiveDescCapacity = 2000000; // Placeholder
             if (actualDescWriteIdx < effectiveDescCapacity) {
                 meshletDescOutput.meshletDescriptors[actualDescWriteIdx].vertexOffset = globalVtxBase;
