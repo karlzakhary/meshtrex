@@ -377,8 +377,8 @@ bool ExtractionPipeline::setup(
     device_ = device;
 
     // --- Load Shaders ---
-    std::string taskShaderPath = "/spirv/uniqueVerticesSubdivision.task.spv";
-    std::string meshShaderPath = "/spirv/uniqueVerticesExtract.mesh.spv";
+    std::string taskShaderPath = "/spirv/extractPmb.task.spv";
+    std::string meshShaderPath = "/spirv/extractPmb2.mesh.spv";
 
     assert(loadShader(taskShader_, device_, taskShaderPath.c_str()));
     assert(loadShader(meshShader_, device_, meshShaderPath.c_str()));
