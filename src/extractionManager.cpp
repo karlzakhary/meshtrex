@@ -21,7 +21,7 @@
 // --- Helper Function to Create Marching Cubes Table Buffer (Revised) ---
 Buffer createTriTableBuffer(VulkanContext& context) {
     Buffer triTableBuffer = {};
-    const int* triTableData = &MarchingCubes::triTable[0][0];
+    const int* triTableData = &MarchingCubes::uniqueTriTable[0][0];
 
     VkDeviceSize triTableSize = 256 * 16 * sizeof(int);
 
@@ -186,7 +186,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         // 2. Create Output Buffers (Sizing is critical and heuristic)
         const VkDeviceSize counterSize = sizeof(uint32_t);
         constexpr uint32_t MAX_VERTS_PER_MESHLET_ESTIMATE = 256;
-        constexpr uint32_t MAX_PRIMS_PER_MESHLET_ESTIMATE = 256;
+        constexpr uint32_t MAX_PRIMS_PER_MESHLET_ESTIMATE = 126;
         constexpr uint32_t MAX_INDICES_PER_MESHLET = MAX_PRIMS_PER_MESHLET_ESTIMATE * 3;
         constexpr uint32_t MAX_SUB_BLOCKS_PER_BLOCK = 8;
         // Add some headroom to size estimations?
@@ -255,10 +255,20 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (extractionOutput.meshletDescriptorBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create meshletDescriptorBuffer."); }
 
-        createBuffer(extractionOutput.meshletDescriptorCountBuffer, device, vulkanContext.getMemoryProperties(),
-                     MAX_MESHLET_DESCRIPTORS_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        createBuffer(extractionOutput.globalVertexIDCounter, device, vulkanContext.getMemoryProperties(),
+                     counterSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (extractionOutput.meshletDescriptorCountBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create meshletDescriptorCountBuffer."); }
+        if (extractionOutput.globalVertexIDCounter.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create globalVertexIDCounter."); }
+
+        createBuffer(extractionOutput.filledMeshletDescriptorCountBuffer, device, vulkanContext.getMemoryProperties(),
+                     counterSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (extractionOutput.filledMeshletDescriptorCountBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create globalVertexIDCounter."); }
+
+        createBuffer(extractionOutput.globalIndexOutputCount, device, vulkanContext.getMemoryProperties(),
+                     counterSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (extractionOutput.globalIndexOutputCount.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create globalVertexIDCounter."); }
 
 
         // 3. Create UBO, MC Triangle Table, and number of vertices buffers
@@ -284,7 +294,9 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo indexCountInfo = {extractionOutput.indexCountBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo descInfo = {extractionOutput.meshletDescriptorBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo descCountInfo = {extractionOutput.meshletDescriptorCountBuffer.buffer,0,  VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo globalVertexIDCountInfo = {extractionOutput.globalVertexIDCounter.buffer,0,  VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo filledDescCountInfo = {extractionOutput.filledMeshletDescriptorCountBuffer.buffer,0,  VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo globalIndexOutputCountInfo = {extractionOutput.globalIndexOutputCount.buffer,0,  VK_WHOLE_SIZE};
 
         writes.push_back({
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -427,9 +439,33 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
             1,
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             nullptr,
-            &descCountInfo,
+            &globalVertexIDCountInfo,
             nullptr
-        }); // Binding 11: Output meshlet descriptors count
+        }); // Binding 11: Output globalVertexIDCounter
+        writes.push_back({
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            nullptr,
+            extractionPipeline.descriptorSet_,
+            12,
+            0,
+            1,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            nullptr,
+            &filledDescCountInfo,
+            nullptr
+        }); // Binding 12: Output filled meshlet descriptors count
+        writes.push_back({
+           VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+           nullptr,
+           extractionPipeline.descriptorSet_,
+           13,
+           0,
+           1,
+           VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+           nullptr,
+           &globalIndexOutputCountInfo,
+           nullptr
+       }); // Binding 13: Output global index output count
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         std::cout << "Extraction pipeline descriptor set updated (Meshlet Desc at Binding 7)." << std::endl;
 
@@ -444,7 +480,9 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.vertexBuffer.buffer,VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS,0, counterSize ));
         vkCmdFillBuffer(cmd, extractionOutput.indexCountBuffer.buffer, 0, counterSize, 0);
         fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.indexBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS, 0, counterSize ));
-        vkCmdFillBuffer(cmd, extractionOutput.meshletDescriptorCountBuffer.buffer, 0, counterSize, 0);
+        vkCmdFillBuffer(cmd, extractionOutput.globalVertexIDCounter.buffer, 0, counterSize, 0);
+        vkCmdFillBuffer(cmd, extractionOutput.filledMeshletDescriptorCountBuffer.buffer, 0, counterSize, 0);
+        vkCmdFillBuffer(cmd, extractionOutput.globalIndexOutputCount.buffer, 0, counterSize, 0);
         fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.meshletDescriptorBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS, 0, counterSize ));
         pipelineBarrier(cmd, {}, fillToComputeBarriers.size(), fillToComputeBarriers.data(), 0, {});
         std::cout << "Atomic counters initialized." << std::endl;

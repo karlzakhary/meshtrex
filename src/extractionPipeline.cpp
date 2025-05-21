@@ -100,7 +100,7 @@ void ExtractionPipeline::releaseResources() {
 void ExtractionPipeline::createPipelineLayout()
 {
     // --- Create Descriptor Set Layout ---
-    std::vector<VkDescriptorSetLayoutBinding> bindings(12);
+    std::vector<VkDescriptorSetLayoutBinding> bindings(14);
     bindings[0] = {
         .binding = 0,
         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -195,7 +195,23 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
-    };  // Output Meshlet Descriptor counter Buffer (Storage Write)
+    }; // globalVertexIDCounter
+
+    bindings[12] = {
+        .binding = 12,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
+    };  // Output Filled Meshlet Descriptor counter Buffer (Storage Write)
+
+    bindings[13] = {
+        .binding = 13,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
+    };  // Output GlobalIndexOutputCount (Storage Write)
 
     VkDescriptorSetLayoutCreateInfo layoutInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -326,7 +342,7 @@ void ExtractionPipeline::createDescriptorPool()
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1});  // UBO
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});   // Volume
     // Block count + IDs + MC Triangle Table + MC Number vertices + VB + VBC + IB + IBC + Meshlet Descriptor + Meshlet Descriptor Counter
-    poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10});
+    poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12});
 
     VkDescriptorPoolCreateInfo poolInfo = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
