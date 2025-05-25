@@ -17,12 +17,12 @@
 #include "glm/gtx/string_cast.hpp"
 
 // --- Constants (match shader/C++ setup) ---
-const int BLOCK_DIM_X_MAX = 8; // Max dimensions the process starts with
-const int BLOCK_DIM_Y_MAX = 8;
-const int BLOCK_DIM_Z_MAX = 8;
+const int BLOCK_DIM_X_MAX = 4; // Max dimensions the process starts with
+const int BLOCK_DIM_Y_MAX = 4;
+const int BLOCK_DIM_Z_MAX = 4;
 const int MIN_BLOCK_DIM = 2; // Smallest block size to recurse down to
-const int MAX_MESHLET_VERTICES = 512;
-const int MAX_MESHLET_PRIMITIVES = 512;
+const int MAX_MESHLET_VERTICES = 64;
+const int MAX_MESHLET_PRIMITIVES = 126;
 
 // --- Helper Structures ---
 struct CPUVertex { /* ... Same as before ... */
@@ -366,9 +366,9 @@ bool compareExtractionOutputs(
     uint32_t gpuMeshletCount = 0; // Number of descriptors written
 
     try {
-        gpuVertexCount = mapCounterBuffer(context, gpuOutput.vertexBuffer);
-        gpuIndexCount = mapCounterBuffer(context, gpuOutput.indexBuffer);
-        gpuMeshletCount = mapCounterBuffer(context, gpuOutput.meshletDescriptorBuffer);
+        gpuVertexCount = mapCounterBuffer(context, gpuOutput.globalVertexCountBuffer);
+        gpuIndexCount = mapCounterBuffer(context, gpuOutput.globalIndexCountBuffer);
+        gpuMeshletCount = mapCounterBuffer(context, gpuOutput.meshletCountBuffer);
 
         std::cout << "GPU Readback Counts:" << std::endl;
         std::cout << "  - Vertex Count:    " << gpuVertexCount << std::endl;
@@ -459,13 +459,13 @@ bool compareExtractionOutputs(
          std::cout << "\nAttempting basic Vertex/Index comparison (order-dependent, use with caution):" << std::endl;
          bool geometryMatch = true;
         try {
-            std::vector<glm::vec3> gpuVertices = mapVec3Buffer(context, gpuOutput.vertexBuffer, gpuVertexCount);
+            std::vector<glm::vec3> gpuVertices = mapVec3Buffer(context, gpuOutput.globalVertexBuffer, gpuVertexCount);
             std::vector<uint32_t> gpuIndices = mapUintBuffer(
                 context.getDevice(),
                 context.getMemoryProperties(),
                 context.getCommandPool(),
                 context.getQueue(),
-                gpuOutput.indexBuffer,
+                gpuOutput.globalIndexBuffer,
                 gpuIndexCount * sizeof(uint32_t),
                 gpuIndexCount
                 ); // Read indices after counter
@@ -539,12 +539,12 @@ bool writeGPUExtractionToOBJPrev(
     uint32_t counterMeshletCount = 0; // Number of descriptors Task Shader allocated space for
 
     try {
-        if(gpuOutput.vertexBuffer.buffer != VK_NULL_HANDLE)
-            counterVertexCount = mapCounterBuffer(context, gpuOutput.vertexCountBuffer);
-        if(gpuOutput.indexBuffer.buffer != VK_NULL_HANDLE)
-            counterIndexCount = mapCounterBuffer(context, gpuOutput.indexCountBuffer);
+        if(gpuOutput.globalVertexBuffer.buffer != VK_NULL_HANDLE)
+            counterVertexCount = mapCounterBuffer(context, gpuOutput.globalVertexCountBuffer);
+        if(gpuOutput.globalIndexBuffer.buffer != VK_NULL_HANDLE)
+            counterIndexCount = mapCounterBuffer(context, gpuOutput.globalIndexCountBuffer);
         if(gpuOutput.meshletDescriptorBuffer.buffer != VK_NULL_HANDLE)
-            counterMeshletCount = mapCounterBuffer(context, gpuOutput.globalVertexIDCounter);
+            counterMeshletCount = mapCounterBuffer(context, gpuOutput.meshletCountBuffer);
 
         std::cout << "GPU Atomic Counter Readback:" << std::endl;
         std::cout << "  - Vertex Counter:    " << counterVertexCount << std::endl;
@@ -616,7 +616,7 @@ bool writeGPUExtractionToOBJPrev(
     if (max_vertex_offset_needed > 0) {
         try {
             std::cout << "Reading up to vertex index " << (max_vertex_offset_needed - 1) << " from VertexBuffer." << std::endl;
-            gpuVertexPositions = mapVec3Buffer(context, gpuOutput.vertexBuffer, max_vertex_offset_needed); // Read up to the max offset needed
+            gpuVertexPositions = mapVec3Buffer(context, gpuOutput.globalVertexBuffer, max_vertex_offset_needed); // Read up to the max offset needed
             std::cout << "Read back " << gpuVertexPositions.size() << " vertex positions from GPU." << std::endl;
              if (gpuVertexPositions.size() < max_vertex_offset_needed) {
                  std::cerr << "Warning: Read back fewer vertices than expected based on descriptor offsets. Clamping OBJ indices." << std::endl;
@@ -636,7 +636,7 @@ bool writeGPUExtractionToOBJPrev(
              std::cout << "Reading up to index " << (max_index_offset_needed - 1) << " from IndexBuffer." << std::endl;
              gpuGlobalIndices = mapUintBuffer(
                  context.getDevice(), context.getMemoryProperties(), context.getCommandPool(), context.getQueue(),
-                 gpuOutput.indexBuffer,
+                 gpuOutput.globalIndexBuffer,
                  max_index_offset_needed * sizeof(uint32_t), // Read up to max needed size
                  max_index_offset_needed                     // Number of index elements to read
              );
@@ -845,9 +845,9 @@ void writeGPUExtractionToOBJ(
 
     // 1. Read counts from their respective buffers
     // These counts are the ACTUAL number of elements written by the shaders.
-    extractionResult.vertexCount = readCounterFromBuffer(context, extractionResult.vertexCountBuffer);
-    extractionResult.indexCount = readCounterFromBuffer(context, extractionResult.indexCountBuffer);
-    extractionResult.meshletCount = readCounterFromBuffer(context, extractionResult.globalVertexIDCounter);
+    extractionResult.vertexCount = readCounterFromBuffer(context, extractionResult.globalVertexCountBuffer);
+    extractionResult.indexCount = readCounterFromBuffer(context, extractionResult.globalIndexCountBuffer);
+    extractionResult.meshletCount = readCounterFromBuffer(context, extractionResult.meshletCountBuffer);
 
     std::cout << "  Read from GPU: Vertices = " << extractionResult.vertexCount
               << ", Indices = " << extractionResult.indexCount
@@ -864,8 +864,8 @@ void writeGPUExtractionToOBJ(
     }
 
     // 2. Read actual data from buffers
-    std::vector<VertexData> vertices = readDataBuffer<VertexData>(context, extractionResult.vertexBuffer, extractionResult.vertexCount);
-    std::vector<uint32_t> indices = readDataBuffer<uint32_t>(context, extractionResult.indexBuffer, extractionResult.indexCount);
+    std::vector<VertexData> vertices = readDataBuffer<VertexData>(context, extractionResult.globalVertexBuffer, extractionResult.vertexCount);
+    std::vector<uint32_t> indices = readDataBuffer<uint32_t>(context, extractionResult.globalIndexBuffer, extractionResult.indexCount);
     std::vector<MeshletDescriptor> meshlets; // Only needed if you want to structure OBJ by meshlets (e.g., with 'g' tags)
                                            // For a simple flat OBJ, we just need vertices and global indices.
                                            // If you want to verify meshlet descriptors, read them here:
@@ -1008,11 +1008,11 @@ void writeExtractionOutputToOBJ_Revised(
     std::cout << "Attempting to write GPU extraction output to OBJ (Global Buffers): " << filePath << std::endl;
 
     // 1. Read the total number of unique global vertices generated
-    uint32_t totalGlobalVertices = readCounterFromBuffer(context, extractionResult.globalVertexIDCounter);
+    uint32_t totalGlobalVertices = readCounterFromBuffer(context, extractionResult.globalVertexCountBuffer);
     std::cout << "  Total Global Unique Vertices generated by GPU: " << totalGlobalVertices << std::endl;
 
     // 2. Read the total number of global indices (triangle corners) written
-    uint32_t totalGlobalIndices = readCounterFromBuffer(context, extractionResult.globalIndexOutputCount);
+    uint32_t totalGlobalIndices = readCounterFromBuffer(context, extractionResult.globalIndexCountBuffer);
     uint32_t totalGlobalTriangles = totalGlobalIndices / 3;
     std::cout << "  Total Global Indices generated by GPU: " << totalGlobalIndices
               << " (Triangles: " << totalGlobalTriangles << ")" << std::endl;
@@ -1030,14 +1030,14 @@ void writeExtractionOutputToOBJ_Revised(
     // 3. Read the entire global vertex buffer
     //    We read 'totalGlobalVertices' elements starting from offset 0.
     std::vector<VertexData> globalVertices =
-        readDataChunkFromBuffer<VertexData>(context, extractionResult.vertexBuffer, // This is globalVerticesSSBO
+        readDataChunkFromBuffer<VertexData>(context, extractionResult.globalVertexBuffer, // This is globalVerticesSSBO
                                             0, // Byte offset
                                             totalGlobalVertices);
 
     // 4. Read the entire global index buffer
     //    We read 'totalGlobalTriangles * 3' uint32_t indices.
     std::vector<uint32_t> globalIndices =
-        readDataChunkFromBuffer<uint32_t>(context, extractionResult.indexBuffer, // This is globalIndicesSSBO
+        readDataChunkFromBuffer<uint32_t>(context, extractionResult.globalIndexBuffer, // This is globalIndicesSSBO
                                            0, // Byte offset
                                            totalGlobalTriangles * 3);
 
@@ -1057,8 +1057,8 @@ void writeExtractionOutputToOBJ_Revised(
 
     // For statistics, you can still read the filled meshlet descriptor count
     uint32_t actualFilledMeshletCount = 0;
-    if (extractionResult.filledMeshletDescriptorCountBuffer.buffer != VK_NULL_HANDLE) { // Check if buffer exists
-         actualFilledMeshletCount = readCounterFromBuffer(context, extractionResult.filledMeshletDescriptorCountBuffer);
+    if (extractionResult.meshletCountBuffer.buffer != VK_NULL_HANDLE) { // Check if buffer exists
+         actualFilledMeshletCount = readCounterFromBuffer(context, extractionResult.meshletCountBuffer);
     }
     std::cout << "  Mesh Shader reported writing " << actualFilledMeshletCount << " non-empty meshlet descriptors." << std::endl;
     // You could still read these descriptors if they contain useful per-meshlet stats,
@@ -1075,7 +1075,7 @@ void writeExtractionOutputToOBJ_Revised(
     outFile << "# OBJ file generated from GPU extraction (Global Buffers Strategy)" << std::endl;
     outFile << "# Global Unique Vertices: " << globalVertices.size() << std::endl;
     outFile << "# Global Triangles: " << totalGlobalTriangles << std::endl;
-    if (extractionResult.filledMeshletDescriptorCountBuffer.buffer != VK_NULL_HANDLE) {
+    if (extractionResult.meshletCountBuffer.buffer != VK_NULL_HANDLE) {
         outFile << "# Reported Non-Empty Meshlet Descriptors: " << actualFilledMeshletCount << std::endl;
     }
 

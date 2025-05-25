@@ -31,10 +31,10 @@ void updateExtractionDescriptors(
     VkDescriptorBufferInfo mcTableInfo = {marchingCubesTriTable.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &mcTableInfo, nullptr});
     // Binding 4: Output Vertex Buffer
-    VkDescriptorBufferInfo vbInfo = {extractionOutput.vertexBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo vbInfo = {extractionOutput.globalVertexBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &vbInfo, nullptr});
     // Binding 5: Output Index Buffer
-    VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo ibInfo = {extractionOutput.globalIndexBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ibInfo, nullptr});
     // Binding 6: Output Indirect Draw Buffer (if used)
     // VkDescriptorBufferInfo drawInfo = {extractionOutput.indirectDrawBuffer.buffer, 0, VK_WHOLE_SIZE};
@@ -79,8 +79,8 @@ void updateRenderingDescriptors(
 
     // Check if necessary buffers from extraction exist
     if (extractionOutput.meshletDescriptorBuffer.buffer == VK_NULL_HANDLE ||
-        extractionOutput.vertexBuffer.buffer == VK_NULL_HANDLE ||
-        extractionOutput.indexBuffer.buffer == VK_NULL_HANDLE) {
+        extractionOutput.globalVertexBuffer.buffer == VK_NULL_HANDLE ||
+        extractionOutput.globalIndexBuffer.buffer == VK_NULL_HANDLE) {
         std::cerr << "Warning: Missing necessary geometry buffers in updateRenderingDescriptors." << std::endl;
         return;
         }
@@ -95,11 +95,11 @@ void updateRenderingDescriptors(
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, renderingPipelineState.descriptorSet_, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &meshletDescInfo, nullptr});
 
     // Binding 2: Vertex Buffer
-    VkDescriptorBufferInfo vbInfo = {extractionOutput.vertexBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo vbInfo = {extractionOutput.globalVertexBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, renderingPipelineState.descriptorSet_, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &vbInfo, nullptr});
 
     // Binding 3: Index Buffer
-    VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo ibInfo = {extractionOutput.globalIndexBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, renderingPipelineState.descriptorSet_, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ibInfo, nullptr});
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -117,7 +117,7 @@ void recordRenderingCommands(
     VkImageLayout colorAttachmentLayout,
     VkImageLayout depthAttachmentLayout
 ) {
-     if (renderingPipelineState.pipeline_ == VK_NULL_HANDLE || extractionOutput.indexBuffer.buffer == VK_NULL_HANDLE) return; // Check if geometry exists
+     if (renderingPipelineState.pipeline_ == VK_NULL_HANDLE || extractionOutput.globalIndexBuffer.buffer == VK_NULL_HANDLE) return; // Check if geometry exists
 
     // --- Begin Dynamic Rendering ---
     VkRenderingAttachmentInfo colorAttachmentInfo = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };

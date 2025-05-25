@@ -18,6 +18,9 @@
 #include <cstring>
 #include <utility> // For std::move if needed later
 
+constexpr uint32_t GLOBAL_EDGE_MAP_SIZE = 16777216; // 16M entries
+constexpr uint32_t INVALID_VERTEX_ID = 0xFFFFFFFF;
+
 // --- Helper Function to Create Marching Cubes Table Buffer (Revised) ---
 Buffer createTriTableBuffer(VulkanContext& context) {
     Buffer triTableBuffer = {};
@@ -73,6 +76,31 @@ Buffer createTriTableBuffer(VulkanContext& context) {
 
     std::cout << "Marching Cubes triangle table buffer created and uploaded." << std::endl;
     return triTableBuffer;
+}
+
+Buffer createEdgeMapBuffer(VulkanContext& context) {
+    Buffer edgeMapBuffer = {};
+    VkDeviceSize bufferSize = sizeof(uint32_t) * GLOBAL_EDGE_MAP_SIZE;
+    createBuffer(edgeMapBuffer, context.getDevice(), context.getMemoryProperties(),
+                 bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, // Add DST for potential future updates via staging
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); // Keep HOST_VISIBLE for easy update
+
+    if (edgeMapBuffer.buffer == VK_NULL_HANDLE) {
+        throw std::runtime_error("Failed to create edge map buffer.");
+    }
+    if (edgeMapBuffer.data == nullptr) {
+         destroyBuffer(edgeMapBuffer, context.getDevice());
+         throw std::runtime_error("Failed to map edge map buffer.");
+    }
+
+    // Initialize buffer with invalid vertex IDs
+    uint32_t* data = static_cast<uint32_t*>(edgeMapBuffer.data);
+    for (uint32_t i = 0; i < GLOBAL_EDGE_MAP_SIZE; ++i) {
+        data[i] = INVALID_VERTEX_ID;
+    }
+
+    std::cout << "Edge map buffer created and initialized." << std::endl;
+    return edgeMapBuffer;
 }
 
 Buffer createNumVerticesBuffer(VulkanContext& context) {
@@ -174,7 +202,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
 
     Buffer constantsUBO = {};
     Buffer mcTriTableBuffer = {};
-    Buffer mcNumVerticesBuffer = {};
+    Buffer edgeMapBuffer = {};
 
     try {
         // 1. Setup Extraction Pipeline State
@@ -185,10 +213,10 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
 
         // 2. Create Output Buffers (Sizing is critical and heuristic)
         const VkDeviceSize counterSize = sizeof(uint32_t);
-        constexpr uint32_t MAX_VERTS_PER_MESHLET_ESTIMATE = 256;
+        constexpr uint32_t MAX_VERTS_PER_MESHLET_ESTIMATE = 64;
         constexpr uint32_t MAX_PRIMS_PER_MESHLET_ESTIMATE = 126;
         constexpr uint32_t MAX_INDICES_PER_MESHLET = MAX_PRIMS_PER_MESHLET_ESTIMATE * 3;
-        constexpr uint32_t MAX_SUB_BLOCKS_PER_BLOCK = 8;
+        constexpr uint32_t MAX_SUB_BLOCKS_PER_BLOCK = 4;
         // Add some headroom to size estimations?
 
         //For basic mesh shader
@@ -197,15 +225,11 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         const uint32_t MAX_PRIMS_PER_CELL_FROM_SHADER = 5;     // Match shader's #define
 
         const VkDeviceSize MAX_TOTAL_VERTICES_BYTES =
-            static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
-            CELLS_PER_BLOCK_FROM_SHADER *
-            MAX_VERTS_PER_CELL_FROM_SHADER *
+            256 * 256 * 256 * 3 *
             sizeof(VertexData);
         std::cout << " Max vertices: " << MAX_TOTAL_VERTICES_BYTES / sizeof(VertexData) << std::endl;
         const VkDeviceSize MAX_TOTAL_INDICES_BYTES =
-            static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
-            CELLS_PER_BLOCK_FROM_SHADER *
-            MAX_PRIMS_PER_CELL_FROM_SHADER * 3 * // 3 indices per primitive
+            256 * 256 * 256 * 3 * 5 *
             sizeof(uint32_t);
         // For advance mesh shader
         // const VkDeviceSize MAX_TOTAL_VERTICES_BYTES =
@@ -220,56 +244,55 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         //                 sizeof(uint32_t)
         // ;
         const VkDeviceSize MAX_MESHLET_DESCRIPTORS_BYTES =
-            static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
-                MAX_SUB_BLOCKS_PER_BLOCK *
-                    sizeof(MeshletDescriptor)
+            (255 / (MAX_SUB_BLOCKS_PER_BLOCK - 1)) * 
+            (MAX_SUB_BLOCKS_PER_BLOCK / (MAX_SUB_BLOCKS_PER_BLOCK - 1)) * 
+            (MAX_SUB_BLOCKS_PER_BLOCK / (MAX_SUB_BLOCKS_PER_BLOCK - 1)) * 8 *
+            sizeof(MeshletDescriptor)
         ;
+        // const VkDeviceSize MAX_MESHLET_DESCRIPTORS_BYTES =
+        //     static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
+        //         MAX_SUB_BLOCKS_PER_BLOCK *
+        //             sizeof(MeshletDescriptor)
+        // ;
 
         std::cout << "Requesting output buffer sizes (incl. counter) based on " << filterOutput.activeBlockCount << " active blocks:" << std::endl;
         std::cout << "  - Vertex Buffer Size:       " << MAX_TOTAL_VERTICES_BYTES << " bytes" << std::endl;
         std::cout << "  - Index Buffer Size:        " << MAX_TOTAL_INDICES_BYTES << " bytes" << std::endl;
         std::cout << "  - Descriptor Buffer Size:   " << MAX_MESHLET_DESCRIPTORS_BYTES << " bytes" << std::endl;
 
-        createBuffer(extractionOutput.vertexBuffer, device, vulkanContext.getMemoryProperties(),
+        createBuffer(extractionOutput.globalVertexBuffer, device, vulkanContext.getMemoryProperties(),
                      MAX_TOTAL_VERTICES_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (extractionOutput.vertexBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create vertexBuffer."); }
+        if (extractionOutput.globalVertexBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create vertexBuffer."); }
 
-        createBuffer(extractionOutput.vertexCountBuffer, device, vulkanContext.getMemoryProperties(),
+        createBuffer(extractionOutput.globalVertexCountBuffer, device, vulkanContext.getMemoryProperties(),
                      counterSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (extractionOutput.vertexCountBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create vertexCountBuffer."); }
+        if (extractionOutput.globalVertexCountBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create vertexCountBuffer."); }
 
-        createBuffer(extractionOutput.indexBuffer, device, vulkanContext.getMemoryProperties(),
+        createBuffer(extractionOutput.globalIndexBuffer, device, vulkanContext.getMemoryProperties(),
                      MAX_TOTAL_INDICES_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (extractionOutput.indexBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create indexBuffer."); }
+        if (extractionOutput.globalIndexBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create indexBuffer."); }
 
-        createBuffer(extractionOutput.indexCountBuffer, device, vulkanContext.getMemoryProperties(),
+        createBuffer(extractionOutput.globalIndexCountBuffer, device, vulkanContext.getMemoryProperties(),
              counterSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (extractionOutput.indexCountBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create indexCountBuffer."); }
+        if (extractionOutput.globalIndexCountBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create indexCountBuffer."); }
 
         createBuffer(extractionOutput.meshletDescriptorBuffer, device, vulkanContext.getMemoryProperties(),
                      MAX_MESHLET_DESCRIPTORS_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (extractionOutput.meshletDescriptorBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create meshletDescriptorBuffer."); }
 
-        createBuffer(extractionOutput.globalVertexIDCounter, device, vulkanContext.getMemoryProperties(),
+        createBuffer(extractionOutput.meshletCountBuffer, device, vulkanContext.getMemoryProperties(),
                      counterSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (extractionOutput.globalVertexIDCounter.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create globalVertexIDCounter."); }
+        if (extractionOutput.meshletCountBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create meshletCountBuffer."); }
 
-        createBuffer(extractionOutput.filledMeshletDescriptorCountBuffer, device, vulkanContext.getMemoryProperties(),
-                     counterSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (extractionOutput.filledMeshletDescriptorCountBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create globalVertexIDCounter."); }
+        extractionOutput.globalEdgeMapBuffer = createEdgeMapBuffer(vulkanContext);
 
-        createBuffer(extractionOutput.globalIndexOutputCount, device, vulkanContext.getMemoryProperties(),
-                     counterSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (extractionOutput.globalIndexOutputCount.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create globalVertexIDCounter."); }
-
+        if (extractionOutput.globalEdgeMapBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create globalEdgeMapBuffer."); }
 
         // 3. Create UBO, MC Triangle Table, and number of vertices buffers
         // Pass necessary values from pushConstants to UBO helper
@@ -277,8 +300,6 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         if (constantsUBO.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create constants UBO."); }
         mcTriTableBuffer = createTriTableBuffer(vulkanContext);
         if (mcTriTableBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create MC table buffer."); }
-        mcNumVerticesBuffer = createNumVerticesBuffer(vulkanContext);
-        if (mcNumVerticesBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create MC NumVertices buffer."); }
 
         // 4. Update Descriptors
         if (extractionPipeline.descriptorSet_ == VK_NULL_HANDLE) { throw std::runtime_error("Extraction pipeline descriptor set is null."); }
@@ -288,15 +309,13 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         VkDescriptorBufferInfo blockCountInfo = {filterOutput.activeBlockCountBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo blockIdInfo = {filterOutput.compactedBlockIdBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo mcTriTableInfo = {mcTriTableBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo mcNumVerticesInfo = {mcNumVerticesBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo vbInfo = {extractionOutput.vertexBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo vertexCountInfo = {extractionOutput.vertexCountBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo indexCountInfo = {extractionOutput.indexCountBuffer.buffer, 0, VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo vbInfo = {extractionOutput.globalVertexBuffer.buffer, 0, VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo vertexCountInfo = {extractionOutput.globalVertexCountBuffer.buffer, 0, VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo ibInfo = {extractionOutput.globalIndexBuffer.buffer, 0, VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo indexCountInfo = {extractionOutput.globalIndexCountBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo descInfo = {extractionOutput.meshletDescriptorBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo globalVertexIDCountInfo = {extractionOutput.globalVertexIDCounter.buffer,0,  VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo filledDescCountInfo = {extractionOutput.filledMeshletDescriptorCountBuffer.buffer,0,  VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo globalIndexOutputCountInfo = {extractionOutput.globalIndexOutputCount.buffer,0,  VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo filledDescCountInfo = {extractionOutput.meshletCountBuffer.buffer,0,  VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo edgeMapInfo = {extractionOutput.globalEdgeMapBuffer.buffer, 0, VK_WHOLE_SIZE};
 
         writes.push_back({
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -362,18 +381,6 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             nullptr,
             extractionPipeline.descriptorSet_,
-            5,
-            0,
-            1,
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            nullptr,
-            &mcNumVerticesInfo,
-            nullptr
-        }); // Binding 5: MC NumVertices Table
-        writes.push_back({
-            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            nullptr,
-            extractionPipeline.descriptorSet_,
             6,
             0,
             1,
@@ -382,19 +389,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
             &vbInfo,
             nullptr
         }); // Binding 6: Output Vertices
-        writes.push_back({
-            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            nullptr,
-            extractionPipeline.descriptorSet_,
-            7,
-            0,
-            1,
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            nullptr,
-            &vertexCountInfo,
-            nullptr
-        }); // Binding 7: Output Vertex count
-        writes.push_back({
+            writes.push_back({
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             nullptr,
             extractionPipeline.descriptorSet_,
@@ -406,18 +401,6 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
             &ibInfo,
             nullptr
         }); // Binding 8: Output Indices
-        writes.push_back({
-            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            nullptr,
-            extractionPipeline.descriptorSet_,
-            9,
-            0,
-            1,
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            nullptr,
-            &indexCountInfo,
-            nullptr
-        }); // Binding 9: Output Indices count
         writes.push_back({
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             nullptr,
@@ -439,10 +422,10 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
             1,
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             nullptr,
-            &globalVertexIDCountInfo,
+            &vertexCountInfo,
             nullptr
-        }); // Binding 11: Output globalVertexIDCounter
-        writes.push_back({
+        }); // Binding 11: Output Vertex count
+            writes.push_back({
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             nullptr,
             extractionPipeline.descriptorSet_,
@@ -455,19 +438,32 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
             nullptr
         }); // Binding 12: Output filled meshlet descriptors count
         writes.push_back({
-           VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-           nullptr,
-           extractionPipeline.descriptorSet_,
-           13,
-           0,
-           1,
-           VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-           nullptr,
-           &globalIndexOutputCountInfo,
-           nullptr
-       }); // Binding 13: Output global index output count
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            nullptr,
+            extractionPipeline.descriptorSet_,
+            13,
+            0,
+            1,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            nullptr,
+            &indexCountInfo,
+            nullptr
+        }); // Binding 13: Index counter
+        writes.push_back({
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            nullptr,
+            extractionPipeline.descriptorSet_,
+            14,
+            0,
+            1,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            nullptr,
+            &edgeMapInfo,
+            nullptr
+        }); // Binding 14: Global edge map
+
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-        std::cout << "Extraction pipeline descriptor set updated (Meshlet Desc at Binding 7)." << std::endl;
+        std::cout << "Extraction pipeline descriptor set updated." << std::endl;
 
         // 5. Record Command Buffer
         VkCommandBuffer cmd = beginSingleTimeCommands(device, vulkanContext.getCommandPool());
@@ -476,14 +472,13 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         std::vector<VkBufferMemoryBarrier2> fillToComputeBarriers;
         const VkPipelineStageFlags2 ATOMIC_SHADER_STAGES = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT;
         const VkAccessFlags2 ATOMIC_ACCESS = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        vkCmdFillBuffer(cmd, extractionOutput.vertexCountBuffer.buffer, 0, counterSize, 0);
-        fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.vertexBuffer.buffer,VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS,0, counterSize ));
-        vkCmdFillBuffer(cmd, extractionOutput.indexCountBuffer.buffer, 0, counterSize, 0);
-        fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.indexBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS, 0, counterSize ));
-        vkCmdFillBuffer(cmd, extractionOutput.globalVertexIDCounter.buffer, 0, counterSize, 0);
-        vkCmdFillBuffer(cmd, extractionOutput.filledMeshletDescriptorCountBuffer.buffer, 0, counterSize, 0);
-        vkCmdFillBuffer(cmd, extractionOutput.globalIndexOutputCount.buffer, 0, counterSize, 0);
+        vkCmdFillBuffer(cmd, extractionOutput.globalVertexCountBuffer.buffer, 0, counterSize, 0);
+        fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.globalVertexBuffer.buffer,VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS,0, counterSize ));
+        vkCmdFillBuffer(cmd, extractionOutput.globalIndexCountBuffer.buffer, 0, counterSize, 0);
+        fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.globalIndexBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS, 0, counterSize ));
+        vkCmdFillBuffer(cmd, extractionOutput.meshletCountBuffer.buffer, 0, counterSize, 0);
         fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.meshletDescriptorBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS, 0, counterSize ));
+        fillToComputeBarriers.push_back(bufferBarrier(extractionOutput.globalEdgeMapBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ATOMIC_SHADER_STAGES, ATOMIC_ACCESS, 0, counterSize ));
         pipelineBarrier(cmd, {}, fillToComputeBarriers.size(), fillToComputeBarriers.data(), 0, {});
         std::cout << "Atomic counters initialized." << std::endl;
 
@@ -526,14 +521,13 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
             VK_IMAGE_ASPECT_COLOR_BIT
         ));
         preBufferBarriers.push_back(bufferBarrier(mcTriTableBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, 0, VK_WHOLE_SIZE));
-        preBufferBarriers.push_back(bufferBarrier(mcNumVerticesBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, 0, VK_WHOLE_SIZE));
 
         // *** Added Barrier for UBO ***
         preBufferBarriers.push_back(bufferBarrier(constantsUBO.buffer, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_UNIFORM_READ_BIT, 0, VK_WHOLE_SIZE));
 
         // Outputs Writable (Simplified barrier after fill barrier)
         preBufferBarriers.push_back(bufferBarrier(
-            extractionOutput.vertexBuffer.buffer,
+            extractionOutput.globalVertexBuffer.buffer,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT,
             EXTRACTION_SHADER_STAGES,
@@ -542,7 +536,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
             VK_WHOLE_SIZE
         ));
         preBufferBarriers.push_back(bufferBarrier(
-            extractionOutput.indexBuffer.buffer,
+            extractionOutput.globalIndexBuffer.buffer,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT,
             EXTRACTION_SHADER_STAGES,
@@ -552,6 +546,15 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         ));
         preBufferBarriers.push_back(bufferBarrier(
             extractionOutput.meshletDescriptorBuffer.buffer,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            EXTRACTION_SHADER_STAGES,
+            EXTRACTION_WRITE_ACCESS | EXTRACTION_ATOMIC_ACCESS,
+            0,
+            VK_WHOLE_SIZE
+        ));
+        preBufferBarriers.push_back(bufferBarrier(
+            extractionOutput.globalEdgeMapBuffer.buffer,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT,
             EXTRACTION_SHADER_STAGES,
@@ -598,9 +601,10 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         VkPipelineStageFlags2 postDstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
         VkAccessFlags2 postDstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
 
-        postBufferBarriers.push_back(bufferBarrier(extractionOutput.vertexBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
-        postBufferBarriers.push_back(bufferBarrier(extractionOutput.indexBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.globalVertexBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.globalIndexBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
         postBufferBarriers.push_back(bufferBarrier(extractionOutput.meshletDescriptorBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.globalEdgeMapBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
 
         pipelineBarrier(cmd, {}, postBufferBarriers.size(), postBufferBarriers.data(), 0, {});
 
@@ -616,7 +620,6 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         // Need to manually clean up UBO/MC Table if created before throw
         destroyBuffer(constantsUBO, device); // Safe to call even if null
         destroyBuffer(mcTriTableBuffer, device); // Safe to call even if null
-        destroyBuffer(mcNumVerticesBuffer, device);
         throw;
     }
 
@@ -624,7 +627,6 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
     // RAII handles extractionPipeline and extractionOutput cleanup
     destroyBuffer(constantsUBO, device);
     destroyBuffer(mcTriTableBuffer, device);
-    destroyBuffer(mcNumVerticesBuffer, device);
 
     std::cout << "--- Finished Meshlet Extraction ---" << std::endl;
     return extractionOutput;

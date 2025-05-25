@@ -561,7 +561,7 @@ inline void testCompactBuffer(VulkanContext &context, Buffer &compactedBlockIdBu
         uint32_t cpuActiveCount = computeActiveBlockCountCPU(cpuMinMaxResults, isovalue);
 
         // 3. Compute Compacted Block ID list on CPU
-        glm::uvec3 blockGridDim = (volumeDims + glm::uvec3(8,8,8) - 1u) / glm::uvec3(8,8,8);
+        glm::uvec3 blockGridDim = (volumeDims + glm::uvec3(4,4,4) - 1u) / glm::uvec3(4,4,4);
         std::vector<uint32_t> cpuActiveIDs = computeCompactedBlockIDsCPU(cpuMinMaxResults, isovalue, blockGridDim);
 
         // --- Read Back GPU Compacted IDs (Placeholder) ---

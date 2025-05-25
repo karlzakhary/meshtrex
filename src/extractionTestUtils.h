@@ -36,6 +36,12 @@ void writeGPUExtractionToOBJ(
     ExtractionOutput& extractionResult, // Pass by non-const ref if you intend to populate counts here
     const char* filePath);
 
+bool writeGPUExtractionToOBJPrev(
+    VulkanContext& context,
+    const ExtractionOutput& gpuOutput, // Contains GPU buffer handles
+    const std::string& filename
+);
+
 void writeExtractionOutputToOBJ_Revised(
     VulkanContext& context,
     ExtractionOutput& extractionResult,

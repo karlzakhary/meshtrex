@@ -100,7 +100,7 @@ void ExtractionPipeline::releaseResources() {
 void ExtractionPipeline::createPipelineLayout()
 {
     // --- Create Descriptor Set Layout ---
-    std::vector<VkDescriptorSetLayoutBinding> bindings(14);
+    std::vector<VkDescriptorSetLayoutBinding> bindings(12);
     bindings[0] = {
         .binding = 0,
         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -122,7 +122,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
-            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+            VK_SHADER_STAGE_TASK_BIT_EXT,
     };  // Active Block count
 
     bindings[3] = {
@@ -130,7 +130,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
-            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+            VK_SHADER_STAGE_TASK_BIT_EXT,
     };  // Block IDs
 
     bindings[4] = {
@@ -142,76 +142,60 @@ void ExtractionPipeline::createPipelineLayout()
     };  // MC Triangle Table
 
     bindings[5] = {
-        .binding = 5,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags =
-            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // MC NumVertices
-
-    bindings[6] = {
         .binding = 6,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
-            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // output Vertex Buffer (Storage Buffer)
+           VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };  // Global Vertices
 
-    bindings[7] = {
-        .binding = 7,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags =
-            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // output Vertex count Buffer (Storage Buffer)
-
-    bindings[8] = {
+    bindings[6] = {
         .binding = 8,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // output Index Buffer (Storage Buffer)
+    };  // Binding 8: Global indices
 
-    bindings[9] = {
-        .binding = 9,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags =
-            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // output Index count Buffer (Storage Buffer)
-
-    bindings[10] = {
+    bindings[7] = {
         .binding = 10,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
-            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
-    };  // Output Meshlet Descriptor Buffer (Storage Write)
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };  // Binding 10: Meshlet descriptors
 
-    bindings[11] = {
+    bindings[8] = {
         .binding = 11,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
-            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
-    }; // globalVertexIDCounter
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };  // Vertex Counter
 
-    bindings[12] = {
+    bindings[9] = {
         .binding = 12,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
-            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
-    };  // Output Filled Meshlet Descriptor counter Buffer (Storage Write)
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };  // Binding 12: Meshlet counter
 
-    bindings[13] = {
+    bindings[10] = {
         .binding = 13,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
-    };  // Output GlobalIndexOutputCount (Storage Write)
+    };  // Binding 13: Index counter
+
+    bindings[11] = {
+        .binding = 14,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags =
+            VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
+    }; // Binding 14: Global edge map
 
     VkDescriptorSetLayoutCreateInfo layoutInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -341,8 +325,8 @@ void ExtractionPipeline::createDescriptorPool()
     std::vector<VkDescriptorPoolSize> poolSizes;
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1});  // UBO
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});   // Volume
-    // Block count + IDs + MC Triangle Table + MC Number vertices + VB + VBC + IB + IBC + Meshlet Descriptor + Meshlet Descriptor Counter
-    poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12});
+    // Block count + IDs + MC Triangle Table + VB + IB + IB + Meshlet Descriptor + VBC +  Meshlet Descriptor Counter + IBC + Edge Map
+    poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10});
 
     VkDescriptorPoolCreateInfo poolInfo = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};

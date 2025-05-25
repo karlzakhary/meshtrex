@@ -1,472 +1,435 @@
 #version 460 core
 #extension GL_EXT_mesh_shader : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
 #extension GL_EXT_shader_atomic_int64 : require
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_EXT_debug_printf : enable
 
-#define MAX_VERTICES_LOCAL_OUTPUT 64u // For SetMeshOutputsEXT (can be small if not rasterizing)
-#define MAX_PRIMITIVES_LOCAL_OUTPUT 126u // For SetMeshOutputsEXT
+// Block dimensions optimized for 64-vertex limit
+// 4×4×4 = 64 cells, typical ~50-80 vertices
+#define CORE_BLOCK_DIM_X 4
+#define CORE_BLOCK_DIM_Y 4  
+#define CORE_BLOCK_DIM_Z 4
 
-#define WORKGROUP_SIZE 32
-#define CONTEXT_CELLS_PER_SIDE 1 // Should match task shader
-#define MAX_CACHE_PROBES 8
+// Mesh shader limits - following NVIDIA's recommendations
+#define MAX_MESHLET_VERTS 64u   // NVIDIA recommended for optimal performance
+#define MAX_MESHLET_PRIMS 126u  // NVIDIA recommended (unchanged)
 
-// Max dimensions of the PROCESSING block (core + context)
-// If core is 8x8x8 and context is 1, then processing is 10x10x10
-// This is used for sizing the shared cache for edge IDs.
-#define MAX_PROC_BLOCK_X (8 + 2*CONTEXT_CELLS_PER_SIDE)
-#define MAX_PROC_BLOCK_Y (8 + 2*CONTEXT_CELLS_PER_SIDE)
-#define MAX_PROC_BLOCK_Z (8 + 2*CONTEXT_CELLS_PER_SIDE)
+// MC constants
+#define MAX_TRI_INDICES 16
+#define MAX_VERTS_PER_CELL 12
+#define MAX_PRIMS_PER_CELL 5
 
+// Global edge map size (adjust based on volume size)
+// For a 1024^3 volume with 8x4x4 blocks, this should be sufficient
+#define GLOBAL_EDGE_MAP_SIZE 16777216u  // 16M entries
+#define INVALID_VERTEX_ID 0xFFFFFFFFu
+#define CREATING_VERTEX_ID 0xFFFFFFFEu
 
-struct MeshletDescriptor {
-    uint vertexOffset; // Will be 0 if using global IDs directly for final mesh
-    uint indexOffset;
-    uint vertexCount;  // Count of vertices *output by this meshlet to SetMeshOutputsEXT*
-    uint primitiveCount;
-};
+// Workgroup sizes - NVIDIA recommended (32 = 1 warp)
+#define TASK_WORKGROUP_SIZE 32
+#define MESH_WORKGROUP_SIZE 32  // Optimal for mesh shaders
 
+// Structures shared with C++
 struct VertexData {
-    vec4 position;
-    vec4 normal;
+    vec4 position;  // xyz = position, w = 1.0
+    vec4 normal;    // xyz = normal, w = 0.0
 };
 
 struct TaskPayload {
-    uint globalVertexOffset_reservation; // For this meshlet's local output to SetMeshOutputsEXT
-    uint globalIndexOffset_reservation;  // For this meshlet's local output to SetMeshOutputsEXT
-
-    uvec3 coreBlockOrigin_global;   // Global origin of the CORE cells this meshlet is responsible for
-    uvec3 coreBlockDim;             // Dimensions of the CORE cells
-    uvec3 processingBlockOrigin_global; // Global origin of the larger block to process (core + context)
-    uvec3 processingBlockDim_total; // Dimensions of this larger block (core + context)
-
-    uint taskId;                    // Original compactedBlockID
+    uvec3 blockOrigin;      // Global origin of the block in voxel coordinates
+    uvec3 blockDim;         // Dimensions of the block to process
+    uint originalBlockId;   // Original block index from compacted array
+    uint level;             // Subdivision level (0 = full block, 1 = half, 2 = quarter)
 };
+
+// Edge vertex offsets for standard MC edges (0-11)
+const ivec3 MC_EDGE_VERTICES[12][2] = ivec3[12][2](
+    ivec3[2](ivec3(0,0,0), ivec3(1,0,0)), // edge 0
+    ivec3[2](ivec3(1,0,0), ivec3(1,1,0)), // edge 1
+    ivec3[2](ivec3(0,1,0), ivec3(1,1,0)), // edge 2
+    ivec3[2](ivec3(0,0,0), ivec3(0,1,0)), // edge 3
+    ivec3[2](ivec3(0,0,1), ivec3(1,0,1)), // edge 4
+    ivec3[2](ivec3(1,0,1), ivec3(1,1,1)), // edge 5
+    ivec3[2](ivec3(0,1,1), ivec3(1,1,1)), // edge 6
+    ivec3[2](ivec3(0,0,1), ivec3(0,1,1)), // edge 7
+    ivec3[2](ivec3(0,0,0), ivec3(0,0,1)), // edge 8
+    ivec3[2](ivec3(1,0,0), ivec3(1,0,1)), // edge 9
+    ivec3[2](ivec3(1,1,0), ivec3(1,1,1)), // edge 10
+    ivec3[2](ivec3(0,1,0), ivec3(0,1,1))  // edge 11
+);
+
+// Neighbor mapping table from PMB paper (Table 1)
+// Maps MC edge ID to neighbor cell offset and distinct edge
+// xyz = neighbor offset, w = distinct edge (0=x, 1=y, 2=z)
+const uvec4 NEIGHBOR_MAPPING_TABLE[12] = uvec4[12](
+    uvec4(0, 0, 0, 0), // edge 0: x-edge at origin
+    uvec4(1, 0, 0, 1), // edge 1: y-edge at (1,0,0)
+    uvec4(0, 1, 0, 0), // edge 2: x-edge at (0,1,0)
+    uvec4(0, 0, 0, 1), // edge 3: y-edge at origin
+    uvec4(0, 0, 1, 0), // edge 4: x-edge at (0,0,1)
+    uvec4(1, 0, 1, 1), // edge 5: y-edge at (1,0,1)
+    uvec4(0, 1, 1, 0), // edge 6: x-edge at (0,1,1)
+    uvec4(0, 0, 1, 1), // edge 7: y-edge at (0,0,1)
+    uvec4(0, 0, 0, 2), // edge 8: z-edge at origin
+    uvec4(1, 0, 0, 2), // edge 9: z-edge at (1,0,0)
+    uvec4(1, 1, 0, 2), // edge 10: z-edge at (1,1,0)
+    uvec4(0, 1, 0, 2)  // edge 11: z-edge at (0,1,0)
+);
+
+// Binding points
+#define BINDING_PUSH_CONSTANTS     0
+#define BINDING_VOLUME_IMAGE       1
+#define BINDING_ACTIVE_BLOCK_COUNT 2
+#define BINDING_COMPACTED_BLOCKS   3
+#define BINDING_MC_TRI_TABLE       4
+#define BINDING_GLOBAL_VERTICES    6
+#define BINDING_GLOBAL_INDICES     8
+#define BINDING_MESHLET_DESC       10
+#define BINDING_VERTEX_COUNTER     11
+#define BINDING_MESHLET_COUNTER    12
+#define BINDING_INDEX_COUNTER      13
+#define BINDING_GLOBAL_EDGE_MAP    14
 
 taskPayloadSharedEXT TaskPayload taskPayloadIn;
 
 // Bindings
-layout(set = 0, binding = 0, std140) uniform PushConstants { /* ... same ... */
+layout(set = 0, binding = BINDING_PUSH_CONSTANTS, std140) uniform PushConstants {
     uvec4 volumeDim;
     uvec4 blockDim;
     uvec4 blockGridDim;
     float isovalue;
 } ubo;
-layout(set = 0, binding = 1, r8ui) uniform readonly uimage3D volumeImage;
-layout(set = 0, binding = 4, std430) readonly buffer MarchingCubesTriTable_SSBO { int triTable[]; } mc;
 
-// GLOBAL Output Buffers - vertices written using global IDs
-layout(set = 0, binding = 6, std430) buffer GlobalVertexBuffer_SSBO { VertexData vertex_data[]; } globalVerticesSSBO;
-layout(set = 0, binding = 8, std430) buffer GlobalIndexBuffer_SSBO { uint indices[]; } globalIndicesSSBO;
+layout(set = 0, binding = BINDING_VOLUME_IMAGE, r8ui) uniform readonly uimage3D volumeImage;
+layout(set = 0, binding = BINDING_MC_TRI_TABLE, std430) readonly buffer MarchingCubesTriTable_SSBO { 
+    int triTable[]; 
+} mc;
 
-// Output for non-empty meshlet descriptors (written by this shader using its own counter)
-layout(set = 0, binding = 10, std430) buffer MeshletDescOutput_SSBO { MeshletDescriptor meshletDescriptors[]; } meshletDescOutput;
-// Counter for Global Vertices (used to assign unique IDs)
-layout(set = 0, binding = 11, std430) buffer GlobalVertexIDCounter_SSBO { uint counter; } globalVertexIDCounter;
-// Counter for ACTUALLY WRITTEN (filled) meshlet descriptors
-layout(set = 0, binding = 12, std430) buffer FilledMeshletDescCount_SSBO { uint filledMeshletCounter; } filledMeshletDescCount;
-// Counter for Global Indices (written by this shader)
-layout(set = 0, binding = 13, std430) buffer GlobalIndexOutputCount_SSBO { uint counter; } globalIndexOutputCount;
+layout(set = 0, binding = BINDING_GLOBAL_VERTICES, std430) buffer GlobalVertexBuffer_SSBO { 
+    VertexData vertex_data[]; 
+} globalVerticesSSBO;
 
+layout(set = 0, binding = BINDING_GLOBAL_INDICES, std430) buffer GlobalIndexBuffer_SSBO { 
+    uint indices[]; 
+} globalIndicesSSBO;
 
-layout(local_size_x = WORKGROUP_SIZE) in;
-// These are for the direct rasterizer path, less critical if we write to SSBOs for persistent mesh
-layout(max_vertices = MAX_VERTICES_LOCAL_OUTPUT, max_primitives = MAX_PRIMITIVES_LOCAL_OUTPUT) out;
+layout(set = 0, binding = BINDING_VERTEX_COUNTER, std430) buffer GlobalVertexIDCounter_SSBO { 
+    uint counter; 
+} globalVertexIDCounter;
+
+layout(set = 0, binding = BINDING_INDEX_COUNTER, std430) buffer GlobalIndexOutputCount_SSBO { 
+    uint counter; 
+} globalIndexOutputCount;
+
+// Meshlet descriptors
+struct MeshletDescriptor {
+    uint vertexOffset;
+    uint indexOffset;
+    uint vertexCount;
+    uint primitiveCount;
+};
+
+layout(set = 0, binding = 10, std430) buffer MeshletDescOutput_SSBO { 
+    MeshletDescriptor meshletDescriptors[]; 
+} meshletDescOutput;
+
+layout(set = 0, binding = 12, std430) buffer FilledMeshletDescCount_SSBO { 
+    uint filledMeshletCounter; 
+} filledMeshletDescCount;
+
+layout(local_size_x = MESH_WORKGROUP_SIZE) in;
+layout(max_vertices = 64, max_primitives = 126) out;
 layout(triangles) out;
 
-layout(location = 0) out PerVertexData { vec3 normal; } meshVertexDataOut_local[]; // For local rasterizer path
+// Shared memory
+shared float voxelValues[CORE_BLOCK_DIM_X + 1][CORE_BLOCK_DIM_Y + 1][CORE_BLOCK_DIM_Z + 1];
+shared uint totalVertices;
+shared uint totalTriangles;
+shared uint vertexOffset;
+shared uint indexOffset;
 
-// Shared Memory
-// For the *local output* via SetMeshOutputsEXT (can be minimal if not used)
-shared VertexData sharedLocalVertices[MAX_VERTICES_LOCAL_OUTPUT];
-shared uvec3 sharedLocalIndices[MAX_PRIMITIVES_LOCAL_OUTPUT];
-shared uint sharedLocalVertexCount;
-shared uint sharedLocalPrimitiveCount;
-shared uint tempGlobalTriangleIndices[MAX_PRIMITIVES_LOCAL_OUTPUT * 3]; // Max output for rasterizer
-shared uint tempLocalPrimitiveCount;
+// Edge table for standard MC - which edges are cut by the isosurface
+const int edgeTable[256] = int[256](
+    0x0,   0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c,
+    0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
+    0x190, 0x99,  0x393, 0x29a, 0x596, 0x49f, 0x795, 0x69c,
+    0x99c, 0x895, 0xb9f, 0xa96, 0xd9a, 0xc93, 0xf99, 0xe90,
+    0x230, 0x339, 0x33,  0x13a, 0x636, 0x73f, 0x435, 0x53c,
+    0xa3c, 0xb35, 0x83f, 0x936, 0xe3a, 0xf33, 0xc39, 0xd30,
+    0x3a0, 0x2a9, 0x1a3, 0xaa,  0x7a6, 0x6af, 0x5a5, 0x4ac,
+    0xbac, 0xaa5, 0x9af, 0x8a6, 0xfaa, 0xea3, 0xda9, 0xca0,
+    0x460, 0x569, 0x663, 0x76a, 0x66,  0x16f, 0x265, 0x36c,
+    0xc6c, 0xd65, 0xe6f, 0xf66, 0x86a, 0x963, 0xa69, 0xb60,
+    0x5f0, 0x4f9, 0x7f3, 0x6fa, 0x1f6, 0xff,  0x3f5, 0x2fc,
+    0xdfc, 0xcf5, 0xfff, 0xef6, 0x9fa, 0x8f3, 0xbf9, 0xaf0,
+    0x650, 0x759, 0x453, 0x55a, 0x256, 0x35f, 0x55,  0x15c,
+    0xe5c, 0xf55, 0xc5f, 0xd56, 0xa5a, 0xb53, 0x859, 0x950,
+    0x7c0, 0x6c9, 0x5c3, 0x4ca, 0x3c6, 0x2cf, 0x1c5, 0xcc,
+    0xfcc, 0xec5, 0xdcf, 0xcc6, 0xbca, 0xac3, 0x9c9, 0x8c0,
+    0x8c0, 0x9c9, 0xac3, 0xbca, 0xcc6, 0xdcf, 0xec5, 0xfcc,
+    0xcc,  0x1c5, 0x2cf, 0x3c6, 0x4ca, 0x5c3, 0x6c9, 0x7c0,
+    0x950, 0x859, 0xb53, 0xa5a, 0xd56, 0xc5f, 0xf55, 0xe5c,
+    0x15c, 0x55,  0x35f, 0x256, 0x55a, 0x453, 0x759, 0x650,
+    0xaf0, 0xbf9, 0x8f3, 0x9fa, 0xef6, 0xfff, 0xcf5, 0xdfc,
+    0x2fc, 0x3f5, 0xff,  0x1f6, 0x6fa, 0x7f3, 0x4f9, 0x5f0,
+    0xb60, 0xa69, 0x963, 0x86a, 0xf66, 0xe6f, 0xd65, 0xc6c,
+    0x36c, 0x265, 0x16f, 0x66,  0x76a, 0x663, 0x569, 0x460,
+    0xca0, 0xda9, 0xea3, 0xfaa, 0x8a6, 0x9af, 0xaa5, 0xbac,
+    0x4ac, 0x5a5, 0x6af, 0x7a6, 0xaa,  0x1a3, 0x2a9, 0x3a0,
+    0xd30, 0xc39, 0xf33, 0xe3a, 0x936, 0x83f, 0xb35, 0xa3c,
+    0x53c, 0x435, 0x73f, 0x636, 0x13a, 0x33,  0x339, 0x230,
+    0xe90, 0xf99, 0xc93, 0xd9a, 0xa96, 0xb9f, 0x895, 0x99c,
+    0x69c, 0x795, 0x49f, 0x596, 0x29a, 0x393, 0x99,  0x190,
+    0xf00, 0xe09, 0xd03, 0xc0a, 0xb06, 0xa0f, 0x905, 0x80c,
+    0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x0
+);
 
-// Cache to map a global edge ID (from any cell in processingBlockDim_total)
-// to its already assigned global unique vertex ID.
-// Key: hash of (global_cell_coord_of_edge_origin, edge_axis_in_cell (0-2 for distinct))
-// Value: The global unique vertex ID.
-#define EDGE_ID_CACHE_SLOTS 1024 // Power of 2, adjust based on typical # of unique edges in processingBlockDim_total
-#define EDGE_CACHE_EMPTY_SLOT 0xFFFFFFFFu
-#define EDGE_POS_EPSILON 1e-5f
+// Map from edge index to the two corner indices it connects
+const ivec2 edgeToCorners[12] = ivec2[12](
+    ivec2(0, 1), // edge 0
+    ivec2(1, 2), // edge 1
+    ivec2(2, 3), // edge 2
+    ivec2(3, 0), // edge 3
+    ivec2(4, 5), // edge 4
+    ivec2(5, 6), // edge 5
+    ivec2(6, 7), // edge 6
+    ivec2(7, 4), // edge 7
+    ivec2(0, 4), // edge 8
+    ivec2(1, 5), // edge 9
+    ivec2(2, 6), // edge 10
+    ivec2(3, 7)  // edge 11
+);
 
-// Key for this cache will be a globally unique identifier for an edge on the grid
-// e.g., hash(global_voxel_coord_of_edge_start, edge_axis (0..11 relative to that voxel as cell origin))
-shared uvec4 edgeCache_Keys[EDGE_ID_CACHE_SLOTS]; // Key: x,y,z of edge start voxel, w=MC edge ID (0-11)
-shared uint  edgeCache_GlobalVertexIDs[EDGE_ID_CACHE_SLOTS];  // Value: The Global Vertex ID
-
-// Helper functions (getEdgeInfo, interpolateVertex, calculateNormal)
-// ... (These functions remain the same as in the previous correct version) ...
-void getEdgeInfo(int edgeIndex, out ivec3 p1_offset, out ivec3 p2_offset, out int corner1_idx, out int corner2_idx, out int axis) {
-    switch (edgeIndex) {
-        case 0:  p1_offset=ivec3(0,0,0); p2_offset=ivec3(1,0,0); corner1_idx=0; corner2_idx=1; axis=0; return;
-        case 1:  p1_offset=ivec3(1,0,0); p2_offset=ivec3(1,1,0); corner1_idx=1; corner2_idx=2; axis=1; return;
-        case 2:  p1_offset=ivec3(0,1,0); p2_offset=ivec3(1,1,0); corner1_idx=3; corner2_idx=2; axis=0; return;
-        case 3:  p1_offset=ivec3(0,0,0); p2_offset=ivec3(0,1,0); corner1_idx=0; corner2_idx=3; axis=1; return;
-        case 4:  p1_offset=ivec3(0,0,1); p2_offset=ivec3(1,0,1); corner1_idx=4; corner2_idx=5; axis=0; return;
-        case 5:  p1_offset=ivec3(1,0,1); p2_offset=ivec3(1,1,1); corner1_idx=5; corner2_idx=6; axis=1; return;
-        case 6:  p1_offset=ivec3(0,1,1); p2_offset=ivec3(1,1,1); corner1_idx=7; corner2_idx=6; axis=0; return;
-        case 7:  p1_offset=ivec3(0,0,1); p2_offset=ivec3(0,1,1); corner1_idx=4; corner2_idx=7; axis=1; return;
-        case 8:  p1_offset=ivec3(0,0,0); p2_offset=ivec3(0,0,1); corner1_idx=0; corner2_idx=4; axis=2; return;
-        case 9:  p1_offset=ivec3(1,0,0); p2_offset=ivec3(1,0,1); corner1_idx=1; corner2_idx=5; axis=2; return;
-        case 10: p1_offset=ivec3(1,1,0); p2_offset=ivec3(1,1,1); corner1_idx=2; corner2_idx=6; axis=2; return;
-        case 11: p1_offset=ivec3(0,1,0); p2_offset=ivec3(0,1,1); corner1_idx=3; corner2_idx=7; axis=2; return;
-        default: p1_offset=ivec3(0); p2_offset=ivec3(0); corner1_idx=-1; corner2_idx=-1; axis=-1; return;
-    }
+// Helper functions
+vec3 interpolateVertex(vec3 p0, vec3 p1, float val0, float val1) {
+    if (abs(val0 - val1) < 1e-6f) return p0;
+    float t = clamp((ubo.isovalue - val0) / (val1 - val0), 0.0f, 1.0f);
+    return mix(p0, p1, t);
 }
 
-vec3 interpolateVertex(ivec3 p1_global, ivec3 p2_global, float val1, float val2) {
-    if (abs(val1 - val2) < 1e-6f) { return vec3(p1_global); }
-    float t = clamp((ubo.isovalue - val1) / (val2 - val1), 0.0f, 1.0f);
-    return mix(vec3(p1_global), vec3(p2_global), t);
-}
-
-vec3 calculateNormal(ivec3 globalCellCoord_not_used, vec3 vertexPos_global) {
-    ivec3 Npos = ivec3(round(vertexPos_global));
+vec3 calculateNormal(vec3 pos) {
+    ivec3 ipos = ivec3(round(pos));
     ivec3 volMax = ivec3(ubo.volumeDim.xyz) - 1;
-    float s1_x = float(imageLoad(volumeImage, clamp(Npos + ivec3(1,0,0), ivec3(0), volMax)).r);
-    float s2_x = float(imageLoad(volumeImage, clamp(Npos - ivec3(1,0,0), ivec3(0), volMax)).r);
-    float s1_y = float(imageLoad(volumeImage, clamp(Npos + ivec3(0,1,0), ivec3(0), volMax)).r);
-    float s2_y = float(imageLoad(volumeImage, clamp(Npos - ivec3(0,1,0), ivec3(0), volMax)).r);
-    float s1_z = float(imageLoad(volumeImage, clamp(Npos + ivec3(0,0,1), ivec3(0), volMax)).r);
-    float s2_z = float(imageLoad(volumeImage, clamp(Npos - ivec3(0,0,1), ivec3(0), volMax)).r);
-    vec3 grad = vec3(s2_x - s1_x, s2_y - s1_y, s2_z - s1_z);
+    
+    float dx = float(imageLoad(volumeImage, clamp(ipos + ivec3(1,0,0), ivec3(0), volMax)).r) -
+               float(imageLoad(volumeImage, clamp(ipos - ivec3(1,0,0), ivec3(0), volMax)).r);
+    float dy = float(imageLoad(volumeImage, clamp(ipos + ivec3(0,1,0), ivec3(0), volMax)).r) -
+               float(imageLoad(volumeImage, clamp(ipos - ivec3(0,1,0), ivec3(0), volMax)).r);
+    float dz = float(imageLoad(volumeImage, clamp(ipos + ivec3(0,0,1), ivec3(0), volMax)).r) -
+               float(imageLoad(volumeImage, clamp(ipos - ivec3(0,0,1), ivec3(0), volMax)).r);
+    
+    vec3 grad = vec3(dx, dy, dz);
     if (length(grad) < 1e-5f) return vec3(0, 1, 0);
     return -normalize(grad);
 }
 
-// Generates a key for an edge based on its globally lowest indexed voxel and its axis relative to that voxel
-uvec2 getGlobalEdgeKey(ivec3 globalCellOrigin_of_MC_cell, int mcEdgeID_0_11) {
-    ivec3 p1_offset, p2_offset;
-    int c1_idx, c2_idx, mc_axis;
-    getEdgeInfo(mcEdgeID_0_11, p1_offset, p2_offset, c1_idx, c2_idx, mc_axis);
-
-    // Determine the globally "lower" voxel of the edge and the edge's primary axis
-    ivec3 v1_global = globalCellOrigin_of_MC_cell + p1_offset;
-    ivec3 v2_global = globalCellOrigin_of_MC_cell + p2_offset;
-
-    ivec3 edgeOriginVoxel_global = min(v1_global, v2_global);
-    int edgeAxisInVoxel; // 0 for X, 1 for Y, 2 for Z edge from edgeOriginVoxel_global
-    if (v1_global.x != v2_global.x) edgeAxisInVoxel = 0;
-    else if (v1_global.y != v2_global.y) edgeAxisInVoxel = 1;
-    else edgeAxisInVoxel = 2;
-
-    // Hash the 3D voxel coordinate and axis
-    uint hash_coord = uint(edgeOriginVoxel_global.x * 73856093 ^
-    edgeOriginVoxel_global.y * 19349663 ^
-    edgeOriginVoxel_global.z * 83492791);
-    uint final_hash = (hash_coord ^ edgeAxisInVoxel) & (EDGE_ID_CACHE_SLOTS - 1);
-
-    // Return a more complete key for precise matching in cache, not just the hash slot
-    // For precise matching, store and compare edgeOriginVoxel_global and edgeAxisInVoxel
-    // Pack into uvec2: key.x = hash_coord, key.y = edgeAxisInVoxel for precise comparison
-    return uvec2(hash_coord, uint(edgeAxisInVoxel));
+uint warpScan(uint val) {
+    uint laneID = gl_LocalInvocationIndex & 31;
+    for (uint i = 1; i < 32; i *= 2) {
+        uint n = subgroupShuffleUp(val, i);
+        if (laneID >= i) val += n;
+    }
+    return val;
 }
 
-
 void main() {
-
+    uvec3 blockOrigin = taskPayloadIn.blockOrigin;
+    uvec3 blockDim = min(taskPayloadIn.blockDim, 
+                         uvec3(CORE_BLOCK_DIM_X, CORE_BLOCK_DIM_Y, CORE_BLOCK_DIM_Z));
+    
+    // Initialize shared memory
     if (gl_LocalInvocationIndex == 0) {
-        sharedLocalVertexCount = 0; // For SetMeshOutputsEXT path
-        sharedLocalPrimitiveCount = 0; // For SetMeshOutputsEXT path
-        for (int i = 0; i < EDGE_ID_CACHE_SLOTS; ++i) {
-            edgeCache_GlobalVertexIDs[i] = EDGE_CACHE_EMPTY_SLOT;
-            edgeCache_Keys[i] = uvec4(0xFFFFFFFFu); // Mark key as invalid
-        }
+        totalVertices = 0;
+        totalTriangles = 0;
+        vertexOffset = 0;
+        indexOffset = 0;
     }
+    
     barrier();
-
-    uvec3 coreBlockOrigin         = taskPayloadIn.coreBlockOrigin_global;
-    uvec3 coreDim                 = taskPayloadIn.coreBlockDim;
-    uvec3 processingBlockOrigin   = taskPayloadIn.processingBlockOrigin_global;
-    uvec3 processingDim           = taskPayloadIn.processingBlockDim_total;
-    uint taskId                   = taskPayloadIn.taskId;
-
-    uint cellsInProcessingBlock = processingDim.x * processingDim.y * processingDim.z;
-
-    // Temporary storage for this meshlet's generated global vertex IDs for its triangles
-    // Max 5 triangles * 3 vertices = 15 global IDs per cell.
-    // Processed by all cells in coreDim.
-    uint max_tris_from_core = coreDim.x * coreDim.y * coreDim.z * 5;
-    if (max_tris_from_core == 0) max_tris_from_core = 1; // Avoid zero size array if coreDim is 0,0,0
-
-    if(gl_LocalInvocationIndex == 0) tempLocalPrimitiveCount = 0;
+    
+    // Phase 1: Cache voxel values
+    uint voxelsToLoad = (blockDim.x + 1) * (blockDim.y + 1) * (blockDim.z + 1);
+    for (uint i = gl_LocalInvocationIndex; i < voxelsToLoad; i += MESH_WORKGROUP_SIZE) {
+        uint x = i % (blockDim.x + 1);
+        uint y = (i / (blockDim.x + 1)) % (blockDim.y + 1);
+        uint z = i / ((blockDim.x + 1) * (blockDim.y + 1));
+        
+        ivec3 voxelPos = ivec3(blockOrigin) + ivec3(x, y, z);
+        float val = 0.0;
+        
+        if (all(greaterThanEqual(voxelPos, ivec3(0))) && 
+            all(lessThan(voxelPos, ivec3(ubo.volumeDim.xyz)))) {
+            val = float(imageLoad(volumeImage, voxelPos).r);
+        }
+        
+        voxelValues[x][y][z] = val;
+    }
+    
     barrier();
-
-
-    // Each thread iterates ALL cells in the processingBlockDim (core + context)
-    // to generate vertices and populate the edge cache.
-    for (uint linearCellIdx_proc = gl_LocalInvocationIndex;
-    linearCellIdx_proc < cellsInProcessingBlock;
-    linearCellIdx_proc += WORKGROUP_SIZE) {
-
-        uvec3 localCellInProcBlock; // Coords relative to processingBlockOrigin, 0 to processingDim-1
-        localCellInProcBlock.x = linearCellIdx_proc % processingDim.x;
-        localCellInProcBlock.y = (linearCellIdx_proc / processingDim.x) % processingDim.y;
-        localCellInProcBlock.z = linearCellIdx_proc / (processingDim.x * processingDim.y);
-
-        ivec3 globalCellOrigin = ivec3(processingBlockOrigin) + ivec3(localCellInProcBlock);
-
-        float cornerValuesF[8];
+    
+    // Phase 2: Count vertices and triangles needed
+    uint myVertexCount = 0;
+    uint myTriangleCount = 0;
+    
+    uint cellsInBlock = blockDim.x * blockDim.y * blockDim.z;
+    for (uint cellIdx = gl_LocalInvocationIndex; cellIdx < cellsInBlock; cellIdx += MESH_WORKGROUP_SIZE) {
+        uvec3 localCell;
+        localCell.x = cellIdx % blockDim.x;
+        localCell.y = (cellIdx / blockDim.x) % blockDim.y;
+        localCell.z = cellIdx / (blockDim.x * blockDim.y);
+        
+        // Calculate cube case
         uint cubeCase = 0;
-        // ... (Calculate cubeCase and cornerValuesF for globalCellOrigin - same as before) ...
         for (int i = 0; i < 8; ++i) {
-            ivec3 cornerOffset = ivec3((i & 1), (i & 2) >> 1, (i & 4) >> 2);
-            ivec3 cornerVolCoord = globalCellOrigin + cornerOffset;
-            uint valU = 0;
-            if (all(greaterThanEqual(cornerVolCoord, ivec3(0))) && all(lessThan(cornerVolCoord, ivec3(ubo.volumeDim.xyz)))) {
-                valU = imageLoad(volumeImage, cornerVolCoord).r;
+            ivec3 offset = ivec3((i & 1), (i & 2) >> 1, (i & 4) >> 2);
+            float val = voxelValues[localCell.x + offset.x][localCell.y + offset.y][localCell.z + offset.z];
+            if (val >= ubo.isovalue) {
+                cubeCase |= (1u << i);
             }
-            cornerValuesF[i] = float(valU);
-            if (cornerValuesF[i] >= ubo.isovalue) cubeCase |= (1 << i);
         }
+        
         if (cubeCase == 0 || cubeCase == 255) continue;
-
-
-        // For each of the up to 15 edges that can form vertices for this cell's triangles
-        int baseTriTableIdx = int(cubeCase * 16);
-        for (int k_edge = 0; k_edge < 15; ++k_edge) {
-            int mcEdgeID = mc.triTable[baseTriTableIdx + k_edge];
-            if (mcEdgeID == -1) break;
-            // Check if this vertex is already processed (for this meshlet)
-            // Key for cache: global origin of the cell this mcEdgeID belongs to, and the mcEdgeID itself,
-            // or more canonically, the global coords of the "lower" voxel of the edge and its axis.
-            uvec2 globalEdgeKeyData = getGlobalEdgeKey(globalCellOrigin, mcEdgeID);
-            uint slot = globalEdgeKeyData.x & (EDGE_ID_CACHE_SLOTS - 1); // Use only hash part for slot index
-
-            bool foundInCache = false;
-            for (int probe = 0; probe < MAX_CACHE_PROBES; ++probe) {
-                uint currentSlot = (slot + probe) & (EDGE_ID_CACHE_SLOTS - 1);
-                if (edgeCache_GlobalVertexIDs[currentSlot] != EDGE_CACHE_EMPTY_SLOT) {
-                    if (edgeCache_Keys[currentSlot].x == globalEdgeKeyData.x &&
-                    edgeCache_Keys[currentSlot].y == globalEdgeKeyData.y) { // Precise key match
-                                                                            foundInCache = true;
-                                                                            break;
-                    }
-                } else { // Empty slot found during probe
-                         // Try to claim it for this globalEdgeKeyData
-                         uint newGlobalVertexID = atomicAdd(globalVertexIDCounter.counter, 1u);
-
-                         // This write to vertex_data needs to be globally unique for this newGlobalVertexID
-                         // If multiple meshlets generate same newGlobalVertexID for *different* edges due to counter races,
-                         // this is an issue. The globalVertexIDCounter *should* provide unique IDs.
-                         // The critical part is that only ONE thread across ALL meshlets writes to vertex_data[newGlobalVertexID].
-                         // This is often solved by a "first one wins" flag per global ID, or by design.
-                         // For now, assume current thread is responsible if it's the one allocating.
-
-                         ivec3 p1_offset, p2_offset; int c1_idx, c2_idx, mc_axis;
-                         getEdgeInfo(mcEdgeID, p1_offset, p2_offset, c1_idx, c2_idx, mc_axis);
-                         vec3 vertPos = interpolateVertex(globalCellOrigin + p1_offset, globalCellOrigin + p2_offset, cornerValuesF[c1_idx], cornerValuesF[c2_idx]);
-                         vec3 vertNorm = calculateNormal(globalCellOrigin, vertPos);
-
-                         // This write needs to be 100% guaranteed unique by newGlobalVertexID.
-                         // Placeholder for bounds check:
-                         if (newGlobalVertexID < 1000000000) { // Max capacity of globalVerticesSSBO
-                                                               globalVerticesSSBO.vertex_data[newGlobalVertexID].position = vec4(vertPos, 1.0);
-                                                               globalVerticesSSBO.vertex_data[newGlobalVertexID].normal = vec4(vertNorm, 0.0);
-                         }
-
-
-                         // Now try to put newGlobalVertexID into cache
-                         uint prev_cache_val = atomicCompSwap(edgeCache_GlobalVertexIDs[currentSlot], EDGE_CACHE_EMPTY_SLOT, newGlobalVertexID);
-                         if (prev_cache_val == EDGE_CACHE_EMPTY_SLOT) { // Successfully cached
-                                                                        edgeCache_Keys[currentSlot] = uvec4(globalEdgeKeyData.x, globalEdgeKeyData.y, 0, 0); // Store precise key
-                         }
-                         // else: another thread cached its vertex here. Our vertex is still in global SSBO.
-                         foundInCache = true; // It's processed.
-                         break;
-                }
-                if (foundInCache) break;
+        
+        // Count vertices needed
+        int edgeFlags = edgeTable[cubeCase];
+        uint vertCount = 0;
+        for (int i = 0; i < 12; ++i) {
+            if ((edgeFlags & (1 << i)) != 0) {
+                vertCount++;
             }
-            if (!foundInCache) { // All probes failed to find/cache
-                                 // This means cache is full of OTHER global edges. Vertex still needs to be generated and put in SSBO.
-                                 uint newGlobalVertexID_uncached = atomicAdd(globalVertexIDCounter.counter, 1u);
-                                 ivec3 p1_offset, p2_offset; int c1_idx, c2_idx, mc_axis;
-                                 getEdgeInfo(mcEdgeID, p1_offset, p2_offset, c1_idx, c2_idx, mc_axis);
-                                 vec3 vertPos = interpolateVertex(globalCellOrigin + p1_offset, globalCellOrigin + p2_offset, cornerValuesF[c1_idx], cornerValuesF[c2_idx]);
-                                 vec3 vertNorm = calculateNormal(globalCellOrigin, vertPos);
-                                 if (newGlobalVertexID_uncached < 1000000000) {
-                                     globalVerticesSSBO.vertex_data[newGlobalVertexID_uncached].position = vec4(vertPos, 1.0);
-                                     globalVerticesSSBO.vertex_data[newGlobalVertexID_uncached].normal = vec4(vertNorm, 0.0);
-                                 }
-                                 // debugPrintfEXT("MS VtxGenUncached: Task %u, GlobalID %u for edge %d in cell (%d,%d,%d)\n", taskId, newGlobalVertexID_uncached, mcEdgeID, globalCellOrigin.x,globalCellOrigin.y,globalCellOrigin.z);
-            }
-        } // End edge loop for vertex generation
-    } // End cell loop for vertex generation/caching phase
-    barrier(); // Ensure all cache writes are visible
-
-    // --- PHASE 2: Assemble Triangles for CORE cells ONLY ---
-    // Each thread processes cells belonging to the CORE block
-    uint cellsInCoreBlock = coreDim.x * coreDim.y * coreDim.z;
-    bool threadShouldStopTriAssembly = false;
-
-    for (uint linearCellIdx_core = gl_LocalInvocationIndex;
-    linearCellIdx_core < cellsInCoreBlock;
-    linearCellIdx_core += WORKGROUP_SIZE) {
-
-        if (threadShouldStopTriAssembly) break;
-        if (sharedLocalPrimitiveCount >= MAX_PRIMITIVES_LOCAL_OUTPUT) { // Using local output limits here
-                                                                        threadShouldStopTriAssembly = true; break;
         }
-
-        uvec3 localCellInCoreBlock; // Relative to coreBlockOrigin
-        localCellInCoreBlock.x = linearCellIdx_core % coreDim.x;
-        localCellInCoreBlock.y = (linearCellIdx_core / coreDim.x) % coreDim.y;
-        localCellInCoreBlock.z = linearCellIdx_core / (coreDim.x * coreDim.y);
-
-        ivec3 globalCellOrigin_core = ivec3(coreBlockOrigin) + ivec3(localCellInCoreBlock);
-
-        // ... (Re-calculate cubeCase and cornerValuesF for this globalCellOrigin_core - same as before) ...
-        float cornerValuesF_assembly[8];
-        uint cubeCase_assembly = 0;
-        for (int i = 0; i < 8; ++i) {
-            ivec3 cornerOffset = ivec3((i & 1), (i & 2) >> 1, (i & 4) >> 2);
-            ivec3 cornerVolCoord = globalCellOrigin_core + cornerOffset;
-            uint valU = 0;
-            if (all(greaterThanEqual(cornerVolCoord, ivec3(0))) && all(lessThan(cornerVolCoord, ivec3(ubo.volumeDim.xyz)))) {
-                valU = imageLoad(volumeImage, cornerVolCoord).r;
-            }
-            cornerValuesF_assembly[i] = float(valU);
-            if (cornerValuesF_assembly[i] >= ubo.isovalue) cubeCase_assembly |= (1 << i);
+        myVertexCount += vertCount;
+        
+        // Count triangles
+        int base = int(cubeCase) * 16;
+        uint triCount = 0;
+        for (int i = 0; i < 16; i += 3) {
+            if (mc.triTable[base + i] < 0) break;
+            triCount++;
         }
-        if (cubeCase_assembly == 0 || cubeCase_assembly == 255) continue;
-
-
-        int baseTriTableIdx = int(cubeCase_assembly * 16);
-        for (int tri_idx_in_cell = 0; tri_idx_in_cell < 5; ++tri_idx_in_cell) {
-            if (sharedLocalPrimitiveCount >= MAX_PRIMITIVES_LOCAL_OUTPUT) {
-                threadShouldStopTriAssembly = true; break;
-            }
-            int mcEdge0 = mc.triTable[baseTriTableIdx + tri_idx_in_cell * 3 + 0];
-            if (mcEdge0 == -1) break;
-            // ... (get mcEdge1, mcEdge2) ...
-            int mcEdge1 = mc.triTable[baseTriTableIdx + tri_idx_in_cell * 3 + 1];
-            int mcEdge2 = mc.triTable[baseTriTableIdx + tri_idx_in_cell * 3 + 2];
-            int currentTriangleMCEdges[3] = {mcEdge0, mcEdge1, mcEdge2};
-
-            uvec3 currentTriangleGlobalVertexIDs;
-            bool triangleIsValid = true;
-
-            for (int v_idx = 0; v_idx < 3; ++v_idx) {
-                int mcEdgeID_for_tri_vtx = currentTriangleMCEdges[v_idx];
-
-                uvec2 globalEdgeKeyData = getGlobalEdgeKey(globalCellOrigin_core, mcEdgeID_for_tri_vtx);
-                uint slot = globalEdgeKeyData.x & (EDGE_ID_CACHE_SLOTS - 1);
-                uint foundGlobalVertexID = EDGE_CACHE_EMPTY_SLOT;
-
-                for (int probe = 0; probe < MAX_CACHE_PROBES; ++probe) {
-                    uint currentSlot = (slot + probe) & (EDGE_ID_CACHE_SLOTS - 1);
-                    if (edgeCache_GlobalVertexIDs[currentSlot] != EDGE_CACHE_EMPTY_SLOT &&
-                    edgeCache_Keys[currentSlot].x == globalEdgeKeyData.x &&
-                    edgeCache_Keys[currentSlot].y == globalEdgeKeyData.y) {
-                        foundGlobalVertexID = edgeCache_GlobalVertexIDs[currentSlot];
-                        break;
-                    }
-                    if (edgeCache_GlobalVertexIDs[currentSlot] == EDGE_CACHE_EMPTY_SLOT && probe > 0) {
-                        // If we hit an empty slot after the first probe, means it wasn't further along (if it was a collision)
-                        break;
-                    }
-                }
-
-                if (foundGlobalVertexID == EDGE_CACHE_EMPTY_SLOT) {
-                    // This should ideally not happen if Phase 1 correctly populated cache for all needed edges.
-                    // Could happen if MAX_PROBES too small or cache too small.
-                    debugPrintfEXT("MS P2 VTX LOOKUP FAIL: Task %u, CoreCell (%u,%u,%u) MCedge %d. GlobalKey (%u,%u). No GlobalID in cache.\n",
-                                   taskId, localCellInCoreBlock.x, localCellInCoreBlock.y, localCellInCoreBlock.z, mcEdgeID_for_tri_vtx,
-                                   globalEdgeKeyData.x, globalEdgeKeyData.y);
-                    triangleIsValid = false;
-                    break;
-                }
-                currentTriangleGlobalVertexIDs[v_idx] = foundGlobalVertexID;
-            } // End v_idx loop
-
-            if (triangleIsValid) {
-                if (currentTriangleGlobalVertexIDs.x == currentTriangleGlobalVertexIDs.y ||
-                currentTriangleGlobalVertexIDs.x == currentTriangleGlobalVertexIDs.z ||
-                currentTriangleGlobalVertexIDs.y == currentTriangleGlobalVertexIDs.z) {
-                    continue;
-                }
-                // Add to global index buffer
-                uint global_idx_buffer_offset = atomicAdd(globalIndexOutputCount.counter, 3u);
-                // Placeholder for bounds check on globalIndexOutputCount.counter
-                if (global_idx_buffer_offset + 2 < 1000000000) { // Max capacity of globalIndicesSSBO
-                                                                 globalIndicesSSBO.indices[global_idx_buffer_offset + 0] = currentTriangleGlobalVertexIDs.x;
-                                                                 globalIndicesSSBO.indices[global_idx_buffer_offset + 1] = currentTriangleGlobalVertexIDs.y;
-                                                                 globalIndicesSSBO.indices[global_idx_buffer_offset + 2] = currentTriangleGlobalVertexIDs.z;
-
-                                                                 // Also add to local indices for SetMeshOutputsEXT if needed for rasterizer path
-                                                                 // This requires mapping global IDs back to a local list, or just outputting some dummy data
-                                                                 // for SetMeshOutputsEXT. For persistent mesh, SSBO is key.
-                                                                 // For now, let's also try to populate sharedLocalIndices for SetMeshOutputsEXT as a proxy.
-                                                                 // This part is tricky as sharedLocalVertices isn't populated with global IDs.
-                                                                 // To make SetMeshOutputsEXT work, we'd need to fill sharedLocalVertices and map global IDs.
-                                                                 // Simplification: only write to SSBO for now. Increment local prim count for descriptor.
-                                                                 atomicAdd(sharedLocalPrimitiveCount, 1u); // Just to make descriptor non-empty if needed
-
-                } else {
-                    // Ran out of global index buffer space
-                    threadShouldStopTriAssembly = true;
-                }
-            }
-            if (threadShouldStopTriAssembly) break;
-        } // End triangle loop
-        if (threadShouldStopTriAssembly) break;
-    } // End core cell loop
-
-    barrier();
-    // Final counts for SetMeshOutputsEXT (can be minimal, e.g., 0,0 if not rasterizing)
-    // For the descriptor, we need vertex/primitive counts *for this meshlet's contribution to global buffers*.
-    // This is harder to get accurately without more counters.
-    // Let's use sharedLocalPrimitiveCount for the descriptor. Vertex count is harder if using global IDs.
-    // The actual "vertex count" for a meshlet using global IDs is effectively the number of *unique* global IDs it referenced.
-
-    uint finalLocalPrimCount = min(sharedLocalPrimitiveCount, MAX_PRIMITIVES_LOCAL_OUTPUT);
-    // For finalVertexCount for descriptor: we could count unique global IDs used by this meshlet's tris,
-    // or just put a placeholder if the descriptor isn't strictly used for rendering.
-    // For simplicity, if prims > 0, say verts > 0.
-    uint finalLocalVertCount = (finalLocalPrimCount > 0) ? min(globalVertexIDCounter.counter, MAX_VERTICES_LOCAL_OUTPUT) : 0; // This is not right.
-    // The descriptor should reflect what this meshlet "outputs" or "references".
-    // Let's use a small placeholder for local output for now.
-    if(finalLocalPrimCount > 0 && finalLocalVertCount == 0) finalLocalVertCount = 3; // Min 3 verts for a tri
-
-    SetMeshOutputsEXT(finalLocalVertCount, finalLocalPrimCount); // For rasterizer path (if any)
-
-    // Write meshlet descriptor
-    if (gl_LocalInvocationIndex == 0) {
-        // This descriptor should reflect the *actual contribution to the global buffers*
-        // This needs careful thought. If indices are global, vertexOffset might be 0.
-        // The count could be the total in globalVertexIDCounter.counter *after this meshlet*.
-        // For now, let's assume the C++ side will rebuild from the global vertex/index buffers.
-        // The descriptor could point to the segment of *indices* this meshlet wrote.
-        // However, the task shader reserved globalVertexOffset_reservation and globalIndexOffset_reservation
-        // which were for the old model of meshlet-local vertex/index lists.
-
-        // New Descriptor Logic:
-        // Get the number of primitives this specific meshlet instance added to the global index buffer.
-        // This is tricky without another atomic counter per meshlet for its own outputted primitives.
-        // Let's assume `tempLocalPrimitiveCount` (if made truly atomic per meshlet) could be used.
-        // For now, if any prims were generated for local output, write a descriptor using global offsets for that.
-
-        uint currentFilledPrims = sharedLocalPrimitiveCount; // Prims added to sharedLocalIndices for raster path
-
-        if (currentFilledPrims > 0) {
-            uint actualDescWriteIdx = atomicAdd(filledMeshletDescCount.filledMeshletCounter, 1u);
-            uint effectiveDescCapacity = 2000000; // Placeholder
-            if (actualDescWriteIdx < effectiveDescCapacity) {
-                // The vertex/index offsets here would ideally point to the *global* buffers
-                // and counts would be how many this meshlet *contributed* or *references*.
-                // This is where the model of independent meshlets with global IDs gets complex for descriptors.
-                // Simplest for OBJ export: descriptor just notes it was non-empty.
-                // The actual vertex/index ranges for this meshlet's triangles are spread in global buffers.
-                meshletDescOutput.meshletDescriptors[actualDescWriteIdx].vertexOffset = 0; // Using global IDs
-                meshletDescOutput.meshletDescriptors[actualDescWriteIdx].indexOffset = 0; // Using global IDs
-                meshletDescOutput.meshletDescriptors[actualDescWriteIdx].vertexCount = globalVertexIDCounter.counter; // Total global vertices so far
-                meshletDescOutput.meshletDescriptors[actualDescWriteIdx].primitiveCount = currentFilledPrims; // Prims this meshlet tried to output locally
-            }
+        myTriangleCount += triCount;
+    }
+    
+    // Prefix sum to get offsets
+    uint myVertexOffset = warpScan(myVertexCount);
+    uint myTriangleOffset = warpScan(myTriangleCount);
+    
+    // Last thread gets total counts
+    if (gl_LocalInvocationIndex == MESH_WORKGROUP_SIZE - 1) {
+        totalVertices = myVertexOffset;
+        totalTriangles = myTriangleOffset;
+        
+        if (myVertexOffset > 0) {
+            vertexOffset = atomicAdd(globalVertexIDCounter.counter, myVertexOffset);
+        }
+        if (myTriangleOffset > 0) {
+            indexOffset = atomicAdd(globalIndexOutputCount.counter, myTriangleOffset * 3);
         }
     }
+    
+    barrier();
+    
+    // Phase 3: Generate vertices and triangles
+    uint currentVertexOffset = myVertexOffset - myVertexCount;
+    uint currentTriangleOffset = myTriangleOffset - myTriangleCount;
+    
+    for (uint cellIdx = gl_LocalInvocationIndex; cellIdx < cellsInBlock; cellIdx += MESH_WORKGROUP_SIZE) {
+        uvec3 localCell;
+        localCell.x = cellIdx % blockDim.x;
+        localCell.y = (cellIdx / blockDim.x) % blockDim.y;
+        localCell.z = cellIdx / (blockDim.x * blockDim.y);
+        
+        ivec3 globalCell = ivec3(blockOrigin) + ivec3(localCell);
+        
+        // Get corner values
+        float cornerValues[8];
+        uint cubeCase = 0;
+        for (int i = 0; i < 8; ++i) {
+            ivec3 offset = ivec3((i & 1), (i & 2) >> 1, (i & 4) >> 2);
+            cornerValues[i] = voxelValues[localCell.x + offset.x][localCell.y + offset.y][localCell.z + offset.z];
+            if (cornerValues[i] >= ubo.isovalue) {
+                cubeCase |= (1u << i);
+            }
+        }
+        
+        if (cubeCase == 0 || cubeCase == 255) continue;
+        
+        // Generate vertices for this cell
+        uint cellVertexIDs[12];
+        for (int i = 0; i < 12; ++i) {
+            cellVertexIDs[i] = INVALID_VERTEX_ID;
+        }
+        
+        int edgeFlags = edgeTable[cubeCase];
+        uint localVertexCounter = 0;
+        
+        for (int edgeIdx = 0; edgeIdx < 12; ++edgeIdx) {
+            if ((edgeFlags & (1 << edgeIdx)) != 0) {
+                // Get the two corners this edge connects
+                ivec2 corners = edgeToCorners[edgeIdx];
+                int c0 = corners.x;
+                int c1 = corners.y;
+                
+                // Get vertex positions for the two corners
+                ivec3 p0 = globalCell + ivec3((c0 & 1), (c0 & 2) >> 1, (c0 & 4) >> 2);
+                ivec3 p1 = globalCell + ivec3((c1 & 1), (c1 & 2) >> 1, (c1 & 4) >> 2);
+                
+                // Interpolate vertex position
+                vec3 pos = interpolateVertex(vec3(p0), vec3(p1), cornerValues[c0], cornerValues[c1]);
+                vec3 normal = calculateNormal(pos);
+                
+                // Store vertex
+                uint globalVertexID = vertexOffset + currentVertexOffset + localVertexCounter;
+                
+                // Debug check
+                if (any(greaterThan(abs(pos), vec3(10000.0)))) {
+                    debugPrintfEXT("ERROR: Huge vertex position: (%f,%f,%f) at cell (%d,%d,%d)\n",
+                                   pos.x, pos.y, pos.z, globalCell.x, globalCell.y, globalCell.z);
+                }
+                
+                globalVerticesSSBO.vertex_data[globalVertexID].position = vec4(pos, 1.0);
+                globalVerticesSSBO.vertex_data[globalVertexID].normal = vec4(normal, 0.0);
+                
+                cellVertexIDs[edgeIdx] = globalVertexID;
+                localVertexCounter++;
+            }
+        }
+        
+        currentVertexOffset += localVertexCounter;
+        
+        // Generate triangles
+        int base = int(cubeCase) * 16;
+        for (int tri = 0; tri < 5; ++tri) {
+            int e0 = mc.triTable[base + tri * 3 + 0];
+            if (e0 < 0 || e0 >= 12) break;
+            
+            int e1 = mc.triTable[base + tri * 3 + 1];
+            int e2 = mc.triTable[base + tri * 3 + 2];
+            
+            if (e1 < 0 || e1 >= 12 || e2 < 0 || e2 >= 12) break;
+            
+            uint globalIndexOffset = indexOffset + (currentTriangleOffset * 3);
+            globalIndicesSSBO.indices[globalIndexOffset + 0] = cellVertexIDs[e0];
+            globalIndicesSSBO.indices[globalIndexOffset + 1] = cellVertexIDs[e1];
+            globalIndicesSSBO.indices[globalIndexOffset + 2] = cellVertexIDs[e2];
+            
+            currentTriangleOffset++;
+        }
+    }
+    
+    barrier();
+    
+    // Write meshlet descriptor
+    if (gl_LocalInvocationIndex == 0 && totalTriangles > 0) {
+        uint descIndex = atomicAdd(filledMeshletDescCount.filledMeshletCounter, 1u);
+        
+        meshletDescOutput.meshletDescriptors[descIndex].vertexOffset = vertexOffset;
+        meshletDescOutput.meshletDescriptors[descIndex].indexOffset = indexOffset / 3;
+        meshletDescOutput.meshletDescriptors[descIndex].vertexCount = totalVertices;
+        meshletDescOutput.meshletDescriptors[descIndex].primitiveCount = totalTriangles;
+    }
+    
+    SetMeshOutputsEXT(0, 0);
 }
