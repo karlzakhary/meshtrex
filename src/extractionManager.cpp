@@ -18,7 +18,7 @@
 #include <cstring>
 #include <utility> // For std::move if needed later
 
-constexpr uint32_t GLOBAL_EDGE_MAP_SIZE = 16777216; // 16M entries
+constexpr uint32_t GLOBAL_EDGE_MAP_SIZE = 4194304; // 16M entries
 constexpr uint32_t INVALID_VERTEX_ID = 0xFFFFFFFF;
 
 // --- Helper Function to Create Marching Cubes Table Buffer (Revised) ---
@@ -220,16 +220,20 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         // Add some headroom to size estimations?
 
         //For basic mesh shader
-        const uint32_t CELLS_PER_BLOCK_FROM_SHADER = 8 * 8 * 8; // Match shader's #define
+        const uint32_t CELLS_PER_BLOCK_FROM_SHADER = 4 * 4 * 4; // Match shader's #define
         const uint32_t MAX_VERTS_PER_CELL_FROM_SHADER = 12;    // Match shader's #define
         const uint32_t MAX_PRIMS_PER_CELL_FROM_SHADER = 5;     // Match shader's #define
 
         const VkDeviceSize MAX_TOTAL_VERTICES_BYTES =
-            256 * 256 * 256 * 3 *
+            static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
+            CELLS_PER_BLOCK_FROM_SHADER *
+            MAX_VERTS_PER_CELL_FROM_SHADER *
             sizeof(VertexData);
         std::cout << " Max vertices: " << MAX_TOTAL_VERTICES_BYTES / sizeof(VertexData) << std::endl;
         const VkDeviceSize MAX_TOTAL_INDICES_BYTES =
-            256 * 256 * 256 * 3 * 5 *
+            static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
+            CELLS_PER_BLOCK_FROM_SHADER *
+            MAX_PRIMS_PER_CELL_FROM_SHADER * 3 * // 3 indices per primitive
             sizeof(uint32_t);
         // For advance mesh shader
         // const VkDeviceSize MAX_TOTAL_VERTICES_BYTES =
@@ -244,16 +248,10 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         //                 sizeof(uint32_t)
         // ;
         const VkDeviceSize MAX_MESHLET_DESCRIPTORS_BYTES =
-            (255 / (MAX_SUB_BLOCKS_PER_BLOCK - 1)) * 
-            (MAX_SUB_BLOCKS_PER_BLOCK / (MAX_SUB_BLOCKS_PER_BLOCK - 1)) * 
-            (MAX_SUB_BLOCKS_PER_BLOCK / (MAX_SUB_BLOCKS_PER_BLOCK - 1)) * 8 *
-            sizeof(MeshletDescriptor)
+            static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
+                CELLS_PER_BLOCK_FROM_SHADER *
+                    sizeof(MeshletDescriptor)
         ;
-        // const VkDeviceSize MAX_MESHLET_DESCRIPTORS_BYTES =
-        //     static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
-        //         MAX_SUB_BLOCKS_PER_BLOCK *
-        //             sizeof(MeshletDescriptor)
-        // ;
 
         std::cout << "Requesting output buffer sizes (incl. counter) based on " << filterOutput.activeBlockCount << " active blocks:" << std::endl;
         std::cout << "  - Vertex Buffer Size:       " << MAX_TOTAL_VERTICES_BYTES << " bytes" << std::endl;

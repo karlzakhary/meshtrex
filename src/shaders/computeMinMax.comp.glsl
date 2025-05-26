@@ -16,7 +16,7 @@ layout(push_constant) uniform PushConstants {
 // --- Layout Definitions ---
 
 // Define the local workgroup size (should match pc.blockDim)
-layout (local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
 // Binding 0: Input scalar field data using a 3D image texture
 // Assumes r8ui format for unsigned 8-bit integer data [0, 255].

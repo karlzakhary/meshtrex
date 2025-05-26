@@ -18,9 +18,9 @@
 const int VOLUME_DIM_X = 256;
 const int VOLUME_DIM_Y = 256;
 const int VOLUME_DIM_Z = 256;
-const int BLOCK_DIM_X = 4;
-const int BLOCK_DIM_Y = 4;
-const int BLOCK_DIM_Z = 4;
+const int BLOCK_DIM_X = 8;
+const int BLOCK_DIM_Y = 8;
+const int BLOCK_DIM_Z = 8;
 const int GRID_DIM_X = static_cast<int>(std::ceil(static_cast<double>(VOLUME_DIM_X) / BLOCK_DIM_X)); // 4
 const int GRID_DIM_Y = static_cast<int>(std::ceil(static_cast<double>(VOLUME_DIM_Y) / BLOCK_DIM_Y)); // 4
 const int GRID_DIM_Z = static_cast<int>(std::ceil(static_cast<double>(VOLUME_DIM_Z) / BLOCK_DIM_Z)); // 2

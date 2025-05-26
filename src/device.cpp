@@ -246,6 +246,7 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
 #endif
     features.features.shaderInt16 = true;
     features.features.shaderInt64 = true;
+    features.features.shaderFloat64 = true;
     features.features.samplerAnisotropy = true;
     features.features.shaderStorageImageWriteWithoutFormat = true;
 
