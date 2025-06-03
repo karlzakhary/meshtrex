@@ -6,15 +6,14 @@
 #extension GL_EXT_debug_printf : enable
 
 // --- Configurable Parameters ---
-#define BLOCK_DIM_X 8
-#define BLOCK_DIM_Y 8
-#define BLOCK_DIM_Z 8
-#define MAX_VERTS_PER_CELL 12
-#define MAX_PRIMS_PER_CELL 5
-#define MAX_MESHLET_VERTS 256u
-#define MAX_MESHLET_PRIMS 128u // Aligned with mesh shader
-#define MAX_TRI_INDICES 16    // From Marching Cubes table structure
+#define MAX_VERTS_PER_CELL 12 // Max vertices a single cell can produce before sharing
+#define MAX_PRIMS_PER_CELL 5  // Max triangles a single cell can produce
+#define MAX_MESHLET_VERTS 256u // Max unique vertices a meshlet aims to produce
+#define MAX_MESHLET_PRIMS 256u // Max primitives a meshlet aims to produce
+#define MAX_TRI_INDICES 16    // Assumed padding for triTable entries per cube case
 #define WORKGROUP_SIZE 32
+#define EFFECTIVE_MAX_MESHLET_VERTS (MAX_MESHLET_VERTS / 8) // Example: 128 if target is 256
+#define EFFECTIVE_MAX_MESHLET_PRIMS (MAX_MESHLET_PRIMS / 8) // Example: 128
 
 // --- Structures ---
 struct TaskPayload {
@@ -23,7 +22,7 @@ struct TaskPayload {
     uint globalMeshletDescOffset;
     uvec3 blockOrigin;      // Absolute origin in volume coordinates OF THE SUB-BLOCK
     uvec3 subBlockDim;      // Dimensions of the sub-block for the mesh shader
-    uint taskId;            // Original compactedBlockID
+    uint taskId;            // Original compactedBlockID for debugging
 };
 
 taskPayloadSharedEXT TaskPayload taskPayloadOut;
@@ -31,39 +30,45 @@ taskPayloadSharedEXT TaskPayload taskPayloadOut;
 // --- Bindings ---
 layout(set = 0, binding = 0, std140) uniform PushConstants {
     uvec4 volumeDim;
-    uvec4 blockDim;         // Default dimensions of blocks processed by task shader (e.g., 8,8,8)
-    uvec4 blockGridDim;
+    uvec4 blockDim;         // Default dimensions of blocks (e.g., 8,8,8 or 16,16,16)
+    uvec4 blockGridDim;     // Grid dimensions in terms of ubo.blockDim blocks
     float isovalue;
 } ubo;
 
 layout(set = 0, binding = 1, r8ui) uniform readonly uimage3D volumeImage;
 
-layout(set = 0, binding = 2, std430) readonly buffer ActiveBlockCount_SSBO { // Assuming this exists for bounds check
-                                                                             uint count;
+layout(set = 0, binding = 2, std430) readonly buffer ActiveBlockCount_SSBO {
+    uint count;
 } activeBlockCountBuffer;
 
 layout(set = 0, binding = 3, std430) readonly buffer CompactedBlockIDs_SSBO {
     uint compactedBlkArray[];
 } blockIds;
 
+// Using classic Marching Cubes triTable for triangle definitions
 layout(set = 0, binding = 4, std430) readonly buffer MarchingCubesTriTable_SSBO {
-    int triTable[];
+    int triTable[]; // Classic MC: 256 cases * 16 ints (max 5 tris * 3 verts + terminator)
 } mc;
 
-// Using countVertices (per-cell unique edges) instead of a separate numVertsTable SSBO
-// layout(set=0, binding=5, std430) readonly buffer NumVertsTable { uint numVertsTable[]; } nvt;
+// Binding 5 would be for edgeTable, but it's used by the Mesh Shader, not Task Shader for this logic
+// layout(set=0, binding=5, std430) readonly buffer EdgeTable_SSBO { uint edgeTable[]; } et;
 
-layout(set = 0, binding = 7, std430) buffer VertexCount_SSBO { uint vertexCounter; } vCount;
-layout(set = 0, binding = 9, std430) buffer IndexCount_SSBO { uint indexCounter; } iCount;
-layout(set = 0, binding = 11, std430) buffer MeshletDescCount_SSBO { uint meshletCounter; } meshletCount;
+// Global counters for allocating space in vertex/index buffers
+layout(set = 0, binding = 11, std430) buffer VertexCount_SSBO { uint vertexCounter; } vCount;
+layout(set = 0, binding = 13, std430) buffer IndexCount_SSBO { uint indexCounter; } iCount;
+// Global counter for allocating space for meshlet descriptors (task shader allocates, mesh shader fills)
+layout(set = 0, binding = 12, std430) buffer MeshletDescCount_SSBO { uint meshletCounter; } meshletDescCount;
+
 
 // --- Helper Functions ---
+// Samples a Marching Cubes case for a cell at its global origin
 uint sampleMcCase(uvec3 cell_global_origin) {
     uint cubeCase = 0;
     for (int i = 0; i < 8; ++i) {
         ivec3 corner_offset = ivec3((i & 1), (i & 2) >> 1, (i & 4) >> 2);
         ivec3 voxel_coord = ivec3(cell_global_origin) + corner_offset;
         uint val = 0;
+        // Boundary checks for sampling volume image
         if (all(greaterThanEqual(voxel_coord, ivec3(0))) && all(lessThan(voxel_coord, ivec3(ubo.volumeDim.xyz)))) {
             val = imageLoad(volumeImage, voxel_coord).r;
         }
@@ -74,16 +79,17 @@ uint sampleMcCase(uvec3 cell_global_origin) {
     return cubeCase;
 }
 
+// Estimates vertices for a single cell by counting unique edges from its triTable entry.
+// This is a pre-sharing estimate for subdivision purposes.
 uint countCellVertices(uint cubeCase) {
-    // Estimates vertices by unique edges for THIS cell
-    uint flags = 0u;
+    uint flags = 0u; // Bitmask to track unique edges
     uint vertCount = 0u;
-    int base = int(cubeCase) * MAX_TRI_INDICES;
+    int base = int(cubeCase) * MAX_TRI_INDICES; // Assumes triTable is padded
     for (int i = 0; i < MAX_TRI_INDICES; ++i) {
         int edgeID = mc.triTable[base + i];
-        if (edgeID < 0) break;
-        uint mask = 1u << uint(edgeID);
-        if ((flags & mask) == 0u) {
+        if (edgeID < 0) break; // Terminator for the list of edges for this case
+        uint mask = 1u << uint(edgeID); // Create a mask for this edge
+        if ((flags & mask) == 0u) { // If this edge hasn't been counted yet
             flags |= mask;
             vertCount++;
         }
@@ -91,60 +97,51 @@ uint countCellVertices(uint cubeCase) {
     return vertCount;
 }
 
+// Counts triangles for a single cell from its triTable entry.
 uint countCellPrimitives(uint cubeCase) {
-    // Counts triangles for THIS cell
     uint primCount = 0;
-    int base = int(cubeCase) * MAX_TRI_INDICES;
-    for (int i = 0; i < MAX_TRI_INDICES; i += 3) {
-        if (mc.triTable[base + i] < 0) break;
+    int base = int(cubeCase) * MAX_TRI_INDICES; // Assumes triTable is padded
+    for (int i = 0; i < MAX_TRI_INDICES; i += 3) { // Each triangle uses 3 edge indices
+        if (mc.triTable[base + i] < 0) break; // Terminator or start of padding
         primCount++;
     }
     return primCount;
 }
 
+// Estimates total vertices in a given sub-block (run by one thread)
 uint estimateVertsInSubBlock(uvec3 subBlockGlobalOrigin, uvec3 subBlockDimensions) {
     uint sum = 0;
-    bool limitExceeded = false;
-    if (gl_LocalInvocationIndex == 0) {
-        // Estimation done by one thread
-        for (uint z = 0; z < subBlockDimensions.z; ++z) {
-            for (uint y = 0; y < subBlockDimensions.y; ++y) {
-                for (uint x = 0; x < subBlockDimensions.x; ++x) {
-                    uvec3 cellGlobalOrigin = subBlockGlobalOrigin + uvec3(x, y, z);
-                    uint cubeCase = sampleMcCase(cellGlobalOrigin);
-                    sum += countCellVertices(cubeCase); // Using per-cell vertex estimate
-                    if (sum > MAX_MESHLET_VERTS) {
-                        limitExceeded = true;
-                        break;
+    for (uint z = 0; z < subBlockDimensions.z; ++z) {
+        for (uint y = 0; y < subBlockDimensions.y; ++y) {
+            for (uint x = 0; x < subBlockDimensions.x; ++x) {
+                uvec3 cellGlobalOrigin = subBlockGlobalOrigin + uvec3(x, y, z);
+                uint cubeCase = sampleMcCase(cellGlobalOrigin);
+                if (cubeCase != 0 && cubeCase != 255) {
+                    sum += countCellVertices(cubeCase);
+                    if (sum > EFFECTIVE_MAX_MESHLET_VERTS + WORKGROUP_SIZE) { // Add a little buffer for parallel estimation inaccuracy
+                        // debugPrintfEXT("TS EST_VERTS_EARLY_EXIT: Sum %u exceeded %u for block %u,%u,%u dim %u,%u,%u\n",
+                        //    sum, EFFECTIVE_MAX_MESHLET_VERTS, subBlockGlobalOrigin.x,subBlockGlobalOrigin.y,subBlockGlobalOrigin.z,
+                        //    subBlockDimensions.x,subBlockDimensions.y,subBlockDimensions.z);
+                        return sum;
                     }
                 }
-                if (limitExceeded) break;
             }
-            if (limitExceeded) break;
         }
     }
-    return sum; // Only thread 0 uses this directly, no broadcast needed if logic is self-contained
+    return sum;
 }
-
-uint estimatePrimsInSubBlock(uvec3 subBlockGlobalOrigin, uvec3 subBlockDimensions) {
+uint estimatePrimsInSubBlock(uvec3 subBlockGlobalOrigin, uvec3 subBlockDimensions) { /* Uses EFFECTIVE_MAX_MESHLET_PRIMS for early exit */
     uint sum = 0;
-    bool limitExceeded = false;
-    if (gl_LocalInvocationIndex == 0) {
-        // Estimation done by one thread
-        for (uint z = 0; z < subBlockDimensions.z; ++z) {
-            for (uint y = 0; y < subBlockDimensions.y; ++y) {
-                for (uint x = 0; x < subBlockDimensions.x; ++x) {
-                    uvec3 cellGlobalOrigin = subBlockGlobalOrigin + uvec3(x, y, z);
-                    uint cubeCase = sampleMcCase(cellGlobalOrigin);
+    for (uint z = 0; z < subBlockDimensions.z; ++z) {
+        for (uint y = 0; y < subBlockDimensions.y; ++y) {
+            for (uint x = 0; x < subBlockDimensions.x; ++x) {
+                uvec3 cellGlobalOrigin = subBlockGlobalOrigin + uvec3(x, y, z);
+                uint cubeCase = sampleMcCase(cellGlobalOrigin);
+                if (cubeCase != 0 && cubeCase != 255) {
                     sum += countCellPrimitives(cubeCase);
-                    if (sum > MAX_MESHLET_PRIMS) {
-                        limitExceeded = true;
-                        break;
-                    }
+                     if (sum > EFFECTIVE_MAX_MESHLET_PRIMS + WORKGROUP_SIZE) return sum;
                 }
-                if (limitExceeded) break;
             }
-            if (limitExceeded) break;
         }
     }
     return sum;
@@ -159,134 +156,127 @@ void main() {
 
     uint compactedBlockID = gl_WorkGroupID.x;
     if (compactedBlockID >= activeBlockCountBuffer.count) {
-         debugPrintfEXT("TS WARN: compactedBlockID %u >= activeBlockCount %u. Skipping.\n", compactedBlockID, activeBlockCountBuffer.count);
         return;
     }
-
     uint originalBlockIndex = blockIds.compactedBlkArray[compactedBlockID];
 
-    uvec3 fullBlockGlobalOrigin; // Origin of the initial 8x8x8 (or whatever ubo.blockDim is) block
+    uvec3 fullBlockGlobalOrigin;
     fullBlockGlobalOrigin.z = originalBlockIndex / (ubo.blockGridDim.x * ubo.blockGridDim.y);
     uint sliceIndex = originalBlockIndex % (ubo.blockGridDim.x * ubo.blockGridDim.y);
     fullBlockGlobalOrigin.y = sliceIndex / ubo.blockGridDim.x;
     fullBlockGlobalOrigin.x = sliceIndex % ubo.blockGridDim.x;
     fullBlockGlobalOrigin *= ubo.blockDim.xyz;
 
-    uvec3 fullBlockDim = ubo.blockDim.xyz;
-    uvec3 halfBlockDim = max(uvec3(1), fullBlockDim / 2u);
-    uvec3 quarterBlockDim = max(uvec3(1), fullBlockDim / 4u);
+    uvec3 initialBlockDim = ubo.blockDim.xyz;
 
-    uint estVertsFull = estimateVertsInSubBlock(fullBlockGlobalOrigin, fullBlockDim);
-    uint estPrimsFull = estimatePrimsInSubBlock(fullBlockGlobalOrigin, fullBlockDim);
+    // Use a simple array as a stack for pending blocks to process
+    // struct SubBlock { uvec3 origin; uvec3 dim; };
+    // SubBlock blockStack[8*8]; // Max 8 quarters from 8 halves = 64. Max 1 initial.
+    // uint stackPtr = 0;
+    // blockStack[stackPtr++] = SubBlock(fullBlockGlobalOrigin, initialBlockDim);
+    // We'll simplify to avoid an explicit stack and just recurse one/two levels for clarity.
 
-    if (estVertsFull == 0 && estPrimsFull == 0) {
-         debugPrintfEXT("TS INFO: Full block ID %u (origin %u,%u,%u) is empty. EstV=%u, EstP=%u.\n", compactedBlockID, fullBlockGlobalOrigin.x, fullBlockGlobalOrigin.y, fullBlockGlobalOrigin.z, estVertsFull, estPrimsFull);
+    // Process full block
+    uint estVerts = estimateVertsInSubBlock(fullBlockGlobalOrigin, initialBlockDim);
+    uint estPrims = estimatePrimsInSubBlock(fullBlockGlobalOrigin, initialBlockDim);
+
+    if (estVerts == 0 && estPrims == 0) {
         return;
     }
 
-    if (estVertsFull <= MAX_MESHLET_VERTS && estPrimsFull <= MAX_MESHLET_PRIMS) {
-        // debugPrintfEXT("TS EMIT: Full block ID %u (origin %u,%u,%u dim %u,%u,%u). EstV=%u, EstP=%u.\n", compactedBlockID, fullBlockGlobalOrigin.x, fullBlockGlobalOrigin.y, fullBlockGlobalOrigin.z, fullBlockDim.x, fullBlockDim.y, fullBlockDim.z, estVertsFull, estPrimsFull);
-        uint cells = fullBlockDim.x * fullBlockDim.y * fullBlockDim.z;
-        uint mV = cells * MAX_VERTS_PER_CELL;
-        uint mI = cells * MAX_PRIMS_PER_CELL * 3u;
-        uint vOff = atomicAdd(vCount.vertexCounter, mV);
-        uint iOff = atomicAdd(iCount.indexCounter, mI);
-        uint dOff = atomicAdd(meshletCount.meshletCounter, 1u);
-        taskPayloadOut = TaskPayload(vOff, iOff, dOff, fullBlockGlobalOrigin, fullBlockDim, compactedBlockID);
+    // if (estVerts <= EFFECTIVE_MAX_MESHLET_VERTS && estPrims <= EFFECTIVE_MAX_MESHLET_PRIMS) {
+        uint cells = initialBlockDim.x * initialBlockDim.y * initialBlockDim.z;
+        uint reservedVerts = cells * MAX_VERTS_PER_CELL;
+        uint reservedIndices = cells * MAX_PRIMS_PER_CELL * 3u;
+        uint vOff = atomicAdd(vCount.vertexCounter, reservedVerts);
+        uint iOff = atomicAdd(iCount.indexCounter, reservedIndices);
+        uint dOff = atomicAdd(meshletDescCount.meshletCounter, 1u);
+        taskPayloadOut = TaskPayload(vOff, iOff, dOff, fullBlockGlobalOrigin, initialBlockDim, compactedBlockID);
         EmitMeshTasksEXT(1, 1, 1);
-        return;
-    }
 
-    // debugPrintfEXT("TS SUBDIVIDE: Full block ID %u (origin %u,%u,%u) too large (EstV=%u, EstP=%u). Subdividing to half...\n", compactedBlockID, fullBlockGlobalOrigin.x, fullBlockGlobalOrigin.y, fullBlockGlobalOrigin.z, estVertsFull, estPrimsFull);
+        return;
+    // }
+
+    // Subdivide full block into 8 half-blocks
+    uvec3 baseHalfDim = max(uvec3(1), initialBlockDim / 2u);
     for (uint oz = 0u; oz < 2u; ++oz) {
         for (uint oy = 0u; oy < 2u; ++oy) {
             for (uint ox = 0u; ox < 2u; ++ox) {
-                uvec3 currentHalfSubBlockDim = uvec3(
-                (fullBlockDim.x == 1) ? 1 : (ox == 0 ? halfBlockDim.x : fullBlockDim.x - halfBlockDim.x),
-                (fullBlockDim.y == 1) ? 1 : (oy == 0 ? halfBlockDim.y : fullBlockDim.y - halfBlockDim.y),
-                (fullBlockDim.z == 1) ? 1 : (oz == 0 ? halfBlockDim.z : fullBlockDim.z - halfBlockDim.z)
-                );
-                if (ox > 0 && currentHalfSubBlockDim.x == halfBlockDim.x && fullBlockDim.x % 2u != 0 && fullBlockDim.x > 1)  {
-                    currentHalfSubBlockDim.x = max(1u, currentHalfSubBlockDim.x -1); // crude fix for uneven
-                }
-                // Similar for y, z if strict non-overlapping is needed for uneven blocks. For 8x8x8, this simplifies.
+                uvec3 currentSubBlockOffset = uvec3(ox * baseHalfDim.x, oy * baseHalfDim.y, oz * baseHalfDim.z);
+                uvec3 subBlockOrigin = fullBlockGlobalOrigin + currentSubBlockOffset;
+                uvec3 subBlockDim;
+                subBlockDim.x = (ox == 0) ? baseHalfDim.x : initialBlockDim.x - baseHalfDim.x;
+                subBlockDim.y = (oy == 0) ? baseHalfDim.y : initialBlockDim.y - baseHalfDim.y;
+                subBlockDim.z = (oz == 0) ? baseHalfDim.z : initialBlockDim.z - baseHalfDim.z;
+                subBlockDim = max(uvec3(1), subBlockDim);
 
-                uvec3 halfSubBlockGlobalOrigin = fullBlockGlobalOrigin +
-                    uvec3(ox * halfBlockDim.x, oy * halfBlockDim.y, oz * halfBlockDim.z);
+                estVerts = estimateVertsInSubBlock(subBlockOrigin, subBlockDim);
+                estPrims = estimatePrimsInSubBlock(subBlockOrigin, subBlockDim);
 
-                uint estVertsHalf = estimateVertsInSubBlock(halfSubBlockGlobalOrigin, currentHalfSubBlockDim);
-                uint estPrimsHalf = estimatePrimsInSubBlock(halfSubBlockGlobalOrigin, currentHalfSubBlockDim);
+                if (estVerts == 0 && estPrims == 0) continue;
 
-                if (estVertsHalf == 0 && estPrimsHalf == 0) continue;
-
-                if (estVertsHalf <= MAX_MESHLET_VERTS && estPrimsHalf <= MAX_MESHLET_PRIMS) {
-                    // debugPrintfEXT("TS EMIT: Half-block for ID %u (offset %u%u%u from origin %u,%u,%u dim %u,%u,%u). EstV=%u, EstP=%u.\n", compactedBlockID, ox,oy,oz, halfSubBlockGlobalOrigin.x, halfSubBlockGlobalOrigin.y, halfSubBlockGlobalOrigin.z, currentHalfSubBlockDim.x, currentHalfSubBlockDim.y, currentHalfSubBlockDim.z, estVertsHalf, estPrimsHalf);
-                    uint cells = currentHalfSubBlockDim.x * currentHalfSubBlockDim.y * currentHalfSubBlockDim.z;
-                    uint mV = cells * MAX_VERTS_PER_CELL;
-                    uint mI = cells * MAX_PRIMS_PER_CELL * 3u;
-                    uint vOff = atomicAdd(vCount.vertexCounter, mV);
-                    uint iOff = atomicAdd(iCount.indexCounter, mI);
-                    uint dOff = atomicAdd(meshletCount.meshletCounter, 1u);
-                    taskPayloadOut = TaskPayload(vOff, iOff, dOff, halfSubBlockGlobalOrigin, currentHalfSubBlockDim, compactedBlockID);
+                if (estVerts <= EFFECTIVE_MAX_MESHLET_VERTS && estPrims <= EFFECTIVE_MAX_MESHLET_PRIMS) {
+                    uint cells = subBlockDim.x * subBlockDim.y * subBlockDim.z;
+                    uint reservedVerts = cells * MAX_VERTS_PER_CELL;
+                    uint reservedIndices = cells * MAX_PRIMS_PER_CELL * 3u;
+                    uint vOff = atomicAdd(vCount.vertexCounter, reservedVerts);
+                    uint iOff = atomicAdd(iCount.indexCounter, reservedIndices);
+                    uint dOff = atomicAdd(meshletDescCount.meshletCounter, 1u);
+                    taskPayloadOut = TaskPayload(vOff, iOff, dOff, subBlockOrigin, subBlockDim, compactedBlockID);
+                    // debugPrintfEXT("TS EMIT HALF");
                     EmitMeshTasksEXT(1, 1, 1);
                 } else {
-                    // debugPrintfEXT("TS SUBDIVIDE: Half-block for ID %u (offset %u%u%u from origin %u,%u,%u) too large (EstV=%u, EstP=%u). Subdividing to quarter...\n", compactedBlockID, ox,oy,oz, halfSubBlockGlobalOrigin.x, halfSubBlockGlobalOrigin.y, halfSubBlockGlobalOrigin.z, estVertsHalf, estPrimsHalf);
-                    bool canBeQuartered = (currentHalfSubBlockDim.x >= 2u && currentHalfSubBlockDim.y >= 2u && currentHalfSubBlockDim.z >= 2u);
-                    if (!canBeQuartered) {
-//                        debugPrintfEXT("TS EMIT WARN: Dense half-block for ID %u (offset %u%u%u from origin %u,%u,%u dim %u,%u,%u) cannot be quartered. Emitting as half. EstV=%u, EstP=%u.\n", compactedBlockID, ox,oy,oz, halfSubBlockGlobalOrigin.x,halfSubBlockGlobalOrigin.y,halfSubBlockGlobalOrigin.z, currentHalfSubBlockDim.x, currentHalfSubBlockDim.y, currentHalfSubBlockDim.z, estVertsHalf, estPrimsHalf);
-                        debugPrintfEXT("TS EMIT WARN: Dense half-block, cannot be quartered 1");
-                        uint cells = currentHalfSubBlockDim.x * currentHalfSubBlockDim.y * currentHalfSubBlockDim.z;
-                        uint mV = cells * MAX_VERTS_PER_CELL;
-                        uint mI = cells * MAX_PRIMS_PER_CELL * 3u;
-                        uint vOff = atomicAdd(vCount.vertexCounter, mV);
-                        uint iOff = atomicAdd(iCount.indexCounter, mI);
-                        uint dOff = atomicAdd(meshletCount.meshletCounter, 1u);
-                        taskPayloadOut = TaskPayload(vOff, iOff, dOff, halfSubBlockGlobalOrigin, currentHalfSubBlockDim, compactedBlockID);
-                        EmitMeshTasksEXT(1, 1, 1);
-                        continue;
-                    }
+                    // Subdivide this half-block into 8 quarter-blocks
+                    uvec3 baseQuarterDim = max(uvec3(1), subBlockDim / 2u);
+                    bool emittedAnyQuarter = false;
+                    for (uint qz = 0u; qz < 2u; ++qz) {
+                        for (uint qy = 0u; qy < 2u; ++qy) {
+                            for (uint qx = 0u; qx < 2u; ++qx) {
+                                if ((qx == 1 && subBlockDim.x < 2) || (qy == 1 && subBlockDim.y < 2) || (qz == 1 && subBlockDim.z < 2)) {
+                                    if ((qx == 1 && subBlockDim.x == 1) || (qy == 1 && subBlockDim.y == 1) || (qz == 1 && subBlockDim.z == 1)) continue;
+                                }
+                                uvec3 quarterSubBlockOffset = uvec3(qx * baseQuarterDim.x, qy * baseQuarterDim.y, qz * baseQuarterDim.z);
+                                uvec3 quarterOrigin = subBlockOrigin + quarterSubBlockOffset;
+                                uvec3 quarterDim;
+                                quarterDim.x = (qx == 0) ? baseQuarterDim.x : subBlockDim.x - baseQuarterDim.x;
+                                quarterDim.y = (qy == 0) ? baseQuarterDim.y : subBlockDim.y - baseQuarterDim.y;
+                                quarterDim.z = (qz == 0) ? baseQuarterDim.z : subBlockDim.z - baseQuarterDim.z;
+                                quarterDim = max(uvec3(1), quarterDim);
 
-                    bool emittedAnyQuarterTask = false;
-                    for (uint oz2 = 0u; oz2 < 2u; ++oz2) {
-                        for (uint oy2 = 0u; oy2 < 2u; ++oy2) {
-                            for (uint ox2 = 0u; ox2 < 2u; ++ox2) {
-                                uvec3 currentQuarterSubBlockDim = uvec3(
-                                (currentHalfSubBlockDim.x == 1) ? 1 : (ox2 == 0 ? quarterBlockDim.x : currentHalfSubBlockDim.x - quarterBlockDim.x),
-                                (currentHalfSubBlockDim.y == 1) ? 1 : (oy2 == 0 ? quarterBlockDim.y : currentHalfSubBlockDim.y - quarterBlockDim.y),
-                                (currentHalfSubBlockDim.z == 1) ? 1 : (oz2 == 0 ? quarterBlockDim.z : currentHalfSubBlockDim.z - quarterBlockDim.z)
-                                );
+                                uint estVertsQ = estimateVertsInSubBlock(quarterOrigin, quarterDim);
+                                uint estPrimsQ = estimatePrimsInSubBlock(quarterOrigin, quarterDim);
 
-                                uvec3 quarterSubBlockGlobalOrigin = halfSubBlockGlobalOrigin + uvec3(ox2 * quarterBlockDim.x, oy2 * quarterBlockDim.y, oz2 * quarterBlockDim.z);
+                                if (estVertsQ == 0 && estPrimsQ == 0) continue;
 
-                                uint estVertsQuarter = estimateVertsInSubBlock(quarterSubBlockGlobalOrigin, currentQuarterSubBlockDim);
-                                uint estPrimsQuarter = estimatePrimsInSubBlock(quarterSubBlockGlobalOrigin, currentQuarterSubBlockDim);
+                                // For quarter blocks, we emit them even if they might slightly exceed EFFECTIVE limits,
+                                // as this is the finest practical subdivision. The mesh shader will clamp.
+                                // The main goal is that these quarter blocks are small enough for actual MAX_MESHLET_VERTS.
+                                // If estVertsQ still exceeds MAX_MESHLET_VERTS_TARGET, then the scene is extremely dense.
+                                // if (estVertsQ > MAX_MESHLET_VERTS_TARGET) {
+                                //    debugPrintfEXT("TS WARN_DENSE_QUARTER: Task %u, Quarter EstV %u > Target %u\n", compactedBlockID, estVertsQ, MAX_MESHLET_VERTS_TARGET);
+                                // }
 
-                                if (estVertsQuarter == 0 && estPrimsQuarter == 0) continue;
-
-                                // Always emit non-empty quarter blocks. Mesh shader will clamp if estimates were off.
-                                // debugPrintfEXT("TS EMIT: Quarter-block for ID %u (offset %u%u%u -> %u%u%u from origin %u,%u,%u dim %u,%u,%u). EstV=%u, EstP=%u.\n", compactedBlockID, ox,oy,oz, ox2,oy2,oz2, quarterSubBlockGlobalOrigin.x, quarterSubBlockGlobalOrigin.y, quarterSubBlockGlobalOrigin.z, currentQuarterSubBlockDim.x,currentQuarterSubBlockDim.y,currentQuarterSubBlockDim.z, estVertsQuarter, estPrimsQuarter);
-                                uint cells = currentQuarterSubBlockDim.x * currentQuarterSubBlockDim.y * currentQuarterSubBlockDim.z;
-                                uint mV = cells * MAX_VERTS_PER_CELL;
-                                uint mI = cells * MAX_PRIMS_PER_CELL * 3u;
-                                uint vOff = atomicAdd(vCount.vertexCounter, mV);
-                                uint iOff = atomicAdd(iCount.indexCounter, mI);
-                                uint dOff = atomicAdd(meshletCount.meshletCounter, 1u);
-                                taskPayloadOut = TaskPayload(vOff, iOff, dOff, quarterSubBlockGlobalOrigin, currentQuarterSubBlockDim, compactedBlockID);
+                                uint cells = quarterDim.x * quarterDim.y * quarterDim.z;
+                                uint reservedVerts = cells * MAX_VERTS_PER_CELL;
+                                uint reservedIndices = cells * MAX_PRIMS_PER_CELL * 3u;
+                                uint vOff = atomicAdd(vCount.vertexCounter, reservedVerts);
+                                uint iOff = atomicAdd(iCount.indexCounter, reservedIndices);
+                                uint dOff = atomicAdd(meshletDescCount.meshletCounter, 1u);
+                                taskPayloadOut = TaskPayload(vOff, iOff, dOff, quarterOrigin, quarterDim, compactedBlockID);
                                 EmitMeshTasksEXT(1, 1, 1);
-                                emittedAnyQuarterTask = true;
+                                emittedAnyQuarter = true;
+                                debugPrintfEXT("TS EMIT QUARTER");
                             }
                         }
                     }
-                    if (!emittedAnyQuarterTask && (estVertsHalf > 0 || estPrimsHalf > 0)) {
-//                        debugPrintfEXT("TS WARN FALLBACK: Dense half-block for ID %u (offset %u %u %u from origin %u,%u,%u) had EstV=%u, EstP=%u BUT NO quarter tasks emitted. Emitting half-block.\n", compactedBlockID, ox,oy,oz, halfSubBlockGlobalOrigin.x, halfSubBlockGlobalOrigin.y, halfSubBlockGlobalOrigin.z, estVertsHalf, estPrimsHalf);
-                        debugPrintfEXT("TS WARN FALLBACK: Dense half-block 2");
-                        uint cells = currentHalfSubBlockDim.x * currentHalfSubBlockDim.y * currentHalfSubBlockDim.z;
-                        uint mV = cells * MAX_VERTS_PER_CELL;
-                        uint mI = cells * MAX_PRIMS_PER_CELL * 3u;
-                        uint vOff = atomicAdd(vCount.vertexCounter, mV);
-                        uint iOff = atomicAdd(iCount.indexCounter, mI);
-                        uint dOff = atomicAdd(meshletCount.meshletCounter, 1u);
-                        taskPayloadOut = TaskPayload(vOff, iOff, dOff, halfSubBlockGlobalOrigin, currentHalfSubBlockDim, compactedBlockID);
+                    if (!emittedAnyQuarter && (estVerts > 0 || estPrims > 0)) { // Fallback if half-block was too small to quarter or all quarters were empty
+                        uint cells = subBlockDim.x * subBlockDim.y * subBlockDim.z;
+                        uint reservedVerts = cells * MAX_VERTS_PER_CELL;
+                        uint reservedIndices = cells * MAX_PRIMS_PER_CELL * 3u;
+                        uint vOff = atomicAdd(vCount.vertexCounter, reservedVerts);
+                        uint iOff = atomicAdd(iCount.indexCounter, reservedIndices);
+                        uint dOff = atomicAdd(meshletDescCount.meshletCounter, 1u);
+                        taskPayloadOut = TaskPayload(vOff, iOff, dOff, subBlockOrigin, subBlockDim, compactedBlockID);
                         EmitMeshTasksEXT(1, 1, 1);
                     }
                 }

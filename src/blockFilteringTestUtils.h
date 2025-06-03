@@ -555,7 +555,7 @@ inline void testCompactBuffer(VulkanContext &context, Buffer &compactedBlockIdBu
         // 1. Compute Min/Max results on CPU
         // Assuming volume dims are known or read from Volume struct
         glm::uvec3 volumeDims = {256, 256, 256}; // Example, use actual dims
-        std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("../cmake-build-debug/raw_volumes/bonsai_256x256x256_uint8.raw");
+        std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("/home/ge26mot/Projects/meshtrex/build/raw_volumes/bonsai_256x256x256_uint8.raw");
 
         // 2. Compute Active Block Count on CPU
         uint32_t cpuActiveCount = computeActiveBlockCountCPU(cpuMinMaxResults, isovalue);

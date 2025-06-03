@@ -46,3 +46,5 @@ void writeExtractionOutputToOBJ_Revised(
     VulkanContext& context,
     ExtractionOutput& extractionResult,
     const char* filePath);
+
+void writeGPUMeshToOBJ(VulkanContext& context, ExtractionOutput& extractionOutput, const char* filename);

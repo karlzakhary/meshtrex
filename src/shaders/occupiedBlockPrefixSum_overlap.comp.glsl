@@ -7,6 +7,7 @@
 layout(push_constant) uniform PushConstants {
     uvec4 volumeDim;     // Original volume dimensions
     uvec4 blockDim;      // Block dimensions (e.g., 8x8x8)
+    uvec4 blockStride;   // Block stride for overlap (e.g., 7x7x7)
     uvec4 blockGridDim;  // Grid dimensions = ceil(volumeDim / blockStride)
     float isovalue;
 } pc;
@@ -14,6 +15,9 @@ layout(push_constant) uniform PushConstants {
 // --- Bindings ---
 
 // Binding 0: Input Min/Max data (rg32ui -> uvec2)
+// IMPORTANT: This min/max volume must have been generated with stride-based block positioning:
+// - Block at grid position (bx,by,bz) covers voxels starting at (bx*stride.x, by*stride.y, bz*stride.z)
+// - Each block covers blockDim voxels, so blocks overlap when stride < blockDim
 layout(binding = 0, rg32ui) uniform readonly uimage3D minMaxInputVolume;
 
 // Binding 1: Output buffer for compacted active block IDs
@@ -43,120 +47,115 @@ shared uint s_workgroupBaseOffset;
 // Stores the total active count for the entire workgroup
 shared uint s_workgroupTotalActiveCount;
 
+// Helper function to convert 1D block index to 3D grid coordinates
+uvec3 blockIndexTo3D(uint index, uvec3 gridDim) {
+    uvec3 coord;
+    uint planeSize = gridDim.x * gridDim.y;
+    coord.z = (planeSize > 0) ? (index / planeSize) : 0;
+    uint remainder = (planeSize > 0) ? (index % planeSize) : index;
+    coord.y = (gridDim.x > 0) ? (remainder / gridDim.x) : 0;
+    coord.x = (gridDim.x > 0) ? (remainder % gridDim.x) : remainder;
+    return coord;
+}
+
+// Helper function to get the actual volume position of a block
+// This is where stride comes into play - blocks are positioned at stride intervals
+uvec3 getBlockVolumePosition(uvec3 blockCoord) {
+    return blockCoord * pc.blockStride.xyz;
+}
 
 void main() {
     // --- Basic Setup & Activity Check ---
     uint globalBlockID1D = gl_GlobalInvocationID.x;
-    uvec3 blockGridDim = pc.blockGridDim.xyz; // Use .xyz accessor
+    uvec3 blockGridDim = pc.blockGridDim.xyz;
     uint totalBlocks = blockGridDim.x * blockGridDim.y * blockGridDim.z;
 
+    // Early exit for threads beyond the grid
     if (globalBlockID1D >= totalBlocks) {
         return;
     }
 
-    uvec3 blockCoord;
-    uint planeSize = blockGridDim.x * blockGridDim.y;
-    blockCoord.z = (planeSize > 0) ? (globalBlockID1D / planeSize) : 0;
-    uint remainder = (planeSize > 0) ? (globalBlockID1D % planeSize) : globalBlockID1D;
-    blockCoord.y = (blockGridDim.x > 0) ? (remainder / blockGridDim.x) : 0;
-    blockCoord.x = (blockGridDim.x > 0) ? (remainder % blockGridDim.x) : remainder;
+    // Convert 1D block index to 3D grid coordinates
+    uvec3 blockCoord = blockIndexTo3D(globalBlockID1D, blockGridDim);
+    
+    // Debug info (commented out for production):
+    // uvec3 blockStartPos = getBlockVolumePosition(blockCoord);
+    // uvec3 blockEndPos = blockStartPos + pc.blockDim.xyz;
 
+    // Load min/max values for this block
+    // The min/max volume should have been generated considering the stride-based positioning
     uvec2 minMax = imageLoad(minMaxInputVolume, ivec3(blockCoord)).xy;
 
+    // Check if block is active (contains the isosurface)
     bool blockIsActive = false;
-    if (minMax.x != minMax.y) {
+    if (minMax.x != minMax.y) { // Skip if min == max (constant block)
         blockIsActive = (pc.isovalue >= float(minMax.x) && pc.isovalue <= float(minMax.y));
     }
     uint activeFlag = blockIsActive ? 1 : 0;
 
     // --- Parallel Scan Implementation ---
+    // This part remains the same as it's already optimized for parallel prefix sum
 
     // Stage 1: Intra-Subgroup Exclusive Scan
-    // Calculates sum of activeFlags preceding this invocation within its subgroup.
     uint subgroupPrefixSum = subgroupExclusiveAdd(activeFlag);
-    // Calculate total active count within this subgroup efficiently
-    // subgroupAdd(activeFlag) sums across the subgroup.
-    uint subgroupTotal = subgroupAdd(activeFlag); // Total count for this subgroup
+    uint subgroupTotal = subgroupAdd(activeFlag);
 
     // Stage 2: Store Subgroup Totals in Shared Memory
-    // Only one thread per subgroup (e.g., the last one) needs to write.
     if (gl_SubgroupInvocationID == gl_SubgroupSize - 1) {
-        // Ensure subgroupID is within bounds of shared memory array
         if(gl_SubgroupID < MAX_SUBGROUPS) {
             s_subgroupTotals[gl_SubgroupID] = subgroupTotal;
         }
     }
 
-    // Synchronize: Ensure all subgroup totals are written to shared memory
-    // before the next stage reads them. Also synchronizes execution flow.
-    memoryBarrierShared(); // Ensure shared memory writes are visible
-    barrier();             // Synchronize workgroup execution
+    memoryBarrierShared();
+    barrier();
 
-    // Stage 3: Inter-Subgroup Scan (Scan across subgroup totals)
-    // This is performed by only the *first* subgroup (gl_SubgroupID == 0).
-    // It scans the totals stored in s_subgroupTotals.
+    // Stage 3: Inter-Subgroup Scan
     if (gl_SubgroupID == 0) {
-        // Each thread in subgroup 0 loads a total from a different subgroup
         uint totalToScan = 0;
-        if (gl_SubgroupInvocationID < MAX_SUBGROUPS) { // Ensure we only read valid totals
+        if (gl_SubgroupInvocationID < MAX_SUBGROUPS) {
             totalToScan = s_subgroupTotals[gl_SubgroupInvocationID];
         }
 
-        // Perform an exclusive scan on these totals within subgroup 0
         uint scanOfTotals = subgroupExclusiveAdd(totalToScan);
 
-        // Write the scan result (base offset for each subgroup) back to shared memory
         if (gl_SubgroupInvocationID < MAX_SUBGROUPS) {
             s_subgroupScanResult[gl_SubgroupInvocationID] = scanOfTotals;
         }
 
-        // All threads in block 0 calculate and store the workgroup's total active count
-        uint workgroupTotal = subgroupAdd(totalToScan); // Total sum of subgroup totals
-        if (gl_LocalInvocationIndex == 0) { // Equivalent to gl_SubgroupInvocationID == 0 here
-            // Workgroup total = scan result for the last subgroup + total of the last subgroup
-            uint lastSubgroupID = (gl_WorkGroupSize.x / gl_SubgroupSize) - 1;
-            // Need the total count from the scan operation within subgroup 0
+        uint workgroupTotal = subgroupAdd(totalToScan);
+        if (gl_LocalInvocationIndex == 0) {
             s_workgroupTotalActiveCount = workgroupTotal;
         }
     }
 
-    // Synchronize: Ensure scan results and workgroup total are written to shared memory
-    // and visible to all threads before proceeding.
     memoryBarrierShared();
     barrier();
 
     // Stage 4: Combine Results for Local Offset
-    // Each thread reads the starting offset for its subgroup
     uint blockPrefixSumForSubgroup = 0;
-    if(gl_SubgroupID < MAX_SUBGROUPS) { // Bounds check
+    if(gl_SubgroupID < MAX_SUBGROUPS) {
         blockPrefixSumForSubgroup = s_subgroupScanResult[gl_SubgroupID];
     }
-    // Add the intra-subgroup prefix sum calculated earlier
     uint localOffset = blockPrefixSumForSubgroup + subgroupPrefixSum;
 
     // Stage 5 & 6: Get Global Offset Base and Broadcast
-    // Only the first thread in the workgroup performs the atomic add
     if (gl_LocalInvocationIndex == 0) {
         uint wgTotal = s_workgroupTotalActiveCount;
-        // Atomically add this workgroup's count to the global counter
-        // and retrieve the starting offset for this workgroup.
         s_workgroupBaseOffset = atomicAdd(activeBlockCount.count, wgTotal);
     }
 
-    // Synchronize: Ensure the base offset is written to shared memory
-    // and visible to all threads in the workgroup.
     memoryBarrierShared();
     barrier();
 
     // Stage 7: Calculate Final Global Offset
-    // All threads read the workgroup's base offset
     uint workgroupBaseOffset = s_workgroupBaseOffset;
     uint globalOffset = workgroupBaseOffset + localOffset;
 
     // Stage 8: Write Output
-    // Only active threads write their original 1D block ID to the calculated position
+    // Store the 1D block index for active blocks
+    // The task shader will use this index to reconstruct the block position using stride
     if (activeFlag == 1) {
-        // Optional: Bounds check globalOffset against total size of blockIDs buffer if needed
         blockIDs[globalOffset] = globalBlockID1D;
     }
 }

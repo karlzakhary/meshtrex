@@ -121,12 +121,12 @@ struct ExtractionOutput {
 
 struct MeshletDescriptor {
    uint32_t vertexOffset;
-   uint32_t indexOffset;
    uint32_t vertexCount;
+   uint32_t indexOffset;
    uint32_t primitiveCount;
 };
 
 struct VertexData {
     glm::vec4 position;
-    glm::vec4 normal;
+    // glm::vec4 normal;
 };

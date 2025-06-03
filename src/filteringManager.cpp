@@ -182,7 +182,7 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, Volume volume, PushCo
     std::cout << "Occupied Block Filtering finished. Active blocks found: " << output.activeBlockCount << std::endl;
 
     // (Optional) Test the compacted buffer content using the handle from the output struct
-    testCompactBuffer(context, output.compactedBlockIdBuffer, output.activeBlockCount);
+    // testCompactBuffer(context, output.compactedBlockIdBuffer, output.activeBlockCount);
 
     // --- Cleanup Only Temporary Resources ---
     destroyBuffer(countReadbackBuffer, context.getDevice());

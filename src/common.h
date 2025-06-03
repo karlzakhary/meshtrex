@@ -29,8 +29,8 @@ char (*countof_helper(T (&_Array)[Size]))[Size];
 struct alignas(16) PushConstants {
     glm::uvec4 volumeDim;     // Offset 0, Size 16. Shader uses .xyz
     glm::uvec4 blockDim;      // Offset 16, Size 16. Shader uses .xyz
-    glm::uvec4 blockGridDim;  // Offset 32, Size 16. Shader uses .xyz
-    float isovalue;           // Offset 48, Size 4.
+    glm::uvec4 blockGridDim;  // Offset 48, Size 16. Shader uses .xyz
+    float isovalue;           // Offset 64, Size 4.
 };
 
 struct SceneUniforms { // Data changing per frame (usually)

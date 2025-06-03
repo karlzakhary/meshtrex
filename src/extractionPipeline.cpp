@@ -107,7 +107,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // UBO (PushConstants)
+    };  //Binding 0: UBO (PushConstants)
 
     bindings[1] = {
         .binding = 1,
@@ -115,7 +115,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // Volume
+    };  //Binding 1: Volume
 
     bindings[2] = {
         .binding = 2,
@@ -123,7 +123,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT,
-    };  // Active Block count
+    };  //Binding 2: Active Block count
 
     bindings[3] = {
         .binding = 3,
@@ -131,7 +131,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT,
-    };  // Block IDs
+    };  //Binding 3: Block IDs
 
     bindings[4] = {
         .binding = 4,
@@ -147,7 +147,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // Global Vertices
+    };  //Binding 6: Global Vertices
 
     bindings[6] = {
         .binding = 8,
@@ -171,7 +171,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // Vertex Counter
+    };  //Binding 11: Vertex Counter
 
     bindings[9] = {
         .binding = 12,
@@ -194,8 +194,8 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
         .stageFlags =
-            VK_SHADER_STAGE_MESH_BIT_EXT, // Task for atomic alloc, Mesh for write
-    }; // Binding 14: Global edge map
+            VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT, // Task for atomic alloc, Mesh for write
+    }; // Binding 14: MC Edge Table
 
     VkDescriptorSetLayoutCreateInfo layoutInfo = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -361,8 +361,8 @@ bool ExtractionPipeline::setup(
     device_ = device;
 
     // --- Load Shaders ---
-    std::string taskShaderPath = "/spirv/extractPmb.task.spv";
-    std::string meshShaderPath = "/spirv/extractPmb2.mesh.spv";
+    std::string taskShaderPath = "/spirv/testExtract.task.spv";
+    std::string meshShaderPath = "/spirv/testExtract.mesh.spv";
 
     assert(loadShader(taskShader_, device_, taskShaderPath.c_str()));
     assert(loadShader(meshShader_, device_, meshShaderPath.c_str()));
