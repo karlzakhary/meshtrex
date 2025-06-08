@@ -1,5 +1,11 @@
 #pragma once
+#include <cstring>
+
+#include "extractionOutput.h"
+#include "shaders.h"
 #include "testMinMax.h"
+#include "vulkan_utils.h"
+#include "resources.h"
 
 // NEW Function: Reads back the MinMax data from a VkImage via a staging buffer
 inline std::vector<MinMaxResult> mapMinMaxImage(VkDevice device, VkPhysicalDeviceMemoryProperties memoryProperties,
@@ -193,7 +199,7 @@ inline bool testMinMaxReadback(
 
         // --- Load Test Shader & Create Test Pipeline ---
         // Ensure TestMinMaxRead.comp is compiled to SPIR-V
-        assert(loadShader(testCS, context.getDevice(), argv[0],
+        assert(loadShader(testCS, context.getDevice(),
                           "spirv/testReadingMinMax.comp.spv"));
         testPipeline = createComputePipeline(context.getDevice(), nullptr,
                                              testCS, testPipelineLayout);
@@ -472,8 +478,8 @@ inline std::vector<uint32_t> computeCompactedBlockIDsCPU(
 }
 
 inline int compareCompactedIDs(std::vector<uint32_t>& gpuIDs, uint32_t gpuCount,
-                        const std::vector<uint32_t>& cpuIDs,
-                        int maxErrorsToPrint = 1000)
+                               const std::vector<uint32_t>& cpuIDs,
+                               int maxErrorsToPrint = 1000)
 {
     std::sort(gpuIDs.begin(), gpuIDs.end());
     std::cout << "\nComparing GPU vs CPU Compacted Block ID lists..."
@@ -539,9 +545,9 @@ inline int compareCompactedIDs(std::vector<uint32_t>& gpuIDs, uint32_t gpuCount,
     return mismatchCount;
 }
 
-inline int testCompactBuffer(VulkanContext &context, Buffer compactedBlockIdBuffer, uint32_t gpuActiveCount) {
+inline void testCompactBuffer(VulkanContext &context, Buffer &compactedBlockIdBuffer, uint32_t gpuActiveCount) {
 
-    float isovalue = 60.0f;
+    float isovalue = 80.0f;
 
     // Placeholder for GPU results
     std::vector<uint32_t> gpuCompactedIDs;
@@ -550,13 +556,13 @@ inline int testCompactBuffer(VulkanContext &context, Buffer compactedBlockIdBuff
         // 1. Compute Min/Max results on CPU
         // Assuming volume dims are known or read from Volume struct
         glm::uvec3 volumeDims = {256, 256, 256}; // Example, use actual dims
-        std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("../cmake-build-debug/raw_volumes/bonsai_256x256x256_uint8.raw");
+        std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("/home/ge26mot/Projects/meshtrex/raw_volumes/bonsai_256x256x256_uint8.raw");
 
         // 2. Compute Active Block Count on CPU
         uint32_t cpuActiveCount = computeActiveBlockCountCPU(cpuMinMaxResults, isovalue);
 
         // 3. Compute Compacted Block ID list on CPU
-        glm::uvec3 blockGridDim = (volumeDims + glm::uvec3(8,8,8) - 1u) / glm::uvec3(8,8,8);
+        glm::uvec3 blockGridDim = (volumeDims + glm::uvec3(4,4,4) - 1u) / glm::uvec3(4,4,4);
         std::vector<uint32_t> cpuActiveIDs = computeCompactedBlockIDsCPU(cpuMinMaxResults, isovalue, blockGridDim);
 
         // --- Read Back GPU Compacted IDs (Placeholder) ---
@@ -585,11 +591,193 @@ inline int testCompactBuffer(VulkanContext &context, Buffer compactedBlockIdBuff
 
     } catch (const std::runtime_error& e) {
         std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
     } catch (...) {
         std::cerr << "An unexpected error occurred." << std::endl;
-        return 1;
+    }
+}
+
+// Reads back a single uint32_t counter value from the start of a buffer
+inline uint32_t mapCounterBuffer(VulkanContext& context, const Buffer& gpuBuffer)
+{
+    VkDevice device = context.getDevice();
+    VkDeviceSize counterSize = sizeof(uint32_t);
+
+    if (gpuBuffer.size < counterSize) {
+         throw std::runtime_error("GPU buffer is too small to contain a counter.");
+    }
+    if (gpuBuffer.buffer == VK_NULL_HANDLE) {
+        std::cerr << "Warning: Attempting to read counter from null GPU buffer." << std::endl;
+        return 0;
     }
 
-    return 0;
+
+    Buffer readbackBuffer = {};
+    createBuffer(readbackBuffer, device, context.getMemoryProperties(), counterSize,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    VkCommandBuffer cmd = beginSingleTimeCommands(device, context.getCommandPool());
+
+    // Barrier: Ensure shader writes to the counter (atomic) are finished before copy
+    VkBufferMemoryBarrier2 atomicWriteToTransferRead = bufferBarrier(
+        gpuBuffer.buffer,
+        VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, // Assuming Task shader wrote the atomic counter last
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,    // Covers atomic write
+        VK_PIPELINE_STAGE_2_COPY_BIT,
+        VK_ACCESS_2_TRANSFER_READ_BIT,
+        0, // Offset of counter
+        counterSize // Size of counter
+    );
+    pipelineBarrier(cmd, {}, 1, &atomicWriteToTransferRead, 0, {});
+
+
+    VkBufferCopy region = {0, 0, counterSize};
+    vkCmdCopyBuffer(cmd, gpuBuffer.buffer, readbackBuffer.buffer, 1, &region);
+
+    // Barrier: Ensure copy finishes before host read (implicitly handled by endSingleTimeCommands wait)
+
+    endSingleTimeCommands(device, context.getCommandPool(), context.getQueue(), cmd);
+    // Note: vkQueueWaitIdle happens inside endSingleTimeCommands
+
+    uint32_t counterValue = 0;
+    if (readbackBuffer.data) {
+        memcpy(&counterValue, readbackBuffer.data, counterSize);
+    } else {
+         std::cerr << "Warning: Readback buffer for counter not mapped." << std::endl;
+    }
+
+
+    destroyBuffer(readbackBuffer, device);
+    return counterValue;
+}
+
+
+// Reads back glm::vec3 data (e.g., vertices, normals)
+// Assumes counter is at the start, reads data *after* the counter.
+inline std::vector<glm::vec3> mapVec3Buffer(VulkanContext& context, const Buffer& gpuBuffer, uint32_t elementCount)
+{
+    VkDevice device = context.getDevice();
+    VkDeviceSize counterSize = sizeof(uint32_t);
+    VkDeviceSize elementSize = sizeof(glm::vec3);
+    VkDeviceSize dataSize = elementCount * elementSize;
+    VkDeviceSize requiredBufferSize =  dataSize;
+    VkDeviceSize bufferOffset = 0; // Start reading after the counter
+
+    std::vector<glm::vec3> cpuData;
+    cpuData.resize(elementCount); // Allocate space
+
+    if (elementCount == 0) return cpuData; // Nothing to read
+
+    if (gpuBuffer.size < requiredBufferSize) {
+         std::cerr << "Warning: GPU buffer (" << gpuBuffer.size << " bytes) might be too small for requested vec3 data size (" << dataSize << " bytes) + counter." << std::endl;
+         // Adjust count if buffer is definitely too small
+         if (gpuBuffer.size <= bufferOffset) return {}; // Cannot even read past counter
+         elementCount = std::min(elementCount, (uint32_t)((gpuBuffer.size - bufferOffset) / elementSize));
+         dataSize = elementCount * elementSize;
+         cpuData.resize(elementCount);
+         if (elementCount == 0) return cpuData;
+    }
+     if (gpuBuffer.buffer == VK_NULL_HANDLE) {
+        std::cerr << "Warning: Attempting to read vec3 data from null GPU buffer." << std::endl;
+        return {};
+    }
+
+    Buffer readbackBuffer = {};
+    createBuffer(readbackBuffer, device, context.getMemoryProperties(), dataSize, // Read only the data part
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    VkCommandBuffer cmd = beginSingleTimeCommands(device, context.getCommandPool());
+
+    // Barrier: Ensure shader writes to data portion are finished before copy
+    VkBufferMemoryBarrier2 storageWriteToTransferRead = bufferBarrier(
+        gpuBuffer.buffer,
+        VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, // Assuming Mesh shader wrote vertex data last
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COPY_BIT,
+        VK_ACCESS_2_TRANSFER_READ_BIT,
+        bufferOffset, // Offset of data
+        dataSize      // Size of data
+    );
+    pipelineBarrier(cmd, {}, 1, &storageWriteToTransferRead, 0, {});
+
+    // Copy starting from the offset after the counter
+    VkBufferCopy region = {bufferOffset, 0, dataSize};
+    vkCmdCopyBuffer(cmd, gpuBuffer.buffer, readbackBuffer.buffer, 1, &region);
+
+    endSingleTimeCommands(device, context.getCommandPool(), context.getQueue(), cmd);
+
+    if (readbackBuffer.data) {
+        memcpy(cpuData.data(), readbackBuffer.data, dataSize);
+    } else {
+         std::cerr << "Warning: Readback buffer for vec3 data not mapped." << std::endl;
+    }
+
+    destroyBuffer(readbackBuffer, device);
+    return cpuData;
+}
+
+// Reads back MeshletDescriptor data
+// Assumes counter is at the start, reads data *after* the counter.
+inline std::vector<MeshletDescriptor> mapMeshletDescriptorBuffer(VulkanContext& context, const Buffer& gpuBuffer, uint32_t elementCount)
+{
+    VkDevice device = context.getDevice();
+    VkDeviceSize counterSize = sizeof(uint32_t);
+    VkDeviceSize elementSize = sizeof(MeshletDescriptor);
+    VkDeviceSize dataSize = elementCount * elementSize;
+    VkDeviceSize requiredBufferSize =  dataSize;
+    VkDeviceSize bufferOffset = 0; // Start reading after the counter
+
+    std::vector<MeshletDescriptor> cpuData;
+    cpuData.resize(elementCount);
+
+    if (elementCount == 0) return cpuData;
+
+    if (gpuBuffer.size < requiredBufferSize) {
+        std::cerr << "Warning: GPU buffer (" << gpuBuffer.size << " bytes) might be too small for requested MeshletDescriptor data size (" << dataSize << " bytes) + counter." << std::endl;
+        if (gpuBuffer.size <= bufferOffset) return {};
+        elementCount = std::min(elementCount, (uint32_t)((gpuBuffer.size - bufferOffset) / elementSize));
+        dataSize = elementCount * elementSize;
+        cpuData.resize(elementCount);
+        if (elementCount == 0) return cpuData;
+    }
+     if (gpuBuffer.buffer == VK_NULL_HANDLE) {
+        std::cerr << "Warning: Attempting to read MeshletDescriptor data from null GPU buffer." << std::endl;
+        return {};
+    }
+
+
+    Buffer readbackBuffer = {};
+    createBuffer(readbackBuffer, device, context.getMemoryProperties(), dataSize,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    VkCommandBuffer cmd = beginSingleTimeCommands(device, context.getCommandPool());
+
+    // Barrier: Ensure shader writes to data portion are finished before copy
+     VkBufferMemoryBarrier2 storageWriteToTransferRead = bufferBarrier(
+        gpuBuffer.buffer,
+        VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, // Mesh shader wrote descriptors last
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COPY_BIT,
+        VK_ACCESS_2_TRANSFER_READ_BIT,
+        bufferOffset, // Offset of data
+        dataSize      // Size of data
+    );
+    pipelineBarrier(cmd, {}, 1, &storageWriteToTransferRead, 0, {});
+
+
+    VkBufferCopy region = {bufferOffset, 0, dataSize};
+    vkCmdCopyBuffer(cmd, gpuBuffer.buffer, readbackBuffer.buffer, 1, &region);
+
+    endSingleTimeCommands(device, context.getCommandPool(), context.getQueue(), cmd);
+
+     if (readbackBuffer.data) {
+        memcpy(cpuData.data(), readbackBuffer.data, dataSize);
+    } else {
+        std::cerr << "Warning: Readback buffer for MeshletDescriptor data not mapped." << std::endl;
+    }
+
+    destroyBuffer(readbackBuffer, device);
+    return cpuData;
 }

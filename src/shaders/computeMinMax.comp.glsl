@@ -1,128 +1,148 @@
 #version 450
 
 #extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require // For subgroupMin/Max (alternative)
-#extension GL_KHR_shader_subgroup_shuffle : require // For basic subgroupShuffle
-#extension GL_KHR_shader_subgroup_shuffle_relative : require // Needed for subgroupShuffleDown/Up
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
 
-// Push constants containing dimensions (matches C++ struct)
+// Push constants containing dimensions
 layout(push_constant) uniform PushConstants {
-    uvec4 volumeDim;    // Actual dimensions of the input volume texture
-    uvec4 blockDim;     // Should match local_size (e.g., 8,8,8)
-    uvec4 blockGridDim; // Dimensions of the dispatch grid (and the output image)
-    float isovalue;     // The target isovalue
+    uvec4 volumeDim;
+    uvec4 blockDim;
+    uvec4 blockGridDim;
+    float isovalue;
 } pc;
 
-// --- Layout Definitions ---
+// Define the local workgroup size
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 2) in;
 
-// Define the local workgroup size (should match pc.blockDim)
-layout (local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
-
-// Binding 0: Input scalar field data using a 3D image texture
-// Assumes r8ui format for unsigned 8-bit integer data [0, 255].
+// Binding 0: Input scalar field data
 layout(binding = 0, r8ui) uniform readonly uimage3D volume;
 
-// Binding 1: Output min/max pairs using a 3D image texture
-// Format rg32ui stores two 32-bit unsigned integers (matching uvec2).
-// Dimensions match the block grid dimensions.
+// Binding 1: Output min/max pairs
 layout(binding = 1, rg32ui) uniform writeonly uimage3D minMaxOutputVolume;
 
-// --- Shared Memory ---
-// Shared memory for intermediate min/max values per subgroup.
-// Uses uvec2 to store uint min/max values.
+// Shared memory for intermediate min/max values per subgroup
 const uint totalInvocations = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
-// Allocate based on a minimum subgroup size of 32 (adjust if needed for target hardware)
-// Ensure this allocation is sufficient for max subgroups per workgroup (totalInvocations / minSubgroupSize)
-shared uvec2 s_subgroupMinMax[totalInvocations / 32];
 
+shared uvec2 s_subgroupMinMax[totalInvocations / 32]; // Assuming min subgroup size of 32
 
 void main() {
-    // Calculate the 3D index of the current workgroup (block)
-    // This will be used as the coordinate to write the final result to the output image.
     const uvec3 workGroupID = gl_WorkGroupID;
-
-    // Calculate thread's local invocation ID within the workgroup
     const uvec3 localInvocationID = gl_LocalInvocationID;
     const uint localInvocationIndex = gl_LocalInvocationIndex;
-
-    // Calculate subgroup ID and invocation ID within the subgroup
     const uint subgroupId = gl_SubgroupID;
     const uint subgroupInvocationId = gl_SubgroupInvocationID;
-
-    // Calculate the global 3D integer coordinates for reading the input volume
-    // Use ivec3 for imageLoad coordinates
-    const ivec3 imageCoord = ivec3(workGroupID * gl_WorkGroupSize + localInvocationID);
-
-    // Initialize min/max values for this invocation (using uint for r8ui input)
-    uint invocationMin = 0xFFFFFFFFu; // UINT_MAX
-    uint invocationMax = 0u;          // UINT_MIN (0 for uint)
-
-    // Check boundary conditions using volume dimensions from push constants
-    if (imageCoord.x < imageSize(volume).x &&
-    imageCoord.y < imageSize(volume).y &&
-    imageCoord.z < imageSize(volume).z) {
-
-        // Read the scalar value using imageLoad (fetches from r8ui format as uint)
-        const uint scalarValue = imageLoad(volume, imageCoord).x;
-
-        // Update invocation's local min/max
-        invocationMin = scalarValue;
-        invocationMax = scalarValue;
+    
+    // Calculate the starting position of this block of CELLS in the volume
+    const ivec3 blockStart = ivec3(workGroupID * pc.blockDim.xyz);
+    
+    // Initialize min/max values
+    uint invocationMin = 0xFFFFFFFFu;
+    uint invocationMax = 0u;
+    
+    // Strategy: Each thread checks exactly 2 voxels to cover all 125 voxels
+    // 64 threads × 2 voxels = 128 > 125 needed
+    
+    // First voxel: Regular 4x4x4 grid
+    {
+        ivec3 voxelCoord = blockStart + ivec3(localInvocationID);
+        if (all(lessThan(voxelCoord, ivec3(pc.volumeDim.xyz)))) {
+            uint value = imageLoad(volume, voxelCoord).x;
+            invocationMin = min(invocationMin, value);
+            invocationMax = max(invocationMax, value);
+        }
     }
-    // If outside bounds, the initial UINT_MAX/0 values will be ignored in reduction.
-
-
+    
+    // Second voxel: Handle the boundary layer (position 4 in each dimension)
+    // We need to cover 64 additional voxels (128 - 64 = 64)
+    if (localInvocationIndex < 61) {
+        ivec3 extraVoxel;
+        
+        if (localInvocationIndex < 16) {
+            // Handle x=4 face: (4, y, z) where y,z ∈ [0,3]
+            uint y = localInvocationIndex % pc.blockDim.x;
+            uint z = localInvocationIndex / pc.blockDim.z;
+            extraVoxel = blockStart + ivec3(pc.blockDim.x, y, z);
+        }
+        else if (localInvocationIndex < 32) {
+            // Handle y=4 face: (x, 4, z) where x ∈ [0,3], z ∈ [0,3]
+            uint idx = localInvocationIndex - 16;
+            uint x = idx % pc.blockDim.x;
+            uint z = idx / pc.blockDim.z;
+            extraVoxel = blockStart + ivec3(x, pc.blockDim.y, z);
+        }
+        else if (localInvocationIndex < 48) {
+            // Handle z=4 face: (x, y, 4) where x,y ∈ [0,3]
+            uint idx = localInvocationIndex - 32;
+            uint x = idx % pc.blockDim.x;
+            uint y = idx / pc.blockDim.y;
+            extraVoxel = blockStart + ivec3(x, y, pc.blockDim.z);
+        }
+        else if (localInvocationIndex < 52) {
+            // Handle x=4, y=4 edge: (4, 4, z) where z ∈ [0,3]
+            uint z = localInvocationIndex - 48;
+            extraVoxel = blockStart + ivec3(pc.blockDim.x, pc.blockDim.y, z);
+        }
+        else if (localInvocationIndex < 56) {
+            // Handle x=4, z=4 edge: (4, y, 4) where y ∈ [0,3]
+            uint y = localInvocationIndex - 52;
+            extraVoxel = blockStart + ivec3(pc.blockDim.x, y, pc.blockDim.z);
+        }
+        else if (localInvocationIndex < 60) {
+            // Handle y=4, z=4 edge: (x, 4, 4) where x ∈ [0,3]
+            uint x = localInvocationIndex - 56;
+            extraVoxel = blockStart + ivec3(x, pc.blockDim.y, pc.blockDim.z);
+        }
+        else {
+            // Handle the corner: (4, 4, 4)
+            extraVoxel = blockStart + ivec3(pc.blockDim.xyz);
+        }
+        
+        if (all(lessThan(extraVoxel, ivec3(pc.volumeDim.xyz)))) {
+            uint value = imageLoad(volume, extraVoxel).x;
+            invocationMin = min(invocationMin, value);
+            invocationMax = max(invocationMax, value);
+        }
+    }
+    
     // --- Step 1: Subgroup-level reduction using subgroupShuffleDown ---
-    // Reduce uint values within the subgroup.
     for (uint offset = gl_SubgroupSize / 2; offset > 0; offset /= 2) {
         uint downMin = subgroupShuffleDown(invocationMin, offset);
         uint downMax = subgroupShuffleDown(invocationMax, offset);
         invocationMin = min(invocationMin, downMin);
         invocationMax = max(invocationMax, downMax);
     }
-    // After this loop, the invocation with subgroupInvocationId == 0 holds the subgroup's min/max.
-
-
-    // --- Step 2: Write partial results (subgroup min/max) to shared memory ---
+    
+    // --- Step 2: Write partial results to shared memory ---
     if (subgroupInvocationId == 0) {
-        // Ensure index is within bounds of the shared memory array
-        if (subgroupId < (totalInvocations / 32)) { // Check against allocated size
-            s_subgroupMinMax[subgroupId] = uvec2(invocationMin, invocationMax); // Store uvec2
+        if (subgroupId < (totalInvocations / 32)) {
+            s_subgroupMinMax[subgroupId] = uvec2(invocationMin, invocationMax);
         }
     }
-
-    // Synchronize all invocations within the workgroup
+    
     barrier();
-
-
+    
     // --- Step 3: Final reduction using the first subgroup ---
     if (subgroupId == 0) {
-        // Load the appropriate subgroup's min/max result (uvec2) from shared memory
-        uvec2 subgroupResult = uvec2(0xFFFFFFFFu, 0u); // Initialize safely for uint min/max
-
+        uvec2 subgroupResult = uvec2(0xFFFFFFFFu, 0u);
+        
         uint sharedMemIndex = subgroupInvocationId;
         uint numSubgroups = totalInvocations / gl_SubgroupSize;
-        // Check bounds against actual subgroup count and allocated shared memory size
-        if(sharedMemIndex < numSubgroups && sharedMemIndex < (totalInvocations / 32) ) {
+        if(sharedMemIndex < numSubgroups && sharedMemIndex < (totalInvocations / 32)) {
             subgroupResult = s_subgroupMinMax[sharedMemIndex];
         }
-
-        // Perform the final reduction *within the first subgroup*.
-        // Requires GL_KHR_shader_subgroup_shuffle_relative.
+        
+        // Final reduction within the first subgroup
         for (uint offset = gl_SubgroupSize / 2; offset > 0; offset /= 2) {
             uint downMin = subgroupShuffleDown(subgroupResult.x, offset);
             uint downMax = subgroupShuffleDown(subgroupResult.y, offset);
             subgroupResult.x = min(subgroupResult.x, downMin);
             subgroupResult.y = max(subgroupResult.y, downMax);
         }
-
-        // --- Step 4: Write final block result to Output Image ---
-        // The first invocation of the first subgroup (subgroupInvocationId == 0)
-        // writes the final uint min/max pair for the workgroup (block) to the output image.
+        
+        // --- Step 4: Write final block result ---
         if (subgroupInvocationId == 0) {
-            // Write the uvec2 result to the output image at the 3D coordinate
-            // corresponding to this workgroup's ID.
-            // imageStore requires ivec3 coordinates and uvec4 value for rg32ui format.
             imageStore(minMaxOutputVolume, ivec3(workGroupID), uvec4(subgroupResult, 0, 0));
         }
     }

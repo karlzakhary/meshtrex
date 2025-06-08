@@ -2,6 +2,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_debug_printf: require
 
 // --- Push Constants / Uniforms ---
 layout(push_constant) uniform PushConstants {
@@ -63,12 +64,9 @@ void main() {
 
     uvec2 minMax = imageLoad(minMaxInputVolume, ivec3(blockCoord)).xy;
 
-    bool blockIsActive = false;
-    if (minMax.x != minMax.y) {
-        blockIsActive = (pc.isovalue >= float(minMax.x) && pc.isovalue <= float(minMax.y));
-    }
+    bool blockIsActive = (pc.isovalue >= float(minMax.x) && pc.isovalue <= float(minMax.y));
     uint activeFlag = blockIsActive ? 1 : 0;
-
+    
     // --- Parallel Scan Implementation ---
 
     // Stage 1: Intra-Subgroup Exclusive Scan

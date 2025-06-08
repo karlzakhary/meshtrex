@@ -102,10 +102,10 @@ void drawTriangle(char **argv)
     vkGetDeviceQueue(device, familyIndex, 0, &queue);
 
     Shader triangleVS{};
-    assert(loadShader(triangleVS, device, argv[0], "spirv/triangle.vert.spv"));
+    assert(loadShader(triangleVS, device,"/spirv/triangle.vert.spv"));
 
     Shader triangleFS{};
-    assert(loadShader(triangleFS, device, argv[0], "spirv/triangle.frag.spv"));
+    assert(loadShader(triangleFS, device, "/spirv/triangle.frag.spv"));
 
     VkPipelineCache pipelineCache = nullptr;
     VkPipelineRenderingCreateInfo renderingInfo = {

@@ -8,4 +8,7 @@ build.ninja
 .ninja_*
 build/
 cmake-build-debug/
+cmake-build-release/
 .idea/
+.vscode/
+.cache/

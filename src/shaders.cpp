@@ -355,17 +355,9 @@ static VkDescriptorUpdateTemplate createUpdateTemplate(
     return updateTemplate;
 }
 
-bool loadShader(Shader& shader, VkDevice device, const char *base,
-                const char *path)
+bool loadShader(Shader& shader, VkDevice device, const char *path)
 {
-    std::string spath = base;
-    std::string::size_type pos = spath.find_last_of("/\\");
-    if (pos == std::string::npos)
-        spath = "";
-    else
-        spath = spath.substr(0, pos + 1);
-    spath += path;
-
+    std::string spath = getFullPath(ROOT_BUILD_PATH, path);
     FILE *file = fopen(spath.c_str(), "rb");
     if (!file) return false;
 

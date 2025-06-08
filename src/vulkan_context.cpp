@@ -141,7 +141,7 @@ VulkanContext::~VulkanContext() {
         // Check if the debug callback exists AND the destruction function is loaded
         if (debugCallback_ != VK_NULL_HANDLE) {
             // Make sure vkDestroyDebugReportCallbackEXT is loaded (Volk should handle this)
-            PFN_vkDestroyDebugReportCallbackEXT vkDestroyDebugReportCallback =
+            auto vkDestroyDebugReportCallback =
                reinterpret_cast<PFN_vkDestroyDebugReportCallbackEXT>(
                     vkGetInstanceProcAddr(instance_,
                                           "vkDestroyDebugReportCallbackEXT"));
