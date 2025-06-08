@@ -75,6 +75,62 @@ Buffer createTriTableBuffer(VulkanContext& context) {
     return triTableBuffer;
 }
 
+Buffer createEdgeTableBuffer(VulkanContext& context) {
+    Buffer edgeTableBuffer = {};
+    const int* edgeTableData = &MarchingCubes::edgeTable[0];
+
+    VkDeviceSize edgeTableSize = 256 * sizeof(int);
+
+    Buffer edgeTableStagingBuffer = {};
+
+    createBuffer(edgeTableStagingBuffer, context.getDevice(), context.getMemoryProperties(),
+                 edgeTableSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+     // Check if staging buffer creation succeeded
+     if (edgeTableStagingBuffer.buffer == VK_NULL_HANDLE) {
+         throw std::runtime_error("Failed to create staging buffer for MC TriTable.");
+     }
+     if (edgeTableStagingBuffer.data == nullptr) {
+          destroyBuffer(edgeTableStagingBuffer, context.getDevice()); // Clean up before throwing
+          throw std::runtime_error("Failed to map staging buffer for MC TriTable.");
+     }
+
+    // Copy table data to staging buffer
+    memcpy(edgeTableStagingBuffer.data, edgeTableData, edgeTableSize); // Use correct pointer
+
+    // Create device-local buffer for the table
+    createBuffer(edgeTableBuffer, context.getDevice(), context.getMemoryProperties(),
+                 edgeTableSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+     // Check if device buffer creation succeeded
+      if (edgeTableBuffer.buffer == VK_NULL_HANDLE) {
+          destroyBuffer(edgeTableStagingBuffer, context.getDevice()); // Clean up staging buffer
+          throw std::runtime_error("Failed to create device buffer for MC TriTable.");
+      }
+
+    // Copy from staging to device-local
+    VkCommandBuffer cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
+    VkBufferCopy copyRegion = {0, 0, edgeTableSize};
+    vkCmdCopyBuffer(cmd, edgeTableStagingBuffer.buffer, edgeTableBuffer.buffer, 1, &copyRegion);
+
+    // Barrier to ensure transfer completes before shader access
+    VkBufferMemoryBarrier2 transferCompleteBarrier = bufferBarrier(
+        edgeTableBuffer.buffer,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, // Task & Mesh read
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        0, VK_WHOLE_SIZE);
+    pipelineBarrier(cmd, {}, 1, &transferCompleteBarrier, 0, {});
+
+    endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
+
+    // Cleanup staging buffer
+    destroyBuffer(edgeTableStagingBuffer, context.getDevice());
+
+    std::cout << "Marching Cubes edge table buffer created and uploaded." << std::endl;
+    return edgeTableBuffer;
+}
+
 Buffer createNumVerticesBuffer(VulkanContext& context) {
     Buffer numVerticesBuffer = {};
     const int* numVerticesData = &MarchingCubes::numVerticesTable[0];
@@ -174,6 +230,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
 
     Buffer constantsUBO = {};
     Buffer mcTriTableBuffer = {};
+    Buffer mcEdgeTableBuffer = {};
     Buffer mcNumVerticesBuffer = {};
 
     try {
@@ -207,21 +264,10 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
             CELLS_PER_BLOCK_FROM_SHADER *
             MAX_PRIMS_PER_CELL_FROM_SHADER * 3 * // 3 indices per primitive
             sizeof(uint32_t);
-        // For advance mesh shader
-        // const VkDeviceSize MAX_TOTAL_VERTICES_BYTES =
-        //     static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
-        //         MAX_SUB_BLOCKS_PER_BLOCK *
-        //             MAX_VERTS_PER_MESHLET_ESTIMATE *
-        //                 sizeof(VertexData);
-        // const VkDeviceSize MAX_TOTAL_INDICES_BYTES =
-        //     static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
-        //         MAX_SUB_BLOCKS_PER_BLOCK *
-        //             MAX_INDICES_PER_MESHLET *
-        //                 sizeof(uint32_t)
-        // ;
+
         const VkDeviceSize MAX_MESHLET_DESCRIPTORS_BYTES =
             static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
-                MAX_SUB_BLOCKS_PER_BLOCK *
+                CELLS_PER_BLOCK_FROM_SHADER *
                     sizeof(MeshletDescriptor)
         ;
 
@@ -256,7 +302,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         if (extractionOutput.meshletDescriptorBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create meshletDescriptorBuffer."); }
 
         createBuffer(extractionOutput.meshletDescriptorCountBuffer, device, vulkanContext.getMemoryProperties(),
-                     MAX_MESHLET_DESCRIPTORS_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     counterSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (extractionOutput.meshletDescriptorCountBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create meshletDescriptorCountBuffer."); }
 
@@ -266,9 +312,9 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         constantsUBO = createConstantsUBO(vulkanContext, pushConstants);
         if (constantsUBO.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create constants UBO."); }
         mcTriTableBuffer = createTriTableBuffer(vulkanContext);
-        if (mcTriTableBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create MC table buffer."); }
-        mcNumVerticesBuffer = createNumVerticesBuffer(vulkanContext);
-        if (mcNumVerticesBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create MC NumVertices buffer."); }
+        if (mcTriTableBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create MC triangle table buffer."); }
+        mcEdgeTableBuffer = createEdgeTableBuffer(vulkanContext);
+        if (mcEdgeTableBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create MC edge table buffer."); }
 
         // 4. Update Descriptors
         if (extractionPipeline.descriptorSet_ == VK_NULL_HANDLE) { throw std::runtime_error("Extraction pipeline descriptor set is null."); }
@@ -278,7 +324,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         VkDescriptorBufferInfo blockCountInfo = {filterOutput.activeBlockCountBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo blockIdInfo = {filterOutput.compactedBlockIdBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo mcTriTableInfo = {mcTriTableBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo mcNumVerticesInfo = {mcNumVerticesBuffer.buffer, 0, VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo mcEdgeTableInfo = {mcEdgeTableBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo vbInfo = {extractionOutput.vertexBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo vertexCountInfo = {extractionOutput.vertexCountBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};
@@ -355,9 +401,9 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
             1,
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             nullptr,
-            &mcNumVerticesInfo,
+            &mcEdgeTableInfo,
             nullptr
-        }); // Binding 5: MC NumVertices Table
+        }); // Binding 5: MC Edge Table
         writes.push_back({
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             nullptr,
@@ -488,7 +534,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
             VK_IMAGE_ASPECT_COLOR_BIT
         ));
         preBufferBarriers.push_back(bufferBarrier(mcTriTableBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, 0, VK_WHOLE_SIZE));
-        preBufferBarriers.push_back(bufferBarrier(mcNumVerticesBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, 0, VK_WHOLE_SIZE));
+        preBufferBarriers.push_back(bufferBarrier(mcEdgeTableBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, 0, VK_WHOLE_SIZE));
 
         // *** Added Barrier for UBO ***
         preBufferBarriers.push_back(bufferBarrier(constantsUBO.buffer, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_UNIFORM_READ_BIT, 0, VK_WHOLE_SIZE));
@@ -578,7 +624,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         // Need to manually clean up UBO/MC Table if created before throw
         destroyBuffer(constantsUBO, device); // Safe to call even if null
         destroyBuffer(mcTriTableBuffer, device); // Safe to call even if null
-        destroyBuffer(mcNumVerticesBuffer, device);
+        destroyBuffer(mcEdgeTableBuffer, device);
         throw;
     }
 
@@ -586,7 +632,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
     // RAII handles extractionPipeline and extractionOutput cleanup
     destroyBuffer(constantsUBO, device);
     destroyBuffer(mcTriTableBuffer, device);
-    destroyBuffer(mcNumVerticesBuffer, device);
+    destroyBuffer(mcEdgeTableBuffer, device);
 
     std::cout << "--- Finished Meshlet Extraction ---" << std::endl;
     return extractionOutput;

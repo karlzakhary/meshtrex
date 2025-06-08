@@ -147,7 +147,7 @@ void ExtractionPipeline::createPipelineLayout()
         .descriptorCount = 1,
         .stageFlags =
             VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
-    };  // MC NumVertices
+    };  // MC Edge Table
 
     bindings[6] = {
         .binding = 6,
@@ -361,8 +361,8 @@ bool ExtractionPipeline::setup(
     device_ = device;
 
     // --- Load Shaders ---
-    std::string taskShaderPath = "/spirv/testExtract.task.spv";
-    std::string meshShaderPath = "/spirv/testExtract.mesh.spv";
+    std::string taskShaderPath = "/spirv/marching_cubes.task.spv";
+    std::string meshShaderPath = "/spirv/marching_cubes.mesh.spv";
 
     assert(loadShader(taskShader_, device_, taskShaderPath.c_str()));
     assert(loadShader(meshShader_, device_, meshShaderPath.c_str()));

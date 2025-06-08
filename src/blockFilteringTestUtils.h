@@ -5,6 +5,7 @@
 #include "shaders.h"
 #include "testMinMax.h"
 #include "vulkan_utils.h"
+#include "resources.h"
 
 // NEW Function: Reads back the MinMax data from a VkImage via a staging buffer
 inline std::vector<MinMaxResult> mapMinMaxImage(VkDevice device, VkPhysicalDeviceMemoryProperties memoryProperties,
@@ -555,13 +556,13 @@ inline void testCompactBuffer(VulkanContext &context, Buffer &compactedBlockIdBu
         // 1. Compute Min/Max results on CPU
         // Assuming volume dims are known or read from Volume struct
         glm::uvec3 volumeDims = {256, 256, 256}; // Example, use actual dims
-        std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("../cmake-build-debug/raw_volumes/bonsai_256x256x256_uint8.raw");
+        std::vector<MinMaxResult> cpuMinMaxResults = computeMinMaxFromFile("/home/ge26mot/Projects/meshtrex/raw_volumes/bonsai_256x256x256_uint8.raw");
 
         // 2. Compute Active Block Count on CPU
         uint32_t cpuActiveCount = computeActiveBlockCountCPU(cpuMinMaxResults, isovalue);
 
         // 3. Compute Compacted Block ID list on CPU
-        glm::uvec3 blockGridDim = (volumeDims + glm::uvec3(8,8,8) - 1u) / glm::uvec3(8,8,8);
+        glm::uvec3 blockGridDim = (volumeDims + glm::uvec3(4,4,4) - 1u) / glm::uvec3(4,4,4);
         std::vector<uint32_t> cpuActiveIDs = computeCompactedBlockIDsCPU(cpuMinMaxResults, isovalue, blockGridDim);
 
         // --- Read Back GPU Compacted IDs (Placeholder) ---
