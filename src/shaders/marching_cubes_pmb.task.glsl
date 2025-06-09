@@ -6,6 +6,7 @@
 #extension GL_EXT_debug_printf : enable
 
 // --- Configurable Parameters ---
+#define WORKGROUP_SIZE 32
 /* core-cell grid ---------------------------------------------------- */
 #define BX 4u
 #define BY 4u
@@ -18,9 +19,7 @@
 #define MAX_VERTS_PER_MESHLET 256u
 #define MAX_PRIMS_PER_MESHLET 256u
 #define MAX_MESHLETS_PER_BLOCK 8u        /* 64 cells / 5-tris ~= 13 → 8 is safe for 4³ */
-#define MAX_OCC_CELLS_PER_THREAD (CELLS_PER_BLOCK + gl_WorkGroupSize.x - 1) / gl_WorkGroupSize.x
-
-#define WORKGROUP_SIZE 32
+#define MAX_OCC_CELLS_PER_THREAD (CELLS_PER_BLOCK + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE
 
 // --- PMB Vertex Ownership Edges ---
 // These are the indices of the 3 edges a cell is responsible for generating vertices on.
@@ -39,7 +38,7 @@ taskPayloadSharedEXT struct TaskPayload {
 
 
 /* ---------------- shared scratch ------------------------------------------ */
-shared uint sh_temp_occ_list[gl_WorkGroupSize.x * MAX_OCC_CELLS_PER_THREAD];
+shared uint sh_temp_occ_list[WORKGROUP_SIZE * MAX_OCC_CELLS_PER_THREAD];
 shared uint sh_subgroup_sums[32];
 shared uint total_occ_count;
 
@@ -111,7 +110,7 @@ void main()
     uint blockID = activeBlockIDs.ids[gl_WorkGroupID.x];
     ivec3 base = ivec3(unpack_block_id(blockID)) * int(STRIDE);
 
-    for (uint cell = lane; cell < CELLS_PER_BLOCK; cell += gl_WorkGroupSize.x)
+    for (uint cell = lane; cell < CELLS_PER_BLOCK; cell += WORKGROUP_SIZE)
     {
         uvec3 cLoc = uvec3(cell % BX, (cell / BX) % BY, cell / (BX * BY));
         if (any(greaterThanEqual(base + ivec3(cLoc), ivec3(ubo.volumeDim.xyz) - 1))) continue;
@@ -153,7 +152,7 @@ void main()
     }
     barrier();
     uint final_occ_offset = sh_subgroup_sums[gl_SubgroupID] + subgroup_offset;
-    if (lane == gl_WorkGroupSize.x - 1) {
+    if (lane == WORKGROUP_SIZE - 1) {
         total_occ_count = final_occ_offset + local_occ_count;
     }
     barrier();

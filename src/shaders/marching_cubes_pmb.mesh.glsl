@@ -7,21 +7,23 @@
 #extension GL_KHR_shader_subgroup_ballot: require
 
 // --- Configurable Parameters ---
+#define WORKGROUP_SIZE 128u
 /* core-cell grid ---------------------------------------------------- */
 #define BX 4u
 #define BY 4u
 #define BZ 4u
 
 /* voxel region you must read (core + 1-voxel halo) ----------------- */
-#define BLOCK_DIM_X 5
-#define BLOCK_DIM_Y 5
-#define BLOCK_DIM_Z 5
+#define BLOCK_DIM_X 5u
+#define BLOCK_DIM_Y 5u
+#define BLOCK_DIM_Z 5u
 #define STRIDE      4u           /* overlap = 1 voxel */
-#define MAX_PRIMS_PER_CELL 5
-#define MAX_PRIMS_PER_THREAD 5 
-#define MAX_VERTS_PER_MESHLET 256
-#define MAX_PRIMS_PER_MESHLET 256
-#define MAX_CELLS_PER_THREAD 1
+#define MAX_PRIMS_PER_CELL 5u
+#define MAX_CELLS_IN_BLOCK 64u
+#define MAX_CELLS_PER_THREAD (MAX_CELLS_IN_BLOCK + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE
+#define MAX_PRIMS_PER_THREAD (MAX_CELLS_PER_THREAD * MAX_PRIMS_PER_CELL)
+#define MAX_VERTS_PER_MESHLET 256u
+#define MAX_PRIMS_PER_MESHLET 256u
 
 /* ------------------  PMB edge ownership -------------------------- */
 const uint PMB_EDGE_X = 0u;
@@ -170,7 +172,7 @@ bool ownsZ(uvec3 c) { return c.z < BZ; } // Core cells 0..3 own their +Z edge
 // --- Workgroup size ---
 // NOTE: A workgroup size of 64 is small for this task. 128 is often better.
 // The code is written to be flexible, but this must match the host application.
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 // --- Output limits ---
 layout(max_vertices = 256, max_primitives = 256) out;
@@ -187,7 +189,7 @@ void main ()
         shPrimCount = 0u;
     }
     // Initialize the vertex map. Each thread clears a portion.
-    for (uint i = gl_LocalInvocationIndex; i < (BLOCK_DIM_X * BLOCK_DIM_Y * BLOCK_DIM_Z); i += gl_WorkGroupSize.x) {
+    for (uint i = gl_LocalInvocationIndex; i < (BLOCK_DIM_X * BLOCK_DIM_Y * BLOCK_DIM_Z); i += WORKGROUP_SIZE) {
         uvec3 c = uvec3(i % BLOCK_DIM_X, (i / BLOCK_DIM_X) % BLOCK_DIM_Y, i / (BLOCK_DIM_X * BLOCK_DIM_Y));
         shVertMap[c.x][c.y][c.z][0] = 0xFFFFFFFFu;
         shVertMap[c.x][c.y][c.z][1] = 0xFFFFFFFFu;
@@ -207,7 +209,7 @@ void main ()
     // --- PASS 1A: COUNT - Each thread counts how many vertices it owns. ---
     uint local_vert_count = 0;
     const uint TOTAL_CONTEXT_CELLS = BLOCK_DIM_X * BLOCK_DIM_Y * BLOCK_DIM_Z;
-    for (uint cell_idx = gl_LocalInvocationIndex; cell_idx < TOTAL_CONTEXT_CELLS; cell_idx += gl_WorkGroupSize.x)
+    for (uint cell_idx = gl_LocalInvocationIndex; cell_idx < TOTAL_CONTEXT_CELLS; cell_idx += WORKGROUP_SIZE)
     {
         uvec3 cLoc = uvec3(cell_idx % BLOCK_DIM_X, (cell_idx / BLOCK_DIM_X) % BLOCK_DIM_Y, cell_idx / (BLOCK_DIM_X * BLOCK_DIM_Y));
         if (any(greaterThanEqual(base_coord + ivec3(cLoc) + ivec3(1), ivec3(ubo.volumeDim.xyz)))) continue;
@@ -234,14 +236,14 @@ void main ()
     barrier();
 
     uint final_vert_offset = sh_vert_subgroup_sums[gl_SubgroupID] + subgroup_vert_offset;
-    if (gl_LocalInvocationIndex == gl_WorkGroupSize.x - 1) { 
+    if (gl_LocalInvocationIndex == WORKGROUP_SIZE - 1) { 
         shVertCount = final_vert_offset + local_vert_count; 
     }
     barrier();
 
     // --- PASS 1C: GENERATE & WRITE - Each thread generates its vertices and writes them to the calculated offsets. ---
     uint running_vert_offset = 0;
-    for (uint cell_idx = gl_LocalInvocationIndex; cell_idx < TOTAL_CONTEXT_CELLS; cell_idx += gl_WorkGroupSize.x) {
+    for (uint cell_idx = gl_LocalInvocationIndex; cell_idx < TOTAL_CONTEXT_CELLS; cell_idx += WORKGROUP_SIZE) {
         uvec3 cLoc = uvec3(cell_idx % BLOCK_DIM_X, (cell_idx / BLOCK_DIM_X) % BLOCK_DIM_Y, cell_idx / (BLOCK_DIM_X * BLOCK_DIM_Y));
         ivec3 gLoc = base_coord + ivec3(cLoc);
         if (any(greaterThanEqual(gLoc + ivec3(1), ivec3(ubo.volumeDim.xyz)))) continue;
@@ -282,7 +284,7 @@ void main ()
     uint num_cells      = taskPayloadIn.cellCount[meshlet_idx_in_block];
     uint local_prim_count = 0;
 
-    for (uint i = gl_LocalInvocationIndex; i < num_cells; i += gl_WorkGroupSize.x)
+    for (uint i = gl_LocalInvocationIndex; i < num_cells; i += WORKGROUP_SIZE)
     {
         uint packed_data = taskPayloadIn.packedCellData[first_cell_idx + i];
         uint cellID = (packed_data >> 16) & 0xFFFFu;
@@ -336,7 +338,7 @@ void main ()
     }
     barrier();
     uint final_prim_offset = sh_prim_subgroup_sums[gl_SubgroupID] + subgroup_prim_offset;
-    if (gl_LocalInvocationIndex == gl_WorkGroupSize.x - 1) { shPrimCount = final_prim_offset + local_prim_count; }
+    if (gl_LocalInvocationIndex == WORKGROUP_SIZE - 1) { shPrimCount = final_prim_offset + local_prim_count; }
     barrier();
     
     // --- PASS 2C: WRITE ---
@@ -361,10 +363,10 @@ void main ()
     vBase = subgroupBroadcastFirst(vBase);
     iBase = subgroupBroadcastFirst(iBase);
 
-    for (uint v = gl_LocalInvocationIndex; v < shVertCount; v += gl_WorkGroupSize.x)
+    for (uint v = gl_LocalInvocationIndex; v < shVertCount; v += WORKGROUP_SIZE)
         vertices.data[vBase + v] = shVerts[v];
 
-    for (uint k = gl_LocalInvocationIndex; k < shPrimCount * 3u; k += gl_WorkGroupSize.x)
+    for (uint k = gl_LocalInvocationIndex; k < shPrimCount * 3u; k += WORKGROUP_SIZE)
         indices.data[iBase + k] = shIdx[k] + vBase; // Add base offset to local indices
 
     // --- 4. Write Meshlet Descriptor and dummy output ---
