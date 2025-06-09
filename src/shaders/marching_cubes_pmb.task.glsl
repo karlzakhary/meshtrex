@@ -1,7 +1,8 @@
 #version 460 core
 #extension GL_EXT_mesh_shader : require
-#extension GL_EXT_shader_atomic_int64 : require
 #extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_shader_subgroup_basic: require
+#extension GL_KHR_shader_subgroup_arithmetic: require
 #extension GL_EXT_debug_printf : enable
 
 // --- Configurable Parameters ---
@@ -17,6 +18,9 @@
 #define MAX_VERTS_PER_MESHLET 256u
 #define MAX_PRIMS_PER_MESHLET 256u
 #define MAX_MESHLETS_PER_BLOCK 8u        /* 64 cells / 5-tris ~= 13 → 8 is safe for 4³ */
+#define MAX_OCC_CELLS_PER_THREAD (CELLS_PER_BLOCK + gl_WorkGroupSize.x - 1) / gl_WorkGroupSize.x
+
+#define WORKGROUP_SIZE 32
 
 // --- PMB Vertex Ownership Edges ---
 // These are the indices of the 3 edges a cell is responsible for generating vertices on.
@@ -35,8 +39,9 @@ taskPayloadSharedEXT struct TaskPayload {
 
 
 /* ---------------- shared scratch ------------------------------------------ */
-shared uint  occCount;
-shared uint  occList[CELLS_PER_BLOCK];          /* store packed cell data */
+shared uint sh_temp_occ_list[gl_WorkGroupSize.x * MAX_OCC_CELLS_PER_THREAD];
+shared uint sh_subgroup_sums[32];
+shared uint total_occ_count;
 
 
 // --- Descriptor Set Bindings ---
@@ -86,7 +91,7 @@ uint calculate_configuration(ivec3 cell_coord_global) {
     return configuration;
 }
 
-#define WORKGROUP_SIZE 32
+
 layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 void main()
@@ -98,85 +103,107 @@ void main()
         return;
     }
 
-    if (lane == 0) occCount = 0u;
-    barrier();
 
-    // 1. Each thread inspects a subset of the 64 core cells
-    uint  blockID  = activeBlockIDs.ids[gl_WorkGroupID.x];
-    uvec3 blkCoord = unpack_block_id(blockID);
-    ivec3 base     = ivec3(blkCoord) * int(STRIDE);
+    // =======================================================================
+    // PASS 1: Find occupied cells and store their data temporarily
+    // =======================================================================
+    uint local_occ_count = 0;
+    uint blockID = activeBlockIDs.ids[gl_WorkGroupID.x];
+    ivec3 base = ivec3(unpack_block_id(blockID)) * int(STRIDE);
 
     for (uint cell = lane; cell < CELLS_PER_BLOCK; cell += gl_WorkGroupSize.x)
     {
-        uvec3 cLoc  = uvec3(cell % BX, (cell / BX) % BY, cell / (BX*BY));
-        ivec3 cGlob = base + ivec3(cLoc);
-
-        if (any(greaterThanEqual(cGlob, ivec3(ubo.volumeDim.xyz) - 1)))
-            continue;
-
-        uint cfg   = calculate_configuration(cGlob);
+        uvec3 cLoc = uvec3(cell % BX, (cell / BX) % BY, cell / (BX * BY));
+        if (any(greaterThanEqual(base + ivec3(cLoc), ivec3(ubo.volumeDim.xyz) - 1))) continue;
+        
+        uint cfg = calculate_configuration(base + ivec3(cLoc));
         uint prims = getPrimitiveCount(cfg);
-
         if (prims == 0u) continue;
 
-        // *** FIX: Calculate vertices this cell OWNS, not total vertices. ***
-        // This is the core of PMB's efficiency.
         uint eMask = mcEdgeTable.edgeTable[cfg];
         uint owner_verts = 0;
         if ((eMask & (1u << PMB_EDGE_X)) != 0) owner_verts++;
         if ((eMask & (1u << PMB_EDGE_Y)) != 0) owner_verts++;
         if ((eMask & (1u << PMB_EDGE_Z)) != 0) owner_verts++;
 
-        uint idx = atomicAdd(occCount, 1u);
-        if (idx < CELLS_PER_BLOCK) {
-            // Pack all necessary data for the mesh shader
-            occList[idx] = (cell & 0xFFFFu) << 16 | (prims & 0xFFu) << 8 | (owner_verts & 0xFFu);
+        // Instead of atomicAdd, write to a private temporary slot
+        if (local_occ_count < MAX_OCC_CELLS_PER_THREAD) {
+            uint packed_data = (cell & 0xFFFFu) << 16 | (prims & 0xFFu) << 8 | (owner_verts & 0xFFu);
+            sh_temp_occ_list[lane * MAX_OCC_CELLS_PER_THREAD + local_occ_count] = packed_data;
+            local_occ_count++;
         }
     }
     barrier();
 
-    // 2. Partition occupied cells into meshlets (single thread)
+    // =======================================================================
+    // PASS 2: Perform parallel scan to find compacted write offsets
+    // =======================================================================
+    uint subgroup_offset = subgroupExclusiveAdd(local_occ_count);
+    uint subgroup_total = subgroupAdd(local_occ_count);
+    if (subgroupElect()) {
+        sh_subgroup_sums[gl_SubgroupID] = subgroup_total;
+    }
+    barrier();
+    if (gl_SubgroupID == 0) {
+        uint subgroup_sum_val = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sh_subgroup_sums[gl_SubgroupInvocationID] : 0;
+        uint subgroup_base_offset = subgroupExclusiveAdd(subgroup_sum_val);
+        if (gl_SubgroupInvocationID < gl_NumSubgroups) {
+            sh_subgroup_sums[gl_SubgroupInvocationID] = subgroup_base_offset;
+        }
+    }
+    barrier();
+    uint final_occ_offset = sh_subgroup_sums[gl_SubgroupID] + subgroup_offset;
+    if (lane == gl_WorkGroupSize.x - 1) {
+        total_occ_count = final_occ_offset + local_occ_count;
+    }
+    barrier();
+
+    // =======================================================================
+    // PASS 3: Write the compacted list to the final TaskPayload
+    // =======================================================================
+    for (uint i = 0; i < local_occ_count; i++) {
+        uint write_idx = final_occ_offset + i;
+        if (write_idx < CELLS_PER_BLOCK) {
+            TP.packedCellData[write_idx] = sh_temp_occ_list[lane * MAX_OCC_CELLS_PER_THREAD + i];
+        }
+    }
+    barrier();
+
+    // =======================================================================
+    // Final Partitioning (only thread 0) - This logic is now fed by the scan result
+    // =======================================================================
     if (lane == 0)
     {
-        uint occ = min(occCount, CELLS_PER_BLOCK);
+        uint occ = total_occ_count; // Use the precise count from the scan
+        uint m = 0;
+        if (occ > 0) {
+            uint runV = 0, runP = 0, first = 0;
+            for (uint i = 0; i < occ; ++i) {
+                // Read from the now-compacted list in the TaskPayload
+                uint packed_data = TP.packedCellData[i];
+                uint prims = (packed_data >> 8) & 0xFFu;
+                uint owner_verts = packed_data & 0xFFu;
 
-        for (uint i = 0; i < occ; ++i) TP.packedCellData[i] = occList[i];
-
-        // Greedy partitioning based on corrected vertex and primitive counts
-        uint m = 0u, runV = 0u, runP = 0u, first = 0u;
-        for (uint i = 0; i < occ; ++i)
-        {
-            uint packed_data = occList[i];
-            uint prims       = (packed_data >> 8) & 0xFFu;
-            uint owner_verts = (packed_data)      & 0xFFu;
-
-            bool over =
-              (runV + owner_verts > MAX_VERTS_PER_MESHLET) ||
-              (runP + prims > MAX_PRIMS_PER_MESHLET);
-
-            if (over && runP != 0)
-            {
-                TP.firstCell[m] = first;
-                TP.cellCount[m] = i - first;
-                m++;
-                first = i;
-                runV = 0u;
-                runP = 0u;
+                if (i > first && (runV + owner_verts > MAX_VERTS_PER_MESHLET || runP + prims > MAX_PRIMS_PER_MESHLET)) {
+                    TP.firstCell[m] = first;
+                    TP.cellCount[m] = i - first;
+                    m++;
+                    first = i;
+                    runV = 0;
+                    runP = 0;
+                }
+                runV += owner_verts;
+                runP += prims;
             }
-            runV += owner_verts;
-            runP += prims;
-        }
 
-        if (runP != 0)
-        {
-            TP.firstCell[m] = first;
-            TP.cellCount[m] = occ - first;
-            m++;
+            if (m < MAX_MESHLETS_PER_BLOCK) {
+                TP.firstCell[m] = first;
+                TP.cellCount[m] = occ - first;
+                m++;
+            }
         }
-
         TP.meshletCount = m;
-        TP.blockID      = blockID;
-
+        TP.blockID = blockID;
         EmitMeshTasksEXT(m, 1, 1);
     }
 }

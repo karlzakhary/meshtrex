@@ -242,14 +242,9 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
 
         // 2. Create Output Buffers (Sizing is critical and heuristic)
         const VkDeviceSize counterSize = sizeof(uint32_t);
-        constexpr uint32_t MAX_VERTS_PER_MESHLET_ESTIMATE = 256;
-        constexpr uint32_t MAX_PRIMS_PER_MESHLET_ESTIMATE = 256;
-        constexpr uint32_t MAX_INDICES_PER_MESHLET = MAX_PRIMS_PER_MESHLET_ESTIMATE * 3;
-        constexpr uint32_t MAX_SUB_BLOCKS_PER_BLOCK = 8;
-        // Add some headroom to size estimations?
 
         //For basic mesh shader
-        const uint32_t CELLS_PER_BLOCK_FROM_SHADER = 8 * 8 * 8; // Match shader's #define
+        const uint32_t CELLS_PER_BLOCK_FROM_SHADER = pushConstants.blockDim.x * pushConstants.blockDim.y * pushConstants.blockDim.z; // Match shader's #define
         const uint32_t MAX_VERTS_PER_CELL_FROM_SHADER = 12;    // Match shader's #define
         const uint32_t MAX_PRIMS_PER_CELL_FROM_SHADER = 5;     // Match shader's #define
 

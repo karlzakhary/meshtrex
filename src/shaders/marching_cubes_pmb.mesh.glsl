@@ -19,6 +19,9 @@
 #define STRIDE      4u           /* overlap = 1 voxel */
 #define MAX_PRIMS_PER_CELL 5
 #define MAX_PRIMS_PER_THREAD 5 
+#define MAX_VERTS_PER_MESHLET 256
+#define MAX_PRIMS_PER_MESHLET 256
+#define MAX_CELLS_PER_THREAD 1
 
 /* ------------------  PMB edge ownership -------------------------- */
 const uint PMB_EDGE_X = 0u;
@@ -156,8 +159,8 @@ shared uint        shPrimCount;
 shared uint        shIdx[256*3];
 
 shared uvec3 sh_temp_tris[128 * MAX_PRIMS_PER_THREAD];
-shared uint sh_subgroup_sums[32];
-// Final, compacted triangle indices.
+shared uint sh_vert_subgroup_sums[32];
+shared uint sh_prim_subgroup_sums[32];
 
 /* helper telling whether a cell in the 5x5x5 context grid owns an edge */
 bool ownsX(uvec3 c) { return c.x < BX; } // Core cells 0..3 own their +X edge
@@ -196,12 +199,51 @@ void main ()
     uvec3 blk_coord = unpack_block_id(taskPayloadIn.blockID);
     ivec3 base_coord = ivec3(blk_coord) * int(STRIDE);
 
-    const uint TOTAL_CONTEXT_CELLS = BLOCK_DIM_X * BLOCK_DIM_Y * BLOCK_DIM_Z; // 125
+    // =================================================================================
+    // SECTION 1: THREE-PASS VERTEX GENERATION (SUBGROUP-BASED)
+    // This entire section replaces the atomic-based vertex generation.
+    // =================================================================================
+
+    // --- PASS 1A: COUNT - Each thread counts how many vertices it owns. ---
+    uint local_vert_count = 0;
+    const uint TOTAL_CONTEXT_CELLS = BLOCK_DIM_X * BLOCK_DIM_Y * BLOCK_DIM_Z;
     for (uint cell_idx = gl_LocalInvocationIndex; cell_idx < TOTAL_CONTEXT_CELLS; cell_idx += gl_WorkGroupSize.x)
     {
         uvec3 cLoc = uvec3(cell_idx % BLOCK_DIM_X, (cell_idx / BLOCK_DIM_X) % BLOCK_DIM_Y, cell_idx / (BLOCK_DIM_X * BLOCK_DIM_Y));
-        ivec3 gLoc = base_coord + ivec3(cLoc);
+        if (any(greaterThanEqual(base_coord + ivec3(cLoc) + ivec3(1), ivec3(ubo.volumeDim.xyz)))) continue;
+        uint eMask = mcEdgeTable.edgeTable[calculate_configuration(base_coord + ivec3(cLoc))];
+        if ((eMask & (1u << PMB_EDGE_X)) != 0u && ownsX(cLoc)) local_vert_count++;
+        if ((eMask & (1u << PMB_EDGE_Y)) != 0u && ownsY(cLoc)) local_vert_count++;
+        if ((eMask & (1u << PMB_EDGE_Z)) != 0u && ownsZ(cLoc)) local_vert_count++;
+    }
+    barrier();
 
+    // --- PASS 1B: SCAN - Perform a workgroup-wide scan on the vertex counts. ---
+    uint subgroup_vert_offset = subgroupExclusiveAdd(local_vert_count);
+    uint subgroup_vert_total  = subgroupAdd(local_vert_count);
+    if (subgroupElect()) { 
+        sh_vert_subgroup_sums[gl_SubgroupID] = subgroup_vert_total; 
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        uint subgroup_sum_val = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sh_vert_subgroup_sums[gl_SubgroupInvocationID] : 0;
+        uint subgroup_base_offset = subgroupExclusiveAdd(subgroup_sum_val);
+        if (gl_SubgroupInvocationID < gl_NumSubgroups) { sh_vert_subgroup_sums[gl_SubgroupInvocationID] = subgroup_base_offset; }
+    }
+    barrier();
+
+    uint final_vert_offset = sh_vert_subgroup_sums[gl_SubgroupID] + subgroup_vert_offset;
+    if (gl_LocalInvocationIndex == gl_WorkGroupSize.x - 1) { 
+        shVertCount = final_vert_offset + local_vert_count; 
+    }
+    barrier();
+
+    // --- PASS 1C: GENERATE & WRITE - Each thread generates its vertices and writes them to the calculated offsets. ---
+    uint running_vert_offset = 0;
+    for (uint cell_idx = gl_LocalInvocationIndex; cell_idx < TOTAL_CONTEXT_CELLS; cell_idx += gl_WorkGroupSize.x) {
+        uvec3 cLoc = uvec3(cell_idx % BLOCK_DIM_X, (cell_idx / BLOCK_DIM_X) % BLOCK_DIM_Y, cell_idx / (BLOCK_DIM_X * BLOCK_DIM_Y));
+        ivec3 gLoc = base_coord + ivec3(cLoc);
         if (any(greaterThanEqual(gLoc + ivec3(1), ivec3(ubo.volumeDim.xyz)))) continue;
 
         uint cfg   = calculate_configuration(gLoc);
@@ -209,27 +251,28 @@ void main ()
 
         // -- X owner edge --
         if ((eMask & (1u << PMB_EDGE_X)) != 0u && ownsX(cLoc)) {
-            uint slot = atomicAdd(shVertCount, 1u);
-            if (slot < 256u) {
-                shVerts[slot] = interpolate_vertex(ubo.isovalue, gLoc, gLoc + ivec3(1,0,0));
-                shVertMap[cLoc.x][cLoc.y][cLoc.z][0] = slot;
+            uint write_idx = final_vert_offset + running_vert_offset;
+            if (write_idx < MAX_VERTS_PER_MESHLET) {
+                shVerts[write_idx] = interpolate_vertex(ubo.isovalue, gLoc, gLoc + ivec3(1,0,0));
+                shVertMap[cLoc.x][cLoc.y][cLoc.z][0] = write_idx;
             }
+            running_vert_offset++;
         }
-        // -- Y owner edge --
         if ((eMask & (1u << PMB_EDGE_Y)) != 0u && ownsY(cLoc)) {
-            uint slot = atomicAdd(shVertCount, 1u);
-            if (slot < 256u) {
-                shVerts[slot] = interpolate_vertex(ubo.isovalue, gLoc, gLoc + ivec3(0,1,0));
-                shVertMap[cLoc.x][cLoc.y][cLoc.z][1] = slot;
+            uint write_idx = final_vert_offset + running_vert_offset;
+            if (write_idx < MAX_VERTS_PER_MESHLET) {
+                shVerts[write_idx] = interpolate_vertex(ubo.isovalue, gLoc, gLoc + ivec3(0,1,0));
+                shVertMap[cLoc.x][cLoc.y][cLoc.z][1] = write_idx;
             }
+            running_vert_offset++;
         }
-        // -- Z owner edge --
         if ((eMask & (1u << PMB_EDGE_Z)) != 0u && ownsZ(cLoc)) {
-            uint slot = atomicAdd(shVertCount, 1u);
-            if (slot < 256u) {
-                shVerts[slot] = interpolate_vertex(ubo.isovalue, gLoc, gLoc + ivec3(0,0,1));
-                shVertMap[cLoc.x][cLoc.y][cLoc.z][2] = slot;
+            uint write_idx = final_vert_offset + running_vert_offset;
+            if (write_idx < MAX_VERTS_PER_MESHLET) {
+                shVerts[write_idx] = interpolate_vertex(ubo.isovalue, gLoc, gLoc + ivec3(0,0,1));
+                shVertMap[cLoc.x][cLoc.y][cLoc.z][2] = write_idx;
             }
+            running_vert_offset++;
         }
     }
     barrier();
@@ -250,8 +293,8 @@ void main ()
         ivec3 g_core = base_coord + ivec3(c_core);
         uint  cfg    = calculate_configuration(g_core);
 
-        for (uint t = 0; t < prims; ++t)
-        {
+        for (uint t = 0; t < prims; ++t) {
+            if (local_prim_count >= MAX_PRIMS_PER_THREAD) continue;
             uvec3 tri_indices;
             int e0 = mcTriangleTable.triTable[cfg*16 + t*3 + 0];
             int e1 = mcTriangleTable.triTable[cfg*16 + t*3 + 1];
@@ -272,50 +315,34 @@ void main ()
                 continue;
             }
 
-            // *** FIX: Critical bug was here. Removed duplicate write outside the if-block. ***
-            sh_temp_tris[gl_LocalInvocationIndex * MAX_PRIMS_PER_THREAD + local_prim_count] = tri_indices;
-            local_prim_count++;
-            // uint slot = atomicAdd(shPrimCount, 1u);
-            // if (slot < 256u) {
-            //     shIdx[slot*3+0] = tri_indices.x;
-            //     shIdx[slot*3+1] = tri_indices.y;
-            //     shIdx[slot*3+2] = tri_indices.z;
-            // }
+            if (tri_indices.x != 0xFFFFFFFFu && tri_indices.y != 0xFFFFFFFFu && tri_indices.z != 0xFFFFFFFFu) {
+                sh_temp_tris[gl_LocalInvocationIndex * MAX_PRIMS_PER_THREAD + local_prim_count] = tri_indices;
+                local_prim_count++;
+            }
         }
     }
     barrier();
-    // --- PASS 2: Perform a workgroup-wide exclusive prefix scan. This is now fully convergent. ---
-    uint subgroup_local_offset = subgroupExclusiveAdd(local_prim_count);
-    uint subgroup_total_prims  = subgroupAdd(local_prim_count);
 
-    if (subgroupElect()) {
-        sh_subgroup_sums[gl_SubgroupID] = subgroup_total_prims;
-    }
-    barrier(); // Ensure all subgroup totals are written.
+    // --- PASS 2B: SCAN ---
+    uint subgroup_prim_offset = subgroupExclusiveAdd(local_prim_count);
+    uint subgroup_prim_total  = subgroupAdd(local_prim_count);
 
+    if (subgroupElect()) { sh_prim_subgroup_sums[gl_SubgroupID] = subgroup_prim_total; }
+    barrier();
     if (gl_SubgroupID == 0) {
-        uint subgroup_sum_val = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sh_subgroup_sums[gl_SubgroupInvocationID] : 0;
+        uint subgroup_sum_val = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sh_prim_subgroup_sums[gl_SubgroupInvocationID] : 0;
         uint subgroup_base_offset = subgroupExclusiveAdd(subgroup_sum_val);
-        if (gl_SubgroupInvocationID < gl_NumSubgroups) {
-            sh_subgroup_sums[gl_SubgroupInvocationID] = subgroup_base_offset;
-        }
+        if (gl_SubgroupInvocationID < gl_NumSubgroups) { sh_prim_subgroup_sums[gl_SubgroupInvocationID] = subgroup_base_offset; }
     }
-    barrier(); // Ensure all subgroup base offsets are visible to all threads.
-
-    // Each thread calculates its final offset into the compacted shIdx array.
-    uint final_prim_offset = sh_subgroup_sums[gl_SubgroupID] + subgroup_local_offset;
-
-    // The last thread computes the grand total for the entire workgroup.
-    if (gl_LocalInvocationIndex == gl_WorkGroupSize.x - 1) {
-        shPrimCount = final_prim_offset + local_prim_count;
-    }
-    barrier(); // Ensure the final count is visible to all threads.
-
-    // --- PASS 3: Each thread copies its primitives from temp storage to the final compacted array. ---
+    barrier();
+    uint final_prim_offset = sh_prim_subgroup_sums[gl_SubgroupID] + subgroup_prim_offset;
+    if (gl_LocalInvocationIndex == gl_WorkGroupSize.x - 1) { shPrimCount = final_prim_offset + local_prim_count; }
+    barrier();
+    
+    // --- PASS 2C: WRITE ---
     for (uint i = 0; i < local_prim_count; ++i) {
         uint write_idx = final_prim_offset + i;
-        // The safety check is still good practice, but should never fail with a correct Task Shader.
-        if (write_idx < 256) {
+        if (write_idx < MAX_PRIMS_PER_MESHLET) {
             uvec3 tri = sh_temp_tris[gl_LocalInvocationIndex * MAX_PRIMS_PER_THREAD + i];
             shIdx[write_idx * 3 + 0] = tri.x;
             shIdx[write_idx * 3 + 1] = tri.y;
