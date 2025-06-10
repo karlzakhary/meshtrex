@@ -120,6 +120,9 @@ void main()
         if (prims == 0u) continue;
 
         uint eMask = mcEdgeTable.edgeTable[cfg];
+        if (eMask == 0u) {
+            continue;                     // nothing else to do for this cell
+        }
         uint owner_verts = 0;
         if ((eMask & (1u << PMB_EDGE_X)) != 0) owner_verts++;
         if ((eMask & (1u << PMB_EDGE_Y)) != 0) owner_verts++;

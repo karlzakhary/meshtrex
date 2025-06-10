@@ -214,6 +214,9 @@ void main ()
         uvec3 cLoc = uvec3(cell_idx % BLOCK_DIM_X, (cell_idx / BLOCK_DIM_X) % BLOCK_DIM_Y, cell_idx / (BLOCK_DIM_X * BLOCK_DIM_Y));
         if (any(greaterThanEqual(base_coord + ivec3(cLoc) + ivec3(1), ivec3(ubo.volumeDim.xyz)))) continue;
         uint eMask = mcEdgeTable.edgeTable[calculate_configuration(base_coord + ivec3(cLoc))];
+        if (eMask == 0u) {
+            continue;                     // nothing else to do for this cell
+        }
         if ((eMask & (1u << PMB_EDGE_X)) != 0u && ownsX(cLoc)) local_vert_count++;
         if ((eMask & (1u << PMB_EDGE_Y)) != 0u && ownsY(cLoc)) local_vert_count++;
         if ((eMask & (1u << PMB_EDGE_Z)) != 0u && ownsZ(cLoc)) local_vert_count++;
@@ -250,7 +253,9 @@ void main ()
 
         uint cfg   = calculate_configuration(gLoc);
         uint eMask = mcEdgeTable.edgeTable[cfg];
-
+        if (eMask == 0u) {
+            continue;                     // nothing else to do for this cell
+        }
         // -- X owner edge --
         if ((eMask & (1u << PMB_EDGE_X)) != 0u && ownsX(cLoc)) {
             uint write_idx = final_vert_offset + running_vert_offset;
