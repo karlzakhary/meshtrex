@@ -9,6 +9,7 @@
 struct MinMaxOutput {
     Image volumeImage{};             // Handle to the uploaded volume data image
     Image minMaxImage{};             // Handle to the intermediate min/max image (optional need)
+    std::vector<VkImageView> minMaxMipViews;
     VkImageView minMaxFull{};
 
     // Add handles needed for destruction by the caller
@@ -22,6 +23,7 @@ struct MinMaxOutput {
     MinMaxOutput(MinMaxOutput&& other) noexcept :
         volumeImage(std::move(other.volumeImage)),
         minMaxImage(std::move(other.minMaxImage)),
+        minMaxMipViews(std::move(other.minMaxMipViews)),
         minMaxFull(std::move(other.minMaxFull))
     {}
     // Move assignment operator (optional, but good practice)
@@ -36,6 +38,7 @@ struct MinMaxOutput {
 
              volumeImage = std::move(other.volumeImage);
              minMaxImage = std::move(other.minMaxImage);
+             minMaxMipViews = std::move(other.minMaxMipViews);
              minMaxFull = std::move(other.minMaxFull);
         }
         return *this;
@@ -51,6 +54,9 @@ struct MinMaxOutput {
         destroyImage(volumeImage, device);
         destroyImage(minMaxImage, device);
         vkDestroyImageView(device, minMaxFull, nullptr);
+        for (auto view : minMaxMipViews) {
+            vkDestroyImageView(device, view, nullptr);
+        }
         // Reset members to indicate they are cleaned up
     }
 };

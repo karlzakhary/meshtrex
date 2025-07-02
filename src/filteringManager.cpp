@@ -66,7 +66,7 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, MinMaxOutput &minMaxO
     VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
     sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
     sci.minLod = 0;
-    sci.maxLod = 7;
+    sci.maxLod = minMaxOutput.minMaxMipViews.size();
     sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.anisotropyEnable = VK_FALSE;
@@ -111,7 +111,7 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, MinMaxOutput &minMaxO
     // --- Cleanup Only Temporary Resources ---
     destroyBuffer(countReadbackBuffer, context.getDevice());
     destroyBuffer(stagingBuffer, context.getDevice());
-
+    vkDestroySampler(context.getDevice(), sampler, nullptr);
     // The Pass objects (minMaxPass, filteringPass) will be destroyed automatically
     // when they go out of scope, cleaning up their internal pipelines/layouts.
     // The VulkanContext object will be destroyed when it goes out of scope.

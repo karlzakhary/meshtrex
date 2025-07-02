@@ -108,6 +108,7 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
             VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, l, 1);
         pipelineBarrier(cmd, {}, 0, {}, 1, &minMaxPreComputeBarrier);
     }
+    output.minMaxMipViews = mipView;
 
     VkImageView fullMipView = createImageView(context.getDevice(),
                                           output.minMaxImage.image,
