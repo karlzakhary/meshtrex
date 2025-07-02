@@ -216,7 +216,7 @@ Buffer createConstantsUBO(VulkanContext& context, PushConstants& pushConstants) 
 
 // --- Main Extraction Function Implementation ---
 
-ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, FilteringOutput& filterOutput, PushConstants& pushConstants) { // Assuming PushConstants still holds relevant dims/isovalue
+ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxOutput& minMaxOutput, FilteringOutput& filterOutput, PushConstants& pushConstants) { // Assuming PushConstants still holds relevant dims/isovalue
     std::cout << "\n--- Starting Meshlet Extraction ---" << std::endl;
     if (filterOutput.activeBlockCount == 0) {
         std::cout << "No active blocks found. Skipping meshlet extraction." << std::endl;
@@ -315,7 +315,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         if (extractionPipeline.descriptorSet_ == VK_NULL_HANDLE) { throw std::runtime_error("Extraction pipeline descriptor set is null."); }
         std::vector<VkWriteDescriptorSet> writes;
         VkDescriptorBufferInfo uboInfo = {constantsUBO.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorImageInfo volInfo = {VK_NULL_HANDLE, filterOutput.volumeImage.imageView, VK_IMAGE_LAYOUT_GENERAL}; // Assuming GENERAL layout from filtering
+        VkDescriptorImageInfo volInfo = {VK_NULL_HANDLE, minMaxOutput.volumeImage.imageView, VK_IMAGE_LAYOUT_GENERAL}; // Assuming GENERAL layout from filtering
         VkDescriptorBufferInfo blockCountInfo = {filterOutput.activeBlockCountBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo blockIdInfo = {filterOutput.compactedBlockIdBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo mcTriTableInfo = {mcTriTableBuffer.buffer, 0, VK_WHOLE_SIZE};
@@ -519,7 +519,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, Filteri
         ));
         // *** Assuming volume image is already in GENERAL layout from filtering pass ***
         preImageBarriers.push_back(imageBarrier(
-            filterOutput.volumeImage.image,
+            minMaxOutput.volumeImage.image,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
             VK_IMAGE_LAYOUT_GENERAL,

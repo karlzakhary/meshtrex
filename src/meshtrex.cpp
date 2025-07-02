@@ -6,6 +6,7 @@
 #endif
 
 #include "common.h"
+#include "minMaxManager.h"
 #include "filteringManager.h"
 #include "extractionManager.h"
 #include "blockFilteringTestUtils.h"
@@ -91,12 +92,13 @@ int main(int argc, char** argv) {
                   << pushConstants.volumeDim.x << "x" << pushConstants.volumeDim.y << "x" << pushConstants.volumeDim.z << ")" << std::endl;
         std::cout << "Block grid: " << pushConstants.blockGridDim.x << "x" << pushConstants.blockGridDim.y << "x" << pushConstants.blockGridDim.z << std::endl;
 
-        FilteringOutput filteringResult = filterActiveBlocks(context, volume, pushConstants);
+        MinMaxOutput minMaxOutput = computeMinMaxMip(context, volume, pushConstants);
+        FilteringOutput filteringResult = filterActiveBlocks(context, minMaxOutput, pushConstants);
 
         std::cout << "Filtering complete. Received handles." << std::endl;
         std::cout << "Active blocks: " << filteringResult.activeBlockCount << std::endl;
         try {
-            ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, filteringResult, pushConstants);
+            ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants);
             writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");
         } catch (std::exception& e) {
             std::cout << e.what() << std::endl;
@@ -136,6 +138,7 @@ int main(int argc, char** argv) {
 
         std::cout << "Cleaning up filtering resources..." << std::endl;
         filteringResult.cleanup(context.getDevice());
+        minMaxOutput.cleanup(context.getDevice());
         // Assuming destroyImage/destroyBuffer take VkDevice:
         // destroyImage(filteringResult.volumeImage, device);
         // destroyImage(filteringResult.minMaxImage, device); // Destroy if created/returned

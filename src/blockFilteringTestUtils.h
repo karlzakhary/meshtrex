@@ -1,6 +1,6 @@
 #pragma once
 #include <cstring>
-
+#include <iostream>
 #include "extractionOutput.h"
 #include "shaders.h"
 #include "testMinMax.h"

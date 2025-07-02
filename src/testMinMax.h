@@ -1,6 +1,7 @@
 #pragma once
 
 #include "blockFiltering.h"
+#include <fstream>
 
 /**
  * @brief Reads a raw uint8 volume file and computes the min/max value for each block.

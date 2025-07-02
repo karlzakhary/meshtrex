@@ -1,4 +1,4 @@
-#version 450
+#version 460
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_ballot : require
@@ -15,7 +15,7 @@ layout(push_constant) uniform PushConstants {
 // --- Bindings ---
 
 // Binding 0: Input Min/Max data (rg32ui -> uvec2)
-layout(binding = 0, rg32ui) uniform readonly uimage3D minMaxInputVolume;
+layout(binding = 0) uniform usampler3D minMaxInputVolume;
 
 // Binding 1: Output buffer for compacted active block IDs
 layout(binding = 1, std430) buffer CompactedBlockIDs {
@@ -44,6 +44,23 @@ shared uint s_workgroupBaseOffset;
 // Stores the total active count for the entire workgroup
 shared uint s_workgroupTotalActiveCount;
 
+const int LEAF_LOD   = 0;             // your leaf statistics
+const int COARSE_LOD = 2;             // 4 → 16 leaf blocks per texel
+
+uvec2 loadMinMax(ivec3 blkCoord)
+{
+    /* ---------- coarse test (early reject) ------------------------ */
+    ivec3  texelC = blkCoord >> COARSE_LOD;        // parent texel
+    uvec2  mm = texelFetch(minMaxInputVolume, texelC, COARSE_LOD).xy;
+
+    if (pc.isovalue < float(mm.x) || pc.isovalue > float(mm.y)) {
+        return uvec2(0xFFFFFFFFu, 0u);             // mark “inactive”
+    }
+
+    /* ---------- fine test (confirm) ------------------------------- */
+    mm = texelFetch(minMaxInputVolume, blkCoord, LEAF_LOD).xy;
+    return mm;
+}
 
 void main() {
     // --- Basic Setup & Activity Check ---
@@ -62,7 +79,7 @@ void main() {
     blockCoord.y = (blockGridDim.x > 0) ? (remainder / blockGridDim.x) : 0;
     blockCoord.x = (blockGridDim.x > 0) ? (remainder % blockGridDim.x) : remainder;
 
-    uvec2 minMax = imageLoad(minMaxInputVolume, ivec3(blockCoord)).xy;
+    uvec2 minMax = loadMinMax(ivec3(blockCoord));
 
     bool blockIsActive = (pc.isovalue >= float(minMax.x) && pc.isovalue <= float(minMax.y));
     uint activeFlag = blockIsActive ? 1 : 0;

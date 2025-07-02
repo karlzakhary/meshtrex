@@ -13,57 +13,13 @@
 #include <iostream>
 #include <string>
 
-void uploadVolumeData(VkCommandBuffer commandBuffer,
-                       VkImage volumeImage, Buffer stagingBuffer, VkExtent3D extent) {
-    VkImageMemoryBarrier2 preCopyBarrier = imageBarrier(
-        volumeImage,
-        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
-        VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_PIPELINE_STAGE_2_COPY_BIT,
-        VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_ASPECT_COLOR_BIT,
-        0, 1
-    );
-    pipelineBarrier(
-        commandBuffer,
-        {},
-        0,
-        {},
-        1,
-        &preCopyBarrier
-    );
-    // copy1DBufferTo3DImage should copy from stagingBuffer.buffer to volumeImage
-    copy1DBufferTo3DImage(stagingBuffer, commandBuffer, volumeImage, extent.width, extent.height, extent.depth);
-    // Transition to GENERAL for shader access (read/write)
-    VkImageMemoryBarrier2 postCopyPreComputeBarrier = imageBarrier(
-        volumeImage,
-        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT,
-        0, 1
-    );
-
-    pipelineBarrier(
-        commandBuffer,
-        {},
-        0,
-        {},
-        1,
-        &postCopyPreComputeBarrier
-    );
-}
-
 
 // --- Modified Main Orchestrating Function ---
 // Returns a struct containing handles to persistent resources
-FilteringOutput filterActiveBlocks(VulkanContext &context, Volume volume, PushConstants& pushConstants)
+FilteringOutput filterActiveBlocks(VulkanContext &context, MinMaxOutput &minMaxOutput, PushConstants& pushConstants)
 {
     // --- Create Pass Objects ---
-    std::string minMaxShaderPath = "/spirv/computeMinMax.comp.spv";
     std::string filterShaderPath = "/spirv/occupiedBlockPrefixSum.comp.spv";
-    MinMaxPass minMaxPass(context, minMaxShaderPath.c_str());
     ActiveBlockFilteringPass filteringPass(context, filterShaderPath.c_str());
 
     // --- Prepare Resources (some persistent, some temporary) ---
@@ -73,15 +29,6 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, Volume volume, PushCo
 
     // Create persistent resources directly in the output struct
     // (Assumes Image/Buffer default constructors initialize handles to VK_NULL_HANDLE or similar)
-
-    // Create MinMax output image (persistent)
-    VkExtent3D gridExtent = {pushConstants.blockGridDim.x, pushConstants.blockGridDim.y, pushConstants.blockGridDim.z};
-    VkExtent3D volumeExtent = {volume.volume_dims.x, volume.volume_dims.y, volume.volume_dims.z};
-
-    createImage(output.minMaxImage, context.getDevice(), context.getMemoryProperties(), VK_IMAGE_TYPE_3D,
-                gridExtent.width, gridExtent.height, gridExtent.depth, 1,
-                VK_FORMAT_R32G32_UINT,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
     // Create Filtering output buffers (persistent)
     uint32_t totalBlocks = pushConstants.blockGridDim.x * pushConstants.blockGridDim.y * pushConstants.blockGridDim.z;
@@ -100,37 +47,6 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, Volume volume, PushCo
     // --- Record Command Buffer ---
     VkCommandBuffer cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
 
-    // 1. Upload Volume Data (creates output.volumeImage and temporary stagingBuffer)
-    //    Pass output.volumeImage by reference to be populated.
-    createImage(output.volumeImage, context.getDevice(), context.getMemoryProperties(), VK_IMAGE_TYPE_3D,
-                    volumeExtent.width, volumeExtent.height, volumeExtent.depth, 1,
-                    VK_FORMAT_R8_UINT, // Assuming uint8 input volume data
-                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT); // Usage for upload and shader read
-
-    createBuffer(stagingBuffer, context.getDevice(), context.getMemoryProperties(), volume.volume_data.size(),
-                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    memcpy(stagingBuffer.data, volume.volume_data.data(), volume.volume_data.size());
-
-    uploadVolumeData(cmd, output.volumeImage.image, stagingBuffer, volumeExtent);
-
-    // 2. Barrier: Prepare MinMax Image for write
-    VkImageMemoryBarrier2 minMaxPreComputeBarrier = imageBarrier(
-        output.minMaxImage.image,
-        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
-    pipelineBarrier(cmd, {}, 0, {}, 1, &minMaxPreComputeBarrier);
-
-    // 3. Run MinMax Pass
-    minMaxPass.recordDispatch(cmd, output.volumeImage.imageView, output.minMaxImage.imageView, pushConstants);
-
-    // 4. Barriers: Transition MinMax Image (W->R), Initialize Count Buffer (Fill->RW), Prepare Compact ID Buffer (None->W)
-    VkImageMemoryBarrier2 minMaxReadBarrier = imageBarrier(
-        output.minMaxImage.image,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
-        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
     vkCmdFillBuffer(cmd, output.activeBlockCountBuffer.buffer, 0, countBufferSize, 0);
 
     VkBufferMemoryBarrier2 bufferTransferToComputeBarriers[2] = {};
@@ -145,10 +61,18 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, Volume volume, PushCo
        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
        0, VK_WHOLE_SIZE);
 
-    pipelineBarrier(cmd, {}, 2, bufferTransferToComputeBarriers, 1, &minMaxReadBarrier); // Combined barrier
-
+    pipelineBarrier(cmd, {}, 2, bufferTransferToComputeBarriers, 0, {}); // Combined barrier
+    VkSampler sampler;
+    VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    sci.minLod = 0;
+    sci.maxLod = 7;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.anisotropyEnable = VK_FALSE;
+    vkCreateSampler(context.getDevice(), &sci, nullptr, &sampler);
     // 5. Run Active Block Filtering Pass
-    filteringPass.recordDispatch(cmd, output.minMaxImage.imageView, output.compactedBlockIdBuffer, output.activeBlockCountBuffer, pushConstants);
+    filteringPass.recordDispatch(cmd, minMaxOutput.minMaxImage.imageView, sampler, output.compactedBlockIdBuffer, output.activeBlockCountBuffer, pushConstants);
 
     // 6. Barrier: Ensure compute writes are finished before copy/readback
     VkBufferMemoryBarrier2 bufferComputeToTransferBarriers[2] = {};
