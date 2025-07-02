@@ -72,9 +72,6 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
     Buffer stagingBuffer = {}; // Temporary for upload
     Buffer countReadbackBuffer = {}; // Temporary for readback
 
-    // Create persistent resources directly in the output struct
-    // (Assumes Image/Buffer default constructors initialize handles to VK_NULL_HANDLE or similar)
-
     // Create MinMax output image (persistent)
     auto mipExtent = [](VkExtent3D e, uint32_t level) {
         return VkExtent3D {
@@ -83,40 +80,28 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
             std::max(1u, e.depth  >> level)
         };
     };
+    VkExtent3D srcExtent = {volume.volume_dims.x, volume.volume_dims.y, volume.volume_dims.z};
     VkExtent3D leafExtent = {pushConstants.blockGridDim.x, pushConstants.blockGridDim.y, pushConstants.blockGridDim.z};
     uint32_t maxDim = std::max({ leafExtent.width, leafExtent.height, leafExtent.depth });
     uint32_t fullMipCount = 1u + static_cast<uint32_t>(std::floor(std::log2(maxDim)));
-    
-    VkExtent3D srcExtent = {volume.volume_dims.x, volume.volume_dims.y, volume.volume_dims.z};
-
+    output.minMaxMipViews.reserve(fullMipCount);
     createImage(output.minMaxImage, context.getDevice(), context.getMemoryProperties(), VK_IMAGE_TYPE_3D,
                 leafExtent.width, leafExtent.height, leafExtent.depth, fullMipCount,
                 VK_FORMAT_R32G32_UINT,
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-
+    
     // --- Record Command Buffer ---
     VkCommandBuffer cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
-
-    std::vector<VkImageView> mipView(fullMipCount);
     for (uint32_t l = 0; l < fullMipCount; ++l) {
-        mipView[l] = createImageView(context.getDevice(), output.minMaxImage.image, VK_FORMAT_R32G32_UINT, VK_IMAGE_TYPE_3D, l, 1);
-        // 2. Barrier: Prepare MinMax Image for write
+        output.minMaxMipViews.push_back(createImageView(context.getDevice(), output.minMaxImage.image, VK_FORMAT_R32G32_UINT, VK_IMAGE_TYPE_3D, l, 1));
         VkImageMemoryBarrier2 minMaxPreComputeBarrier = imageBarrier(
             output.minMaxImage.image,
             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, l, 1);
-        pipelineBarrier(cmd, {}, 0, {}, 1, &minMaxPreComputeBarrier);
+            VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_ASPECT_COLOR_BIT, l, 1);
+            pipelineBarrier(cmd, {}, 0, {}, 1, &minMaxPreComputeBarrier);
     }
-    output.minMaxMipViews = mipView;
 
-    VkImageView fullMipView = createImageView(context.getDevice(),
-                                          output.minMaxImage.image,
-                                          VK_FORMAT_R32G32_UINT,
-                                          VK_IMAGE_TYPE_3D,
-                                          0,                 // baseMip
-                                          fullMipCount);     // levelCount = ALL
-    output.minMaxFull = fullMipView;
     // 1. Upload Volume Data (creates output.volumeImage and temporary stagingBuffer)
     //    Pass output.volumeImage by reference to be populated.
     createImage(output.volumeImage, context.getDevice(), context.getMemoryProperties(), VK_IMAGE_TYPE_3D,
@@ -161,7 +146,7 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
         VkImageMemoryBarrier2 dstWrite = imageBarrier(
             output.minMaxImage.image,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            VK_ACCESS_2_NONE,                        /* was: nothing */
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT,                        /* was: read */
             VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
@@ -169,7 +154,7 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
             VK_IMAGE_ASPECT_COLOR_BIT, l + 1, 1);
         pipelineBarrier(cmd, {}, 0, {}, 1, &dstWrite);
 
-        minMaxPass.recordOctreeDispatch(cmd, mipView[l], extent, mipView[l+1], dstExtent);
+        minMaxPass.recordOctreeDispatch(cmd, output.minMaxMipViews[l], extent, output.minMaxMipViews[l+1], dstExtent);
         extent = dstExtent;
     }
 
