@@ -1,8 +1,8 @@
 #pragma once
 
 #include "filteringOutput.h"
-#include "volume.h"
+#include "minMaxOutput.h"
 
 class VulkanContext;
 
-FilteringOutput filterActiveBlocks(VulkanContext &vulkanContext, Volume volume, PushConstants& pushConstants);
+FilteringOutput filterActiveBlocks(VulkanContext &vulkanContext, MinMaxOutput &minMaxOutput, PushConstants& pushConstants);

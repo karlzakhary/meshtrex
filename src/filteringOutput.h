@@ -8,8 +8,6 @@
 
 // Structure to hold the results and persistent resources from the filtering process
 struct FilteringOutput {
-    Image volumeImage{};             // Handle to the uploaded volume data image
-    Image minMaxImage{};             // Handle to the intermediate min/max image (optional need)
     Buffer compactedBlockIdBuffer{}; // Buffer containing IDs of active blocks
     Buffer activeBlockCountBuffer{}; // Buffer containing the count of active blocks (atomic counter)
     uint32_t activeBlockCount = 0; // The actual count read back from the buffer
@@ -23,8 +21,6 @@ struct FilteringOutput {
 
     // Move constructor (important for transferring ownership)
     FilteringOutput(FilteringOutput&& other) noexcept :
-        volumeImage(std::move(other.volumeImage)),
-        minMaxImage(std::move(other.minMaxImage)),
         compactedBlockIdBuffer(std::move(other.compactedBlockIdBuffer)),
         activeBlockCountBuffer(std::move(other.activeBlockCountBuffer)),
         activeBlockCount(other.activeBlockCount)
@@ -44,8 +40,6 @@ struct FilteringOutput {
              // Simplest if Image/Buffer handle moves cleanly or if caller
              // ensures *this* is empty before move-assigning.
 
-             volumeImage = std::move(other.volumeImage);
-             minMaxImage = std::move(other.minMaxImage);
              compactedBlockIdBuffer = std::move(other.compactedBlockIdBuffer);
              activeBlockCountBuffer = std::move(other.activeBlockCountBuffer);
              activeBlockCount = other.activeBlockCount;
@@ -63,8 +57,6 @@ struct FilteringOutput {
 
     // Add a cleanup method if preferred over manual destruction by the caller
     void cleanup(VkDevice device) const {
-        destroyImage(volumeImage, device);
-        destroyImage(minMaxImage, device);
         destroyBuffer(compactedBlockIdBuffer, device);
         destroyBuffer(activeBlockCountBuffer, device);
         // Reset members to indicate they are cleaned up

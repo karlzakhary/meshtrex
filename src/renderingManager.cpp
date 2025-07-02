@@ -2,6 +2,7 @@
 
 #include "extractionOutput.h"
 #include "extractionPipeline.h"
+#include "minMaxOutput.h"
 #include "filteringOutput.h"
 #include "renderingPipeline.h"
 #include "resources.h"
@@ -10,6 +11,7 @@
 void updateExtractionDescriptors(
     VkDevice device,
     ExtractionPipeline& extractionPipelineState,
+    const MinMaxOutput& minMaxOutput,
     const FilteringOutput& filteringResult, // Input: Active block list/count
     const Buffer& uboIsovalue,              // Input: UBO containing current isovalue etc.
     const Buffer& marchingCubesTriTable,    // Input: MC Table
@@ -22,7 +24,7 @@ void updateExtractionDescriptors(
     VkDescriptorBufferInfo uboInfo = {uboIsovalue.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr});
     // Binding 1: Volume Image
-    VkDescriptorImageInfo volInfo = {VK_NULL_HANDLE, filteringResult.volumeImage.imageView, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo volInfo = {VK_NULL_HANDLE, minMaxOutput.volumeImage.imageView, VK_IMAGE_LAYOUT_GENERAL};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &volInfo, nullptr, nullptr});
     // Binding 2: Block IDs
     VkDescriptorBufferInfo blockIdInfo = {filteringResult.compactedBlockIdBuffer.buffer, 0, VK_WHOLE_SIZE};

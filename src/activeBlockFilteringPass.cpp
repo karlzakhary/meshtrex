@@ -33,7 +33,7 @@ void ActiveBlockFilteringPass::createPipelineLayout() {
 
     bindings[0] = { // MinMax Input Image
         .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         .descriptorCount = 1,
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT
     };
@@ -86,6 +86,7 @@ void ActiveBlockFilteringPass::createPipeline(const char* shaderPath) {
 
 void ActiveBlockFilteringPass::recordDispatch(VkCommandBuffer cmd,
                                            VkImageView minMaxImageView,
+                                           VkSampler sampler,
                                            const Buffer& compactedBlockIdBuffer,
                                            const Buffer& activeBlockCountBuffer,
                                            const PushConstants& pushConstants) const
@@ -95,9 +96,9 @@ void ActiveBlockFilteringPass::recordDispatch(VkCommandBuffer cmd,
 
     // Push Descriptors
     VkDescriptorImageInfo minMaxImageInfo = {
-        .sampler = VK_NULL_HANDLE,
+        .sampler = sampler,
         .imageView = minMaxImageView,
-        .imageLayout = VK_IMAGE_LAYOUT_GENERAL // Must match layout from previous pass output
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL // Must match layout from previous pass output
     };
 
     VkDescriptorBufferInfo compactedIdBufferInfo = {
@@ -117,7 +118,7 @@ void ActiveBlockFilteringPass::recordDispatch(VkCommandBuffer cmd,
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstBinding = 0,
         .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         .pImageInfo = &minMaxImageInfo
     };
     writes[1] = {
