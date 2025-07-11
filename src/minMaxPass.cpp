@@ -313,7 +313,7 @@ void MinMaxPass::recordStreamingLeafDispatch(VkCommandBuffer cmd,
                                             VkSampler volumeSampler,
                                             const Buffer& pageTableBuffer,
                                             VkImageView minMaxView,
-                                            const PushConstants& pushConstants,
+                                            const StreamingMinMaxPushConstants& pushConstants,
                                             const PageCoord& pageCoord) {
     // The streaming pipeline must be available
     assert(streamingLeafPipeline_ != VK_NULL_HANDLE);
@@ -378,11 +378,10 @@ void MinMaxPass::recordStreamingLeafDispatch(VkCommandBuffer cmd,
                        &pushConstants);
 
     // Dispatch - for streaming, we process one page worth of blocks
-    // Calculate dispatch size for single page (64x32x32 voxels)
-    // Each workgroup processes a 4x4x4 block
-    uint32_t pageBlocksX = 64 / 4;  // 16
-    uint32_t pageBlocksY = 32 / 4;  // 8
-    uint32_t pageBlocksZ = 32 / 4;  // 8
+    // Calculate dispatch size based on actual page dimensions
+    uint32_t pageBlocksX = pushConstants.pageSizeX / pushConstants.blockSize;
+    uint32_t pageBlocksY = pushConstants.pageSizeY / pushConstants.blockSize;
+    uint32_t pageBlocksZ = pushConstants.pageSizeZ / pushConstants.blockSize;
     vkCmdDispatch(cmd, pageBlocksX, pageBlocksY, pageBlocksZ);
 }
 

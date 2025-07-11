@@ -44,7 +44,7 @@ public:
                                     VkSampler volumeSampler,
                                     const Buffer& pageTableBuffer,
                                     VkImageView minMaxView,
-                                    const PushConstants& pushConstants,
+                                    const StreamingMinMaxPushConstants& pushConstants,
                                     const PageCoord& pageCoord);
 
     void recordStreamingOctreeDispatch(VkCommandBuffer cmd,

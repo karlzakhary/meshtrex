@@ -314,6 +314,9 @@ void VolumeStreamer::processPendingCopies() {
         std::lock_guard<std::mutex> lock(pendingCopiesMutex);
         std::swap(copiesToProcess, pendingCopies);
     }
+    
+    bool anyPagesProcessed = !copiesToProcess.empty();
+    
     while (!copiesToProcess.empty()) {
         PendingCopy& pending = copiesToProcess.front();
         VkCommandBuffer copyCmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
@@ -369,6 +372,11 @@ void VolumeStreamer::processPendingCopies() {
         }
         destroyBuffer(pending.stagingBuffer, context.getDevice());
         copiesToProcess.pop();
+    }
+    
+    // Update page table after processing all copies
+    if (anyPagesProcessed) {
+        updatePageTable();
     }
 }
 
@@ -516,9 +524,16 @@ void VolumeStreamer::updatePageTable() {
             uint32_t pageIndex = getPageIndex(coord, volumeWidth, volumeHeight, volumeDepth,
                 params.pageSizeX, params.pageSizeY, params.pageSizeZ);
             if (pageIndex < params.maxResidentPages) {
-                pageTableData[pageIndex].atlasX = entry.atlasX;
-                pageTableData[pageIndex].atlasY = entry.atlasY;
-                pageTableData[pageIndex].atlasZ = entry.atlasZ;
+                uint32_t granularityX = sparseMemoryReqs.formatProperties.imageGranularity.width;
+                uint32_t granularityY = sparseMemoryReqs.formatProperties.imageGranularity.height;
+                uint32_t granularityZ = sparseMemoryReqs.formatProperties.imageGranularity.depth;
+                uint32_t atlasPageX = entry.atlasX / granularityX;
+                uint32_t atlasPageY = entry.atlasY / granularityY;
+                uint32_t atlasPageZ = entry.atlasZ / granularityZ;
+                pageTableData[pageIndex].atlasCoord =
+                    (atlasPageX & 0x3FF) |
+                    ((atlasPageY & 0x3FF) << 10) |
+                    ((atlasPageZ & 0x3FF) << 20);
                 pageTableData[pageIndex].isResident = 1;
             }
         }

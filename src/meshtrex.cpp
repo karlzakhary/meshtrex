@@ -314,34 +314,9 @@ int main(int argc, char** argv) {
                         for (uint32_t x = 0; x < pagesX; x++) {
                             PageCoord pageCoord = { x, y, z, 0 };
                             if (volumeStreamer.isPageResident(pageCoord)) {
-                                bool neighborsResident = true;
-                                const int faceOffsets[6][3] = {
-                                    {-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}
-                                };
-                                for (int i = 0; i < 6 && neighborsResident; i++) {
-                                    int nx = int(x) + faceOffsets[i][0];
-                                    int ny = int(y) + faceOffsets[i][1];
-                                    int nz = int(z) + faceOffsets[i][2];
-                                    if (nx < 0 || ny < 0 || nz < 0 || nx >= int(pagesX) || ny >= int(pagesY) || nz >= int(pagesZ)) {
-                                        continue;
-                                    }
-                                    PageCoord neighborCoord = { uint32_t(nx), uint32_t(ny), uint32_t(nz), 0 };
-                                    if (!volumeStreamer.isPageResident(neighborCoord)) {
-                                        neighborsResident = false;
-                                        volumeStreamer.requestPage(neighborCoord);
-                                    }
-                                }
-                                if (neighborsResident || frameIndex > 10) {
-                                    pagesToProcess.push_back(pageCoord);
-                                    if (!neighborsResident && frameIndex > 10) {
-                                        static int pagesWithoutNeighborsShown = 0;
-                                        if (pagesWithoutNeighborsShown < 5) {
-                                            std::cout << "  Processing page (" << x << "," << y << "," << z
-                                                << ") without all neighbors due to timeout" << std::endl;
-                                            pagesWithoutNeighborsShown++;
-                                        }
-                                    }
-                                }
+                                // Process page immediately without checking neighbors
+                                // This will cause cross-page sampling issues
+                                pagesToProcess.push_back(pageCoord);
                             }
                         }
                     }
@@ -354,34 +329,14 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                uint32_t pagesWaitingForNeighbors = 0;
-                for (uint32_t z = 0; z < pagesZ; z++) {
-                    for (uint32_t y = 0; y < pagesY; y++) {
-                        for (uint32_t x = 0; x < pagesX; x++) {
-                            PageCoord pageCoord = { x, y, z, 0 };
-                            if (volumeStreamer.isPageResident(pageCoord) && extractedPages.find(pageCoord) == extractedPages.end()) {
-                                bool inToProcess = false;
-                                for (const auto& p : pagesToProcess) {
-                                    if (p.x == x && p.y == y && p.z == z) {
-                                        inToProcess = true;
-                                        break;
-                                    }
-                                }
-                                if (!inToProcess) {
-                                    pagesWaitingForNeighbors++;
-                                }
-                            }
-                        }
-                    }
-                }
+                // No longer tracking pages waiting for neighbors since we process immediately
 
-                std::cout << "Found " << pagesToProcess.size() << " pages ready (with neighbors), "
-                    << unextractedCount << " not yet extracted, "
-                    << pagesWaitingForNeighbors << " waiting for neighbors" << std::endl;
+                std::cout << "Found " << pagesToProcess.size() << " pages ready, "
+                    << unextractedCount << " not yet extracted" << std::endl;
                 if (unextractedCount == 0 && extractedPages.size() < pagesX* pagesY* pagesZ) {
                     std::cout << "No pages to process this frame, waiting for more pages to load..." << std::endl;
                     std::cout << "Extracted: " << extractedPages.size() << "/" << (pagesX * pagesY * pagesZ)
-                        << " pages, " << pagesWaitingForNeighbors << " waiting for neighbors" << std::endl;
+                        << " pages" << std::endl;
                     frameIndex++;
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     continue;
@@ -406,7 +361,7 @@ int main(int argc, char** argv) {
 
                     std::cout << "  Computing min-max for page with grid " << pagePushConstants.blockGridDim.x
                         << "x" << pagePushConstants.blockGridDim.y << "x" << pagePushConstants.blockGridDim.z << std::endl;
-
+                    
                     MinMaxOutput minMaxOutput = computeStreamingMinMaxMip(
                         context,
                         volumeStreamer.getVolumeAtlasView(),

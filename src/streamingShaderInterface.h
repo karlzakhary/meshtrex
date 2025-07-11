@@ -4,9 +4,7 @@
 #include <glm/glm.hpp>
 
 struct PageTableEntry {
-    uint32_t atlasX;
-    uint32_t atlasY;
-    uint32_t atlasZ;
+    uint32_t atlasCoord;  // Packed atlas coordinates
     uint32_t isResident;
 };
 

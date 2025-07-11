@@ -3,7 +3,6 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_KHR_shader_subgroup_shuffle_relative : require
-#extension GL_EXT_debug_printf : enable
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 2) in;
 
@@ -18,6 +17,10 @@ layout(push_constant) uniform PushConstants {
     uint volumeSizeX;
     uint volumeSizeY;
     uint volumeSizeZ;
+    uint granularityX;
+    uint granularityY;
+    uint granularityZ;
+    uint pageOverlap;
 } pc;
 
 layout(set = 0, binding = 0, std430) readonly buffer PageTable {
@@ -73,9 +76,9 @@ uint sampleVolumeAtlas(uvec3 worldCoord, out bool valid) {
                              worldCoord.y % pc.pageSizeY,
                              worldCoord.z % pc.pageSizeZ);
     
-    ivec3 atlasTexel = ivec3(atlasCoord.x * 64 + localCoord.x,
-                             atlasCoord.y * 32 + localCoord.y,
-                             atlasCoord.z * 32 + localCoord.z);
+    ivec3 atlasTexel = ivec3(atlasCoord.x * pc.pageSizeX + localCoord.x,
+                             atlasCoord.y * pc.pageSizeY + localCoord.y,
+                             atlasCoord.z * pc.pageSizeZ + localCoord.z);
     
     if (any(greaterThanEqual(atlasTexel, ivec3(1024)))) {
         return 0;
@@ -130,11 +133,13 @@ void main() {
         } else if (localInvocationIndex < 56) {
             uint y = localInvocationIndex - 52;
             extraVoxel = blockStart + ivec3(pc.blockSize, y, pc.blockSize);
-        } else if (localInvocationIndex < 60) {
+        } else {
             uint x = localInvocationIndex - 56;
             extraVoxel = blockStart + ivec3(x, pc.blockSize, pc.blockSize);
-        } else {
-            extraVoxel = blockStart + ivec3(pc.blockSize);
+        }
+        
+        if (localInvocationIndex == 60) {
+            extraVoxel = blockStart + ivec3(pc.blockSize, pc.blockSize, pc.blockSize);
         }
         
         bool valid;

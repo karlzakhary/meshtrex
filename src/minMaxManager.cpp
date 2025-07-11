@@ -9,6 +9,7 @@
 #include "minMaxOutput.h"
 #include "blockFilteringTestUtils.h"
 #include "activeBlockFilteringPass.h"
+#include "streamingShaderInterface.h"
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -195,8 +196,28 @@ MinMaxOutput computeStreamingMinMaxMip(VulkanContext& context,
         pipelineBarrier(cmd, 0, 0, nullptr, 1, &barrier);
     }
 
+    // Create proper streaming push constants
+    StreamingMinMaxPushConstants streamingPC = {};
+    streamingPC.pageCoord = glm::uvec3(pageCoord.x, pageCoord.y, pageCoord.z);
+    streamingPC.mipLevel = 0;
+    streamingPC.isoValue = pushConstants.isovalue;
+    streamingPC.blockSize = pushConstants.blockDim.x; // Should be 4
+    // Calculate page dimensions from blockGridDim - this assumes the caller set it correctly
+    streamingPC.pageSizeX = pushConstants.blockGridDim.x * pushConstants.blockDim.x;
+    streamingPC.pageSizeY = pushConstants.blockGridDim.y * pushConstants.blockDim.y;
+    streamingPC.pageSizeZ = pushConstants.blockGridDim.z * pushConstants.blockDim.z;
+    // Volume dimensions are passed correctly in volumeDim
+    streamingPC.volumeSizeX = pushConstants.volumeDim.x;
+    streamingPC.volumeSizeY = pushConstants.volumeDim.y;
+    streamingPC.volumeSizeZ = pushConstants.volumeDim.z;
+    // Granularity is the same as page size for now
+    streamingPC.granularityX = streamingPC.pageSizeX;
+    streamingPC.granularityY = streamingPC.pageSizeY;
+    streamingPC.granularityZ = streamingPC.pageSizeZ;
+    streamingPC.pageOverlap = 0;
+    
     minMaxPass.recordStreamingLeafDispatch(cmd, volumeAtlasView, volumeSampler, pageTableBuffer,
-        output.minMaxMipViews[0], pushConstants, pageCoord);
+        output.minMaxMipViews[0], streamingPC, pageCoord);
 
     VkImageMemoryBarrier2 leafToOctreeBarrier = imageBarrier(
         output.minMaxImage.image,
