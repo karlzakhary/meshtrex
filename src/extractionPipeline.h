@@ -27,6 +27,15 @@ public:
         VkFormat colorFormat,       // Target color attachment format
         VkFormat depthFormat        // Target depth attachment format
     );
+    
+    // Overloaded setup with custom shader paths
+    bool setup(
+        VkDevice device,
+        VkFormat colorFormat,
+        VkFormat depthFormat,
+        const char* taskShaderPath,
+        const char* meshShaderPath
+    );
 
     // Explicit cleanup method (alternative or supplement to destructor)
     void cleanup();
@@ -38,6 +47,10 @@ public:
     VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE; // Assuming one set
+    
+    // Streaming pipeline support
+    bool isStreamingPipeline_ = false;
+    VkDescriptorSetLayout pageTableSetLayout_ = VK_NULL_HANDLE;
 
 private:
     // Shader modules managed by Shader struct (RAII)
@@ -47,6 +60,7 @@ private:
     // Internal helper to release resources safely
     void releaseResources();
     void createPipelineLayout();
+    void createStreamingPipelineLayout();
     void createExtractionGraphicsPipeline(VkFormat colorFormat,
                                           VkFormat depthFormat);
     void createDescriptorPool();

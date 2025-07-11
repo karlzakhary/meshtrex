@@ -1,5 +1,8 @@
 #pragma once
 
+#include <fstream>
+#include <vector>
+
 inline VkSemaphore createSemaphore(VkDevice device)
 {
     VkSemaphoreCreateInfo createInfo = {
@@ -123,4 +126,45 @@ inline VkImageView createImageView(VkDevice device, VkImage image, VkFormat form
     VK_CHECK(vkCreateImageView(device, &createInfo, 0, &view));
 
     return view;
+}
+
+// Transition image layout using pipeline barriers
+inline void transitionImageLayout(VkCommandBuffer cmd, VkImage image,
+                                 VkImageLayout oldLayout, VkImageLayout newLayout,
+                                 uint32_t mipLevels = 1) {
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = oldLayout,
+        .newLayout = newLayout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = mipLevels,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        }
+    };
+    
+    VkPipelineStageFlags sourceStage;
+    VkPipelineStageFlags destinationStage;
+    
+    if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_GENERAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destinationStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_GENERAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        sourceStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    } else {
+        throw std::invalid_argument("Unsupported layout transition");
+    }
+    
+    vkCmdPipelineBarrier(cmd, sourceStage, destinationStage, 0,
+                        0, nullptr, 0, nullptr, 1, &barrier);
 }

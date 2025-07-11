@@ -1,0 +1,244 @@
+// Autonomous DGC Example
+// Demonstrates the complete GPU-driven streaming volume renderer
+
+#include "integratedAutonomousSystem.h"
+#include "vulkan_context.h"
+#include "camera.h"
+#include <iostream>
+#include <chrono>
+
+class AutonomousDGCExample {
+public:
+    AutonomousDGCExample() {
+        initVulkan();
+        initSystem();
+    }
+
+    ~AutonomousDGCExample() {
+        cleanup();
+    }
+
+    void run() {
+        mainLoop();
+    }
+
+private:
+    // Vulkan context
+    std::unique_ptr<VulkanContext> context_;
+    
+    // Integrated autonomous system
+    std::unique_ptr<IntegratedAutonomousSystem> system_;
+    
+    // Camera
+    Camera camera_;
+    
+    // Timing
+    std::chrono::steady_clock::time_point startTime_;
+    uint32_t frameIndex_ = 0;
+    
+    // Parameters
+    float currentIsoValue_ = 127.5f;
+    bool isoValueChanged_ = false;
+    
+    void initVulkan() {
+        // Initialize Vulkan context with required extensions
+        std::vector<const char*> deviceExtensions = {
+            VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+            VK_EXT_MESH_SHADER_EXTENSION_NAME,
+            VK_NV_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME,
+            VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME,
+            VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME
+        };
+        
+        // Enable required features
+        VkPhysicalDeviceFeatures deviceFeatures = {};
+        deviceFeatures.sparseBinding = VK_TRUE;
+        deviceFeatures.sparseResidencyImage3D = VK_TRUE;
+        
+        context_ = std::make_unique<VulkanContext>();
+        context_->initialize("Autonomous DGC Volume Renderer", 1280, 720, 
+                           deviceExtensions, &deviceFeatures);
+        
+        std::cout << "Vulkan context initialized" << std::endl;
+    }
+    
+    void initSystem() {
+        // Initialize the integrated autonomous system
+        system_ = std::make_unique<IntegratedAutonomousSystem>(*context_);
+        
+        // Load volume data
+        std::string volumePath = "raw_volumes/nucleon_41x41x41_uint8.raw";
+        
+        try {
+            system_->initialize(volumePath, currentIsoValue_);
+            std::cout << "Autonomous system initialized with volume: " << volumePath << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to initialize system: " << e.what() << std::endl;
+            throw;
+        }
+        
+        // Setup camera
+        camera_.setPosition(glm::vec3(2.0f, 2.0f, 2.0f));
+        camera_.lookAt(glm::vec3(0.0f, 0.0f, 0.0f));
+        
+        startTime_ = std::chrono::steady_clock::now();
+    }
+    
+    void mainLoop() {
+        while (!context_->shouldClose()) {
+            context_->pollEvents();
+            
+            // Handle input
+            handleInput();
+            
+            // Update camera if moved
+            if (camera_.hasChanged()) {
+                system_->updateView(camera_.getViewMatrix(), 
+                                  camera_.getProjectionMatrix(context_->getAspectRatio()),
+                                  camera_.getPosition());
+                camera_.resetChanged();
+            }
+            
+            // Update isovalue if changed
+            if (isoValueChanged_) {
+                system_->setExtractionParameter(currentIsoValue_);
+                isoValueChanged_ = false;
+                std::cout << "Isovalue changed to: " << currentIsoValue_ << std::endl;
+            }
+            
+            // Execute frame
+            drawFrame();
+            
+            frameIndex_++;
+        }
+        
+        vkDeviceWaitIdle(context_->getDevice());
+    }
+    
+    void drawFrame() {
+        // Begin frame
+        uint32_t imageIndex;
+        VkResult result = context_->acquireNextImage(&imageIndex);
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            context_->recreateSwapChain();
+            return;
+        }
+        
+        // Record command buffer
+        VkCommandBuffer cmd = context_->getCurrentCommandBuffer();
+        
+        VkCommandBufferBeginInfo beginInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+        };
+        
+        VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
+        
+        // Execute autonomous extraction (GPU handles everything)
+        system_->executeFrame(frameIndex_);
+        
+        // Begin render pass
+        VkRenderPassBeginInfo renderPassInfo = {
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+            .renderPass = context_->getRenderPass(),
+            .framebuffer = context_->getSwapChainFramebuffer(imageIndex),
+            .renderArea = {
+                .offset = {0, 0},
+                .extent = context_->getSwapChainExtent()
+            }
+        };
+        
+        VkClearValue clearValues[2];
+        clearValues[0].color = {{0.1f, 0.1f, 0.1f, 1.0f}};
+        clearValues[1].depthStencil = {1.0f, 0};
+        renderPassInfo.clearValueCount = 2;
+        renderPassInfo.pClearValues = clearValues;
+        
+        vkCmdBeginRenderPass(cmd, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+        
+        // Render extracted geometry with culling
+        glm::mat4 viewProj = camera_.getProjectionMatrix(context_->getAspectRatio()) * 
+                            camera_.getViewMatrix();
+        system_->renderFrame(cmd, viewProj);
+        
+        // End render pass
+        vkCmdEndRenderPass(cmd);
+        
+        VK_CHECK(vkEndCommandBuffer(cmd));
+        
+        // Submit and present
+        context_->submitCommandBuffer(cmd);
+        context_->presentImage(imageIndex);
+        
+        // Print progress periodically
+        if (frameIndex_ % 60 == 0) {
+            float progress = system_->getExtractionProgress();
+            bool complete = system_->isExtractionComplete();
+            
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startTime_).count();
+            
+            std::cout << "[Frame " << frameIndex_ << "] "
+                     << "Time: " << elapsed << "s, "
+                     << "Extraction: " << (complete ? "COMPLETE" : std::to_string(int(progress * 100)) + "%")
+                     << std::endl;
+        }
+    }
+    
+    void handleInput() {
+        // Camera movement
+        if (context_->isKeyPressed(GLFW_KEY_W)) {
+            camera_.moveForward(0.1f);
+        }
+        if (context_->isKeyPressed(GLFW_KEY_S)) {
+            camera_.moveBackward(0.1f);
+        }
+        if (context_->isKeyPressed(GLFW_KEY_A)) {
+            camera_.moveLeft(0.1f);
+        }
+        if (context_->isKeyPressed(GLFW_KEY_D)) {
+            camera_.moveRight(0.1f);
+        }
+        
+        // Isovalue adjustment
+        if (context_->isKeyPressed(GLFW_KEY_UP)) {
+            currentIsoValue_ = std::min(255.0f, currentIsoValue_ + 1.0f);
+            isoValueChanged_ = true;
+        }
+        if (context_->isKeyPressed(GLFW_KEY_DOWN)) {
+            currentIsoValue_ = std::max(0.0f, currentIsoValue_ - 1.0f);
+            isoValueChanged_ = true;
+        }
+        
+        // Mouse look
+        double mouseX, mouseY;
+        context_->getCursorPos(&mouseX, &mouseY);
+        static double lastX = mouseX, lastY = mouseY;
+        
+        if (context_->isMouseButtonPressed(GLFW_MOUSE_BUTTON_RIGHT)) {
+            float deltaX = float(mouseX - lastX) * 0.002f;
+            float deltaY = float(mouseY - lastY) * 0.002f;
+            camera_.rotate(-deltaX, -deltaY);
+        }
+        
+        lastX = mouseX;
+        lastY = mouseY;
+    }
+    
+    void cleanup() {
+        if (context_) {
+            vkDeviceWaitIdle(context_->getDevice());
+        }
+    }
+};
+
+int main() {
+    try {
+        AutonomousDGCExample app;
+        app.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+    
+    return EXIT_SUCCESS;
+}

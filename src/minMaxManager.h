@@ -18,3 +18,12 @@
 // --- Modified Main Orchestrating Function ---
 // Returns a struct containing handles to persistent resources
 MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstants& pushConstants);
+
+// --- Streaming version for sparse atlas ---
+// Works with a single page in the sparse volume atlas
+MinMaxOutput computeStreamingMinMaxMip(VulkanContext &context, 
+                                      VkImageView volumeAtlasView,
+                                      VkSampler volumeSampler,
+                                      const Buffer& pageTableBuffer,
+                                      const PageCoord& pageCoord,
+                                      PushConstants& pushConstants);

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "blockFiltering.h"
 #include <fstream>
 
 /**
@@ -16,6 +15,13 @@
  * - Data layout is Z-major (slice by slice, row by row).
  * - Volume dimensions are hardcoded inside the function (INFLEXIBLE!).
  */
+
+ struct MinMaxResult {
+    uint32_t minVal;
+    uint32_t maxVal;
+};
+
+
 const int VOLUME_DIM_X = 256;
 const int VOLUME_DIM_Y = 256;
 const int VOLUME_DIM_Z = 256;
@@ -239,4 +245,146 @@ inline uint32_t computeActiveBlockCountCPU(const std::vector<MinMaxResult>& minM
     }
     std::cout << "CPU: Active block count calculation finished. Found: " << activeCount << std::endl;
     return activeCount;
+}
+
+// Test function to analyze min-max computation for a specific page
+inline void testStreamingMinMaxForPage(
+    const std::vector<uint8_t>& volumeData,
+    uint32_t volumeSizeX,
+    uint32_t volumeSizeY,
+    uint32_t volumeSizeZ,
+    uint32_t blockSize,
+    uint32_t pageX,
+    uint32_t pageY,
+    uint32_t pageZ,
+    uint32_t pageSizeX,
+    uint32_t pageSizeY,
+    uint32_t pageSizeZ,
+    float isovalue)
+{
+    std::cout << "\n=== Testing Streaming Min-Max for Page (" << pageX << "," << pageY << "," << pageZ << ") ===" << std::endl;
+    
+    // Calculate page boundaries in world coordinates
+    uint32_t pageStartX = pageX * pageSizeX;
+    uint32_t pageStartY = pageY * pageSizeY;
+    uint32_t pageStartZ = pageZ * pageSizeZ;
+    
+    // Calculate number of blocks in this page
+    uint32_t blocksPerPageX = pageSizeX / blockSize;
+    uint32_t blocksPerPageY = pageSizeY / blockSize;
+    uint32_t blocksPerPageZ = pageSizeZ / blockSize;
+    
+    std::cout << "Page starts at world (" << pageStartX << "," << pageStartY << "," << pageStartZ << ")" << std::endl;
+    std::cout << "Blocks per page: " << blocksPerPageX << "x" << blocksPerPageY << "x" << blocksPerPageZ << std::endl;
+    
+    uint32_t activeBlocksInPage = 0;
+    uint32_t blocksAffectedByBoundary = 0;
+    
+    // Process all blocks in this page
+    for (uint32_t bz = 0; bz < blocksPerPageZ; bz++) {
+        for (uint32_t by = 0; by < blocksPerPageY; by++) {
+            for (uint32_t bx = 0; bx < blocksPerPageX; bx++) {
+                // Calculate block's world coordinates
+                uint32_t blockWorldX = pageStartX + bx * blockSize;
+                uint32_t blockWorldY = pageStartY + by * blockSize;
+                uint32_t blockWorldZ = pageStartZ + bz * blockSize;
+                
+                // Compute min-max for this block
+                // The shader samples a 5x5x5 region for each 4x4x4 block
+                // This includes the block itself plus a 1-voxel halo
+                uint32_t minVal = 255;
+                uint32_t maxVal = 0;
+                uint32_t samplesFromOtherPages = 0;
+                uint32_t totalSamples = 0;
+                
+                // Also compute min-max if we only sampled from current page
+                uint32_t minValCurrentPageOnly = 255;
+                uint32_t maxValCurrentPageOnly = 0;
+                uint32_t samplesInCurrentPage = 0;
+                
+                // Sample the 5x5x5 region (block + 1 voxel halo)
+                for (uint32_t dz = 0; dz <= blockSize; dz++) {
+                    for (uint32_t dy = 0; dy <= blockSize; dy++) {
+                        for (uint32_t dx = 0; dx <= blockSize; dx++) {
+                            uint32_t worldX = blockWorldX + dx;
+                            uint32_t worldY = blockWorldY + dy;
+                            uint32_t worldZ = blockWorldZ + dz;
+                            
+                            // Check if out of volume bounds
+                            if (worldX >= volumeSizeX || worldY >= volumeSizeY || worldZ >= volumeSizeZ) {
+                                continue;
+                            }
+                            
+                            // Check which page this voxel belongs to
+                            uint32_t voxelPageX = worldX / pageSizeX;
+                            uint32_t voxelPageY = worldY / pageSizeY;
+                            uint32_t voxelPageZ = worldZ / pageSizeZ;
+                            
+                            // Sample the volume
+                            uint32_t idx = worldZ * volumeSizeY * volumeSizeX + worldY * volumeSizeX + worldX;
+                            uint32_t value = volumeData[idx];
+                            
+                            // Update global min-max
+                            minVal = std::min(minVal, value);
+                            maxVal = std::max(maxVal, value);
+                            totalSamples++;
+                            
+                            // Track if sample is from current page
+                            if (voxelPageX == pageX && voxelPageY == pageY && voxelPageZ == pageZ) {
+                                minValCurrentPageOnly = std::min(minValCurrentPageOnly, value);
+                                maxValCurrentPageOnly = std::max(maxValCurrentPageOnly, value);
+                                samplesInCurrentPage++;
+                            } else {
+                                samplesFromOtherPages++;
+                            }
+                        }
+                    }
+                }
+                
+                // Check if this block is active with correct min-max
+                bool isActiveCorrect = (minVal <= isovalue && maxVal >= isovalue);
+                
+                // Check if it would be active with page-only samples
+                bool isActivePageOnly = false;
+                if (samplesInCurrentPage > 0) {
+                    isActivePageOnly = (minValCurrentPageOnly <= isovalue && maxValCurrentPageOnly >= isovalue);
+                }
+                
+                // If the shader returns 0 for non-resident pages, simulate that
+                uint32_t minValShaderBehavior = minValCurrentPageOnly;
+                uint32_t maxValShaderBehavior = maxValCurrentPageOnly;
+                if (samplesFromOtherPages > 0 && samplesInCurrentPage > 0) {
+                    // Shader would return 0 for out-of-page samples, affecting min
+                    minValShaderBehavior = 0;
+                }
+                bool isActiveShaderBehavior = (minValShaderBehavior <= isovalue && maxValShaderBehavior >= isovalue);
+                
+                if (isActiveCorrect) {
+                    activeBlocksInPage++;
+                }
+                
+                if (samplesFromOtherPages > 0) {
+                    blocksAffectedByBoundary++;
+                    
+                    // Only print detailed info for blocks where the boundary matters
+                    if (isActiveCorrect != isActivePageOnly || isActiveCorrect != isActiveShaderBehavior) {
+                        std::cout << "\nBoundary Block (" << bx << "," << by << "," << bz << "):" << std::endl;
+                        std::cout << "  World pos: (" << blockWorldX << "," << blockWorldY << "," << blockWorldZ << ")" << std::endl;
+                        std::cout << "  Correct min/max: [" << minVal << ", " << maxVal << "] -> " 
+                                  << (isActiveCorrect ? "ACTIVE" : "inactive") << std::endl;
+                        std::cout << "  Page-only min/max: [" << minValCurrentPageOnly << ", " << maxValCurrentPageOnly << "] -> " 
+                                  << (isActivePageOnly ? "ACTIVE" : "inactive") << std::endl;
+                        std::cout << "  Shader behavior (0 for other pages): [" << minValShaderBehavior << ", " << maxValShaderBehavior << "] -> " 
+                                  << (isActiveShaderBehavior ? "ACTIVE" : "inactive") << std::endl;
+                        std::cout << "  Samples: " << samplesInCurrentPage << " in page, " << samplesFromOtherPages << " from other pages" << std::endl;
+                    }
+                }
+            }
+        }
+    }
+    
+    std::cout << "\nPage Summary:" << std::endl;
+    std::cout << "  Total blocks: " << (blocksPerPageX * blocksPerPageY * blocksPerPageZ) << std::endl;
+    std::cout << "  Active blocks (correct): " << activeBlocksInPage << std::endl;
+    std::cout << "  Blocks affected by page boundary: " << blocksAffectedByBoundary << std::endl;
 }

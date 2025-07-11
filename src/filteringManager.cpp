@@ -120,3 +120,111 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, MinMaxOutput &minMaxO
     // Move semantics will be used if FilteringOutput has a move constructor.
     return output;
 }
+
+// Streaming version that works with sparse atlas
+FilteringOutput filterStreamingActiveBlocks(VulkanContext &context, 
+                                          MinMaxOutput &minMaxOutput,
+                                          const Buffer& pageTableBuffer,
+                                          const PageCoord& pageCoord,
+                                          PushConstants& pushConstants) {
+    // Create filtering pass with both regular and streaming shaders
+    std::string regularFilterShaderPath = "/spirv/occupiedBlockPrefixSum.comp.spv";
+    std::string streamingFilterShaderPath = "/spirv/streamingOccupiedBlockPrefixSum.comp.spv";
+    ActiveBlockFilteringPass filteringPass(context, regularFilterShaderPath.c_str(), streamingFilterShaderPath.c_str());
+    
+    // Create output structure
+    FilteringOutput output{};
+    
+    // For a single page, calculate the number of blocks
+    uint32_t totalBlocks = pushConstants.blockGridDim.x * pushConstants.blockGridDim.y * pushConstants.blockGridDim.z;
+    VkDeviceSize compactedBufferSize = totalBlocks * sizeof(uint32_t);
+    
+    // Create output buffers
+    createBuffer(output.compactedBlockIdBuffer, context.getDevice(), context.getMemoryProperties(),
+                 compactedBufferSize,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    
+    VkDeviceSize countBufferSize = sizeof(uint32_t);
+    createBuffer(output.activeBlockCountBuffer, context.getDevice(), context.getMemoryProperties(),
+                 countBufferSize,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    
+    // Record command buffer
+    VkCommandBuffer cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
+    
+    // Clear the count buffer
+    vkCmdFillBuffer(cmd, output.activeBlockCountBuffer.buffer, 0, countBufferSize, 0);
+    
+    // Memory barrier after fill
+    VkBufferMemoryBarrier2 countInitBarrier = bufferBarrier(
+        output.activeBlockCountBuffer.buffer,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+        0, countBufferSize
+    );
+    pipelineBarrier(cmd, VK_DEPENDENCY_BY_REGION_BIT, 1, &countInitBarrier, 0, nullptr);
+    
+    // Create sampler for min-max texture
+    VkSampler sampler;
+    VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    sci.minLod = 0;
+    sci.maxLod = static_cast<float>(minMaxOutput.minMaxMipViews.size());
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.anisotropyEnable = VK_FALSE;
+    vkCreateSampler(context.getDevice(), &sci, nullptr, &sampler);
+    
+    // Use streaming dispatch with page table support
+    filteringPass.recordStreamingDispatch(cmd, minMaxOutput.minMaxImage.imageView, sampler,
+                                         pageTableBuffer,
+                                         output.compactedBlockIdBuffer, 
+                                         output.activeBlockCountBuffer, 
+                                         pushConstants,
+                                         pageCoord);
+    
+    // Memory barrier after filtering
+    VkBufferMemoryBarrier2 postFilterBarriers[2] = {
+        bufferBarrier(
+            output.compactedBlockIdBuffer.buffer,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+            0, compactedBufferSize
+        ),
+        bufferBarrier(
+            output.activeBlockCountBuffer.buffer,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+            0, countBufferSize
+        )
+    };
+    pipelineBarrier(cmd, VK_DEPENDENCY_BY_REGION_BIT, 2, postFilterBarriers, 0, nullptr);
+    
+    // Read back the active block count
+    Buffer countReadbackBuffer = {};
+    createBuffer(countReadbackBuffer, context.getDevice(), context.getMemoryProperties(),
+                 countBufferSize,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    
+    VkBufferCopy copyRegion = {0, 0, countBufferSize};
+    vkCmdCopyBuffer(cmd, output.activeBlockCountBuffer.buffer, countReadbackBuffer.buffer, 1, &copyRegion);
+    
+    endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
+    
+    // Get the active block count
+    uint32_t activeBlockCount = 0;
+    std::memcpy(&activeBlockCount, countReadbackBuffer.data, sizeof(uint32_t));
+    output.activeBlockCount = activeBlockCount;
+    
+    // std::cout << "Streaming filtering for page (" << pageCoord.x << "," << pageCoord.y << "," << pageCoord.z 
+    //           << "): " << activeBlockCount << " active blocks found" << std::endl;
+    
+    // Cleanup temporary resources
+    destroyBuffer(countReadbackBuffer, context.getDevice());
+    vkDestroySampler(context.getDevice(), sampler, nullptr);
+    
+    return output;
+}

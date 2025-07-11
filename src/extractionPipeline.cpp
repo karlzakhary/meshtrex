@@ -13,6 +13,8 @@ ExtractionPipeline::ExtractionPipeline(ExtractionPipeline&& other) noexcept :
     descriptorSetLayout_(other.descriptorSetLayout_),
     descriptorPool_(other.descriptorPool_),
     descriptorSet_(other.descriptorSet_),
+    isStreamingPipeline_(other.isStreamingPipeline_),
+    pageTableSetLayout_(other.pageTableSetLayout_),
     taskShader_(std::move(other.taskShader_)),
     meshShader_(std::move(other.meshShader_))
 {
@@ -23,6 +25,8 @@ ExtractionPipeline::ExtractionPipeline(ExtractionPipeline&& other) noexcept :
     other.descriptorSetLayout_ = VK_NULL_HANDLE;
     other.descriptorPool_ = VK_NULL_HANDLE;
     other.descriptorSet_ = VK_NULL_HANDLE;
+    other.isStreamingPipeline_ = false;
+    other.pageTableSetLayout_ = VK_NULL_HANDLE;
 }
 
 // Move Assignment Operator
@@ -38,6 +42,8 @@ ExtractionPipeline& ExtractionPipeline::operator=(ExtractionPipeline&& other) no
         descriptorSetLayout_ = other.descriptorSetLayout_;
         descriptorPool_ = other.descriptorPool_;
         descriptorSet_ = other.descriptorSet_;
+        isStreamingPipeline_ = other.isStreamingPipeline_;
+        pageTableSetLayout_ = other.pageTableSetLayout_;
         taskShader_ = std::move(other.taskShader_);
         meshShader_ = std::move(other.meshShader_);
 
@@ -48,6 +54,8 @@ ExtractionPipeline& ExtractionPipeline::operator=(ExtractionPipeline&& other) no
         other.descriptorSetLayout_ = VK_NULL_HANDLE;
         other.descriptorPool_ = VK_NULL_HANDLE;
         other.descriptorSet_ = VK_NULL_HANDLE;
+        other.isStreamingPipeline_ = false;
+        other.pageTableSetLayout_ = VK_NULL_HANDLE;
     }
     return *this;
 }
@@ -91,6 +99,12 @@ void ExtractionPipeline::releaseResources() {
     if (descriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, descriptorSetLayout_, nullptr);
         descriptorSetLayout_ = VK_NULL_HANDLE;
+    }
+    
+    // Clean up streaming page table layout if present
+    if (pageTableSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, pageTableSetLayout_, nullptr);
+        pageTableSetLayout_ = VK_NULL_HANDLE;
     }
 
     // Don't nullify device_ here as it might be owned elsewhere
@@ -323,10 +337,18 @@ void ExtractionPipeline::createExtractionGraphicsPipeline(VkFormat colorFormat,
 void ExtractionPipeline::createDescriptorPool()
 {
     std::vector<VkDescriptorPoolSize> poolSizes;
-    poolSizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1});  // UBO
-    poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});   // Volume
-    // Block count + IDs + MC Triangle Table + MC Number vertices + VB + VBC + IB + IBC + Meshlet Descriptor + Meshlet Descriptor Counter
-    poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10});
+    
+    if (isStreamingPipeline_) {
+        // For streaming pipeline: 1 storage image + 11 storage buffers
+        poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});   // Volume Atlas
+        poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11}); // Page table + all other buffers
+    } else {
+        // For regular pipeline
+        poolSizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1});  // UBO
+        poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});   // Volume
+        // Block count + IDs + MC Triangle Table + MC Number vertices + VB + VBC + IB + IBC + Meshlet Descriptor + Meshlet Descriptor Counter
+        poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10});
+    }
 
     VkDescriptorPoolCreateInfo poolInfo = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -376,4 +398,131 @@ bool ExtractionPipeline::setup(
     std::cout << "Extraction descriptor set allocated." << std::endl;
 
     return true;
+}
+
+// Overloaded setup with custom shader paths
+bool ExtractionPipeline::setup(
+    VkDevice device,
+    VkFormat colorFormat,
+    VkFormat depthFormat,
+    const char* taskShaderPath,
+    const char* meshShaderPath
+) {
+    // Prevent double setup without cleanup
+    if (device_ != VK_NULL_HANDLE) {
+        std::cerr << "ExtractionPipeline::setup called on an already initialized object. Call cleanup() first." << std::endl;
+        return false;
+    }
+    device_ = device;
+
+    // --- Load Shaders ---
+    assert(loadShader(taskShader_, device_, taskShaderPath));
+    assert(loadShader(meshShader_, device_, meshShaderPath));
+    std::cout << "Extraction shaders loaded from custom paths." << std::endl;
+
+    // Check if this is a streaming pipeline based on shader path
+    std::string taskPath(taskShaderPath);
+    isStreamingPipeline_ = (taskPath.find("streaming") != std::string::npos);
+    
+    if (isStreamingPipeline_) {
+        std::cout << "Creating streaming extraction pipeline with page table support." << std::endl;
+        createStreamingPipelineLayout();
+    } else {
+        createPipelineLayout();
+    }
+    
+    createExtractionGraphicsPipeline(colorFormat, depthFormat);
+    // --- Create Descriptor Pool & Allocate Set ---
+    createDescriptorPool();
+    allocateDescriptorSets();
+    std::cout << "Extraction descriptor set allocated." << std::endl;
+
+    return true;
+}
+
+void ExtractionPipeline::createStreamingPipelineLayout()
+{
+    // For streaming pipeline, we need to create a completely different layout
+    // that matches what the streaming shaders expect in set 0
+    
+    // Destroy the regular layout if it was created
+    if (descriptorSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, descriptorSetLayout_, nullptr);
+        descriptorSetLayout_ = VK_NULL_HANDLE;
+    }
+    if (pipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
+        pipelineLayout_ = VK_NULL_HANDLE;
+    }
+    
+    // Create descriptor set layout that matches streaming shaders
+    std::vector<VkDescriptorSetLayoutBinding> bindings(12);
+    
+    // Binding 0: Page Table (STORAGE_BUFFER) - This is what the shader expects!
+    bindings[0] = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };
+    
+    // Binding 1: Volume Atlas (STORAGE_IMAGE)
+    bindings[1] = {
+        .binding = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };
+    
+    // Binding 2: Active Block Count
+    bindings[2] = {
+        .binding = 2,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };
+    
+    // Binding 3: Active Block IDs
+    bindings[3] = {
+        .binding = 3,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+    };
+    
+    // Bindings 4-11: MC tables and output buffers (all storage buffers)
+    for (uint32_t i = 4; i < 12; i++) {
+        bindings[i] = {
+            .binding = i,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+        };
+    }
+    
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = static_cast<uint32_t>(bindings.size()),
+        .pBindings = bindings.data()
+    };
+    
+    VK_CHECK(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &descriptorSetLayout_));
+    
+    // Push constants for page coordinates and offsets
+    VkPushConstantRange pushConstantRange = {
+        .stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+        .offset = 0,
+        .size = sizeof(uint32_t) * 17  // pageCoord.xyz, mipLevel, isoValue(float), blockSize, pageSize.xyz, globalOffsets
+    };
+    
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,  // Only one descriptor set!
+        .pSetLayouts = &descriptorSetLayout_,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushConstantRange
+    };
+    
+    VK_CHECK(vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &pipelineLayout_));
+    std::cout << "Streaming extraction pipeline layout created with correct bindings." << std::endl;
 }

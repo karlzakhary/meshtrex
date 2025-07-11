@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 
 #include "config.h"
 
@@ -214,6 +215,22 @@ VkPhysicalDevice pickPhysicalDevice(VkPhysicalDevice *physicalDevices,
 VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
                       uint32_t familyIndex, bool meshShadingSupported)
 {
+    // First, enumerate supported device extensions
+    uint32_t extensionCount = 0;
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, nullptr);
+    std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, availableExtensions.data());
+    
+    // Helper to check if extension is available
+    auto isExtensionAvailable = [&](const char* extensionName) {
+        for (const auto& ext : availableExtensions) {
+            if (strcmp(ext.extensionName, extensionName) == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     float queuePriorities[] = {1.0f};
 
     VkDeviceQueueCreateInfo queueInfo = {
@@ -233,7 +250,17 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
 #endif
         VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
         VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+        VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME,
+        VK_NV_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME,
     };
+    
+    // Only add compute DGC extension if available
+    if (isExtensionAvailable(VK_NV_DEVICE_GENERATED_COMMANDS_COMPUTE_EXTENSION_NAME)) {
+        extensions.push_back(VK_NV_DEVICE_GENERATED_COMMANDS_COMPUTE_EXTENSION_NAME);
+        printf("VK_NV_device_generated_commands_compute extension is available\n");
+    } else {
+        printf("Warning: VK_NV_device_generated_commands_compute extension is not available\n");
+    }
 
     if (meshShadingSupported)
         extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
@@ -248,6 +275,8 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
     features.features.shaderInt64 = true;
     features.features.samplerAnisotropy = true;
     features.features.shaderStorageImageWriteWithoutFormat = true;
+    features.features.sparseBinding = true;
+    features.features.sparseResidencyImage3D = true;
 
     VkPhysicalDeviceVulkan11Features features11 = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
@@ -297,6 +326,10 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
     featuresSynchronization2.synchronization2 = true;
 
+    VkPhysicalDeviceDeviceGeneratedCommandsFeaturesNV featuresDGC = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_NV};
+    featuresDGC.deviceGeneratedCommands = true;
+
     VkDeviceCreateInfo createInfo = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     createInfo.queueCreateInfoCount = 1;
     createInfo.pQueueCreateInfos = &queueInfo;
@@ -321,6 +354,10 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
         *ppNext = &featuresMesh;
         ppNext = &featuresMesh.pNext;
     }
+
+    // Add DGC features to the chain
+    *ppNext = &featuresDGC;
+    ppNext = &featuresDGC.pNext;
 
     VkDevice device = nullptr;
     VK_CHECK(vkCreateDevice(physicalDevice, &createInfo, nullptr, &device));
