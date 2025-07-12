@@ -1,5 +1,13 @@
 #pragma once
 
+struct DGCSupport {
+    bool dgcSupported = false;
+    bool dgcComputeSupported = false;
+    VkPhysicalDeviceDeviceGeneratedCommandsFeaturesNV dgcFeatures = {};
+    VkPhysicalDeviceDeviceGeneratedCommandsPropertiesNV dgcProperties = {};
+};
+
+DGCSupport queryDGCSupport(VkPhysicalDevice device);
 VkInstance createInstance();
 VkDebugReportCallbackEXT registerDebugCallback(VkInstance instance);
 
