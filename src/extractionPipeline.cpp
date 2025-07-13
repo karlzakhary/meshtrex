@@ -325,7 +325,7 @@ void ExtractionPipeline::createDescriptorPool()
     std::vector<VkDescriptorPoolSize> poolSizes;
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1});  // UBO
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});   // Volume
-    // Block count + IDs + MC Triangle Table + MC Number vertices + VB + VBC + IB + IBC + Meshlet Descriptor + Meshlet Descriptor Counter
+    // Block count + IDs + MC Triangle Table + MC Edge Table + VB + VBC + IB + IBC + Meshlet Descriptor + Meshlet Descriptor Counter
     poolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10});
 
     VkDescriptorPoolCreateInfo poolInfo = {

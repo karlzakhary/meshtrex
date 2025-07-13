@@ -10,7 +10,7 @@
 struct FilteringOutput {
     Buffer compactedBlockIdBuffer{}; // Buffer containing IDs of active blocks
     Buffer activeBlockCountBuffer{}; // Buffer containing the count of active blocks (atomic counter)
-    uint32_t activeBlockCount = 0; // The actual count read back from the buffer
+    uint32_t activeBlockCount = 0; // DEPRECATED: For GPU-driven pipeline, this value is not read back from GPU
 
     // Add handles needed for destruction by the caller
     // If Image/Buffer structs don't store these, add them here.

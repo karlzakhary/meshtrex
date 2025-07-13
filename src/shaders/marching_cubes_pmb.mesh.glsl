@@ -365,6 +365,7 @@ void main ()
         vBase = atomicAdd(vCount.vertexCounter, shVertCount);
         iBase = atomicAdd(iCount.indexCounter,  shPrimCount * 3u);
     }
+    
     vBase = subgroupBroadcastFirst(vBase);
     iBase = subgroupBroadcastFirst(iBase);
 
@@ -374,12 +375,9 @@ void main ()
     for (uint k = gl_LocalInvocationIndex; k < shPrimCount * 3u; k += WORKGROUP_SIZE)
         indices.data[iBase + k] = shIdx[k] + vBase; // Add base offset to local indices
 
-    // --- 4. Write Meshlet Descriptor and dummy output ---
+    // --- 4. Write Meshlet Descriptor ---
     if (gl_LocalInvocationIndex == 0)
     {
-        // This assumes one block produces one meshlet, but the task shader can create more.
-        // This part needs to be handled carefully if a block can be split.
-        // For now, writing one descriptor per workgroup.
         uint desc_id = atomicAdd(meshletCount.meshletCounter, 1u);
         meshlets.descriptors[desc_id] = MeshletDescriptor(vBase, iBase, shVertCount, shPrimCount);
 

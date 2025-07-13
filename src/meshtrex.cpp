@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
         FilteringOutput filteringResult = filterActiveBlocks(context, minMaxOutput, pushConstants);
 
         std::cout << "Filtering complete. Received handles." << std::endl;
-        std::cout << "Active blocks: " << filteringResult.activeBlockCount << std::endl;
+        std::cout << "Active blocks: (count remains on GPU for GPU-driven pipeline)" << std::endl;
         try {
             ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants);
             writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");

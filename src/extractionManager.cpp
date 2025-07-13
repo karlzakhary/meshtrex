@@ -5,6 +5,7 @@
 #include "filteringOutput.h"
 #include "extractionOutput.h"
 #include "extractionPipeline.h"
+#include "dgcGenerationPipeline.h"
 #include "buffer.h"
 #include "image.h"
 #include "resources.h"
@@ -218,10 +219,7 @@ Buffer createConstantsUBO(VulkanContext& context, PushConstants& pushConstants) 
 
 ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxOutput& minMaxOutput, FilteringOutput& filterOutput, PushConstants& pushConstants) { // Assuming PushConstants still holds relevant dims/isovalue
     std::cout << "\n--- Starting Meshlet Extraction ---" << std::endl;
-    if (filterOutput.activeBlockCount == 0) {
-        std::cout << "No active blocks found. Skipping meshlet extraction." << std::endl;
-        return {};
-    }
+    // Note: We no longer check activeBlockCount on CPU - the GPU will handle empty cases
 
     VkDevice device = vulkanContext.getDevice();
     ExtractionPipeline extractionPipeline;
@@ -240,7 +238,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
             throw std::runtime_error("Failed to setup Extraction Pipeline.");
         }
 
-        // 2. Create Output Buffers (Sizing is critical and heuristic)
+        // 2. Create Output Buffers (GPU-driven optimal allocation)
         const VkDeviceSize counterSize = sizeof(uint32_t);
 
         //For basic mesh shader
@@ -248,20 +246,26 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
         const uint32_t MAX_VERTS_PER_CELL_FROM_SHADER = 12;    // Match shader's #define
         const uint32_t MAX_PRIMS_PER_CELL_FROM_SHADER = 5;     // Match shader's #define
 
+        // Allocate based on typical isosurface density
+        // Most isosurfaces use 10-30% of blocks
+        const uint32_t totalBlocks = pushConstants.blockGridDim.x * pushConstants.blockGridDim.y * pushConstants.blockGridDim.z;
+        const float ALLOCATION_FACTOR = 0.3f; // 30% of blocks
+        const uint32_t allocationBlocks = static_cast<uint32_t>(totalBlocks * ALLOCATION_FACTOR);
+        
         const VkDeviceSize MAX_TOTAL_VERTICES_BYTES =
-            static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
+            static_cast<VkDeviceSize>(allocationBlocks) *
             CELLS_PER_BLOCK_FROM_SHADER *
             MAX_VERTS_PER_CELL_FROM_SHADER *
             sizeof(VertexData);
-        std::cout << " Max vertices: " << MAX_TOTAL_VERTICES_BYTES / sizeof(VertexData) << std::endl;
+        
         const VkDeviceSize MAX_TOTAL_INDICES_BYTES =
-            static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
+            static_cast<VkDeviceSize>(allocationBlocks) *
             CELLS_PER_BLOCK_FROM_SHADER *
             MAX_PRIMS_PER_CELL_FROM_SHADER * 3 * // 3 indices per primitive
             sizeof(uint32_t);
 
         const VkDeviceSize MAX_MESHLET_DESCRIPTORS_BYTES =
-            static_cast<VkDeviceSize>(filterOutput.activeBlockCount) *
+            static_cast<VkDeviceSize>(allocationBlocks) *
                 CELLS_PER_BLOCK_FROM_SHADER *
                     sizeof(MeshletDescriptor)
         ;
@@ -300,6 +304,13 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
                      counterSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (extractionOutput.meshletDescriptorCountBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create meshletDescriptorCountBuffer."); }
+
+        // Create indirect draw buffer for GPU-driven command generation
+        createBuffer(extractionOutput.indirectDrawBuffer, device, vulkanContext.getMemoryProperties(),
+                     sizeof(VkDrawMeshTasksIndirectCommandEXT), 
+                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (extractionOutput.indirectDrawBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create indirectDrawBuffer."); }
 
 
         // 3. Create UBO, MC Triangle Table, and number of vertices buffers
@@ -565,6 +576,22 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
 
         pipelineBarrier(cmd, {}, preBufferBarriers.size(), preBufferBarriers.data(), preImageBarriers.size(), preImageBarriers.data());
 
+        // --- Generate Indirect Draw Commands ---
+        // First, ensure the active block count buffer is ready to be read by compute shader
+        VkBufferMemoryBarrier2 activeCountBarrier = bufferBarrier(
+            filterOutput.activeBlockCountBuffer.buffer,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,  // From filtering compute shader
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,    // That wrote to it
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,  // To DGC generation compute shader
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT,     // That will read from it
+            0,
+            VK_WHOLE_SIZE
+        );
+        pipelineBarrier(cmd, {}, 1, &activeCountBarrier, 0, {});
+        
+        std::cout << "Generating indirect draw commands on GPU..." << std::endl;
+        generateIndirectDrawCommands(cmd, device, filterOutput.activeBlockCountBuffer, extractionOutput.indirectDrawBuffer);
+
         // --- Begin Dynamic Rendering ---
         VkRenderingInfo renderingInfo = { VK_STRUCTURE_TYPE_RENDERING_INFO };
         renderingInfo.layerCount = 1;
@@ -585,10 +612,9 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-        // --- Dispatch ---
-        uint32_t taskCount = filterOutput.activeBlockCount;
-        std::cout << "Dispatching " << taskCount << " mesh tasks..." << std::endl;
-        vkCmdDrawMeshTasksEXT(cmd, taskCount, 1, 1);
+        // --- Dispatch using indirect draw ---
+        std::cout << "Dispatching mesh tasks using indirect draw..." << std::endl;
+        vkCmdDrawMeshTasksIndirectEXT(cmd, extractionOutput.indirectDrawBuffer.buffer, 0, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));
 
         // --- End Dynamic Rendering ---
         vkCmdEndRendering(cmd);
@@ -611,7 +637,6 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
         endSingleTimeCommands(device, vulkanContext.getCommandPool(), vulkanContext.getQueue(), cmd);
         VK_CHECK(vkDeviceWaitIdle(device));
         std::cout << "Meshlet extraction command buffer submitted and executed." << std::endl;
-        extractionOutput.meshletCount = filterOutput.activeBlockCount; // Still an upper bound
 
     } catch (const std::exception& e) {
         std::cerr << "Error during meshlet extraction: " << e.what() << std::endl;

@@ -90,26 +90,18 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, MinMaxOutput &minMaxO
 
     // --- End and Submit Command Buffer ---
     endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
-    VK_CHECK(vkDeviceWaitIdle(context.getDevice()));
     std::cout << "Compute passes finished." << std::endl;
 
-    // --- Read back the active block count (into output struct) ---
-    createBuffer(countReadbackBuffer, context.getDevice(), context.getMemoryProperties(), countBufferSize,
-                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkCommandBuffer copyCmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
-    VkBufferCopy region = {0, 0, countBufferSize};
-    vkCmdCopyBuffer(copyCmd, output.activeBlockCountBuffer.buffer, countReadbackBuffer.buffer, 1, &region);
-    endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), copyCmd);
-    VK_CHECK(vkDeviceWaitIdle(context.getDevice()));
-    memcpy(&output.activeBlockCount, countReadbackBuffer.data, sizeof(uint32_t));
-    std::cout << "Occupied Block Filtering finished. Active blocks found: " << output.activeBlockCount << std::endl;
-
-    // (Optional) Test the compacted buffer content using the handle from the output struct
-    testCompactBuffer(context, output.compactedBlockIdBuffer, output.activeBlockCount);
+    // --- GPU-driven pipeline: No CPU readback needed ---
+    // The active block count remains on GPU and will be used by subsequent GPU passes
+    output.activeBlockCount = 0; // Set to 0 as we don't know the actual value on CPU
+    std::cout << "Occupied Block Filtering finished. Active block count remains on GPU." << std::endl;
+    
+    // Note: Testing would require CPU readback, so we skip it in GPU-driven mode
+    // testCompactBuffer(context, output.compactedBlockIdBuffer, output.activeBlockCount);
 
     // --- Cleanup Only Temporary Resources ---
-    destroyBuffer(countReadbackBuffer, context.getDevice());
+    // countReadbackBuffer no longer created/used
     destroyBuffer(stagingBuffer, context.getDevice());
     vkDestroySampler(context.getDevice(), sampler, nullptr);
     // The Pass objects (minMaxPass, filteringPass) will be destroyed automatically
