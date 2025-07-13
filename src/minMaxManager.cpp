@@ -70,7 +70,6 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
     // --- Prepare Resources (some persistent, some temporary) ---
     MinMaxOutput output{}; // Create the output struct to hold persistent resources
     Buffer stagingBuffer = {}; // Temporary for upload
-    Buffer countReadbackBuffer = {}; // Temporary for readback
 
     // Create MinMax output image (persistent)
     auto mipExtent = [](VkExtent3D e, uint32_t level) {
@@ -177,7 +176,6 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
     VK_CHECK(vkDeviceWaitIdle(context.getDevice()));
 
     // --- Cleanup Only Temporary Resources ---
-    destroyBuffer(countReadbackBuffer, context.getDevice());
     destroyBuffer(stagingBuffer, context.getDevice());
 
     return output;

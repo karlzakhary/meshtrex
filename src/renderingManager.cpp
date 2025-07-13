@@ -1,10 +1,12 @@
 #include <iostream>
 
+#include "common.h"
 #include "extractionOutput.h"
 #include "extractionPipeline.h"
 #include "minMaxOutput.h"
 #include "filteringOutput.h"
 #include "renderingPipeline.h"
+#include "dgcRenderingPipeline.h"
 #include "resources.h"
 
 // Updates descriptors for Pipeline 2 (Extraction)
@@ -51,12 +53,11 @@ void updateExtractionDescriptors(
 void recordExtractionDispatch(
     VkCommandBuffer commandBuffer,
     ExtractionPipeline& extractionPipelineState,
-    const FilteringOutput& filteringResult
-    // Add dynamic rendering info params similar to recordRenderingCommands if needed,
-    // or begin/end rendering outside this specific function call.
-    // VkExtent2D dummyExtent, VkImageView dummyView, VkImageLayout dummyLayout
+    const FilteringOutput& filteringResult,
+    const Buffer& indirectDrawBuffer  // Add indirect draw buffer parameter
 ) {
-     if (extractionPipelineState.pipeline_ == VK_NULL_HANDLE || filteringResult.activeBlockCount == 0) return;
+     if (extractionPipelineState.pipeline_ == VK_NULL_HANDLE) return;
+     // Note: We no longer check activeBlockCount on CPU - GPU handles empty cases via indirect draw
 
     // Need to be inside vkCmdBegin/EndRendering for vkCmdDrawMeshTasks...
 
@@ -64,9 +65,8 @@ void recordExtractionDispatch(
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, extractionPipelineState.pipeline_);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, extractionPipelineState.pipelineLayout_, 0, 1, &extractionPipelineState.descriptorSet_, 0, nullptr);
 
-    // Dispatch Task shaders - one workgroup per active block
-    uint32_t numActiveBlocks = filteringResult.activeBlockCount;
-    vkCmdDrawMeshTasksEXT(commandBuffer, numActiveBlocks, 1, 1);
+    // Use indirect draw for GPU-driven dispatch
+    vkCmdDrawMeshTasksIndirectEXT(commandBuffer, indirectDrawBuffer.buffer, 0, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));
 }
 
 // Updates descriptors for Pipeline 3 (Rendering)
@@ -111,6 +111,7 @@ void updateRenderingDescriptors(
 // Records commands for Pipeline 3 (Rendering) - Runs every frame
 void recordRenderingCommands(
     VkCommandBuffer commandBuffer,
+    VkDevice device,
     RenderingPipeline& renderingPipelineState,
     const ExtractionOutput& extractionOutput, // Input: Geometry buffers
     VkExtent2D swapchainExtent,
@@ -119,22 +120,81 @@ void recordRenderingCommands(
     VkImageLayout colorAttachmentLayout,
     VkImageLayout depthAttachmentLayout
 ) {
-     if (renderingPipelineState.pipeline_ == VK_NULL_HANDLE || extractionOutput.indexBuffer.buffer == VK_NULL_HANDLE) return; // Check if geometry exists
+    // Validate pipeline
+    if (renderingPipelineState.pipeline_ == VK_NULL_HANDLE) {
+        std::cerr << "Warning: Rendering pipeline not initialized" << std::endl;
+        return;
+    }
+    
+    // Check if we have geometry to render
+    if (extractionOutput.meshletDescriptorBuffer.buffer == VK_NULL_HANDLE ||
+        extractionOutput.meshletDescriptorCountBuffer.buffer == VK_NULL_HANDLE ||
+        extractionOutput.vertexBuffer.buffer == VK_NULL_HANDLE ||
+        extractionOutput.indexBuffer.buffer == VK_NULL_HANDLE ||
+        extractionOutput.renderingIndirectDrawBuffer.buffer == VK_NULL_HANDLE) {
+        // No geometry extracted yet, skip rendering
+        return;
+    }
 
+    // --- Generate indirect draw commands for rendering ---
+    // This must happen BEFORE vkCmdBeginRendering
+    
+    // Ensure meshlet count buffer is ready for compute shader
+    VkBufferMemoryBarrier2 meshletCountBarrier = bufferBarrier(
+        extractionOutput.meshletDescriptorCountBuffer.buffer,
+        VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT,  // From extraction mesh shader
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,     // That wrote to it
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,   // To DGC generation compute shader
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT,      // That will read from it
+        0,
+        VK_WHOLE_SIZE
+    );
+    pipelineBarrier(commandBuffer, {}, 1, &meshletCountBarrier, 0, {});
+    
+    // Generate indirect draw commands based on meshlet count
+    const uint32_t taskWorkgroupSize = 32; // Task shader processes 32 meshlets per workgroup
+    generateRenderingIndirectCommands(commandBuffer, device,
+                                    extractionOutput.meshletDescriptorCountBuffer,
+                                    extractionOutput.renderingIndirectDrawBuffer,
+                                    taskWorkgroupSize);
+    
+    // Ensure indirect commands are written before being consumed
+    VkBufferMemoryBarrier2 indirectBarrier = bufferBarrier(
+        extractionOutput.renderingIndirectDrawBuffer.buffer,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+        VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+        0,
+        VK_WHOLE_SIZE
+    );
+    pipelineBarrier(commandBuffer, {}, 1, &indirectBarrier, 0, {});
+    
     // --- Begin Dynamic Rendering ---
     VkRenderingAttachmentInfo colorAttachmentInfo = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-    // ... populate colorAttachmentInfo ...
-    colorAttachmentInfo.imageView = colorAttachmentView; colorAttachmentInfo.imageLayout = colorAttachmentLayout; colorAttachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; colorAttachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE; colorAttachmentInfo.clearValue.color = {{0.1f, 0.1f, 0.1f, 1.0f}};
+    colorAttachmentInfo.imageView = colorAttachmentView;
+    colorAttachmentInfo.imageLayout = colorAttachmentLayout;
+    colorAttachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachmentInfo.clearValue.color = {{0.1f, 0.1f, 0.1f, 1.0f}};
+    
     VkRenderingAttachmentInfo depthAttachmentInfo = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-    // ... populate depthAttachmentInfo ...
-    depthAttachmentInfo.imageView = depthAttachmentView; depthAttachmentInfo.imageLayout = depthAttachmentLayout; depthAttachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; depthAttachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE; depthAttachmentInfo.clearValue.depthStencil = {1.0f, 0};
+    depthAttachmentInfo.imageView = depthAttachmentView;
+    depthAttachmentInfo.imageLayout = depthAttachmentLayout;
+    depthAttachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAttachmentInfo.clearValue.depthStencil = {1.0f, 0};
+    
     VkRenderingInfo renderingInfo = { VK_STRUCTURE_TYPE_RENDERING_INFO };
-    // ... populate renderingInfo ...
-    renderingInfo.renderArea = {{0, 0}, swapchainExtent}; renderingInfo.layerCount = 1; renderingInfo.colorAttachmentCount = 1; renderingInfo.pColorAttachments = &colorAttachmentInfo; renderingInfo.pDepthAttachment = &depthAttachmentInfo;
+    renderingInfo.renderArea = {{0, 0}, swapchainExtent};
+    renderingInfo.layerCount = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments = &colorAttachmentInfo;
+    renderingInfo.pDepthAttachment = &depthAttachmentInfo;
 
     vkCmdBeginRendering(commandBuffer, &renderingInfo);
 
-    // --- Bind Pipeline 3 and its descriptors ---
+    // --- Bind Pipeline and descriptors ---
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderingPipelineState.pipeline_);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderingPipelineState.pipelineLayout_, 0, 1, &renderingPipelineState.descriptorSet_, 0, nullptr);
 
@@ -143,27 +203,13 @@ void recordRenderingCommands(
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     VkRect2D scissor = {{0, 0}, swapchainExtent};
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-
-    // --- Issue Draw Call using Mesh Tasks ---
-    // Calculate number of task workgroups needed. Often based on total meshlets / workgroup size.
-    // The Task shader itself will then select individual meshlets based on the descriptor buffer.
-    // Example: Launch enough groups to cover all meshlets, assuming task shader handles 1 meshlet per invocation (adjust as needed)
-    uint32_t taskWorkgroupSize = 32; // Or query subgroup size / typical warp size
-    uint32_t numTaskWorkgroups = (extractionOutput.meshletCount + taskWorkgroupSize - 1) / taskWorkgroupSize;
-
-    if (numTaskWorkgroups > 0) {
-        // Ensure vkCmdDrawMeshTasksEXT function pointer is loaded!
-        vkCmdDrawMeshTasksEXT(commandBuffer, numTaskWorkgroups, 1, 1);
-
-        // --- OR --- Use Indirect Mesh Draw if Pipeline 2 generated indirectMeshDrawBuffer
-        // if (extractionOutput.indirectMeshDrawBuffer.buffer != VK_NULL_HANDLE) {
-        //    vkCmdDrawMeshTasksIndirectEXT(commandBuffer,
-        //                                  extractionOutput.indirectMeshDrawBuffer.buffer,
-        //                                  0, // offset
-        //                                  extractionOutput.drawCommandCount, // draw count (often 1)
-        //                                  sizeof(VkDrawMeshTasksIndirectCommandEXT)); // stride
-        //}
-    }
+    
+    // Issue indirect draw call using GPU-generated commands
+    vkCmdDrawMeshTasksIndirectEXT(commandBuffer,
+                                  extractionOutput.renderingIndirectDrawBuffer.buffer,
+                                  0, // offset
+                                  1, // draw count
+                                  sizeof(VkDrawMeshTasksIndirectCommandEXT)); // stride
 
     // --- End Dynamic Rendering ---
     vkCmdEndRendering(commandBuffer);

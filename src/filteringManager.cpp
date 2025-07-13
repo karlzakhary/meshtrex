@@ -24,8 +24,6 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, MinMaxOutput &minMaxO
 
     // --- Prepare Resources (some persistent, some temporary) ---
     FilteringOutput output{}; // Create the output struct to hold persistent resources
-    Buffer stagingBuffer = {}; // Temporary for upload
-    Buffer countReadbackBuffer = {}; // Temporary for readback
 
     // Create persistent resources directly in the output struct
     // (Assumes Image/Buffer default constructors initialize handles to VK_NULL_HANDLE or similar)
@@ -101,8 +99,7 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, MinMaxOutput &minMaxO
     // testCompactBuffer(context, output.compactedBlockIdBuffer, output.activeBlockCount);
 
     // --- Cleanup Only Temporary Resources ---
-    // countReadbackBuffer no longer created/used
-    destroyBuffer(stagingBuffer, context.getDevice());
+    // countReadbackBuffer and stagingBuffer were declared but never created, so don't destroy them
     vkDestroySampler(context.getDevice(), sampler, nullptr);
     // The Pass objects (minMaxPass, filteringPass) will be destroyed automatically
     // when they go out of scope, cleaning up their internal pipelines/layouts.

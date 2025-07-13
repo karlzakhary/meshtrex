@@ -229,7 +229,6 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
     Buffer constantsUBO = {};
     Buffer mcTriTableBuffer = {};
     Buffer mcEdgeTableBuffer = {};
-    Buffer mcNumVerticesBuffer = {};
 
     try {
         // 1. Setup Extraction Pipeline State
@@ -311,6 +310,13 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (extractionOutput.indirectDrawBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create indirectDrawBuffer."); }
+        
+        // Create rendering indirect draw buffer for GPU-driven rendering dispatch
+        createBuffer(extractionOutput.renderingIndirectDrawBuffer, device, vulkanContext.getMemoryProperties(),
+                     sizeof(VkDrawMeshTasksIndirectCommandEXT), 
+                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (extractionOutput.renderingIndirectDrawBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create renderingIndirectDrawBuffer."); }
 
 
         // 3. Create UBO, MC Triangle Table, and number of vertices buffers

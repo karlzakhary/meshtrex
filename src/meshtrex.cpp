@@ -1,5 +1,6 @@
 #include <fstream>    // For file operations
 #include <iostream>
+#include <chrono>
 
 #ifndef __APPLE__
 #include <cstdint>
@@ -9,6 +10,7 @@
 #include "minMaxManager.h"
 #include "filteringManager.h"
 #include "extractionManager.h"
+#include "renderingFramework.h"
 #include "blockFilteringTestUtils.h"
 #include "extractionTestUtils.h"
 #include <dlfcn.h>
@@ -49,8 +51,6 @@ std::vector<uint8_t> generateSphereVolume(int width, int height, int depth) {
     return data;
 }
 
-// Use with isovalue = 128
-
 int main(int argc, char** argv) {
     try {
         std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/bonsai_256x256x256_uint8.raw");
@@ -59,25 +59,38 @@ int main(int argc, char** argv) {
 #ifndef __APPLE__
         requestMeshShading = true;
 #endif
-        // For Linux, use dlopen() and dlsym()
+        
+        // Check for command line arguments
+        if (argc > 1) {
+            volumePath = argv[1];
+        }
+        if (argc > 2) {
+            isovalue = std::stof(argv[2]);
+        }
+        
+        // RenderDoc integration
         void *mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
         if (mod) {
             pRENDERDOC_GetAPI RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)dlsym(mod, "RENDERDOC_GetAPI");
             int ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_1_2, (void **)&rdoc_api);
             assert(ret == 1);
         }
+        
+        // Initialize Vulkan context
         VulkanContext context(requestMeshShading);
-        std::cout << "Vulkan context initialized for filtering." << std::endl;
+        std::cout << "Vulkan context initialized." << std::endl;
 
+        // Load volume data
         Volume volume = loadVolume(volumePath.c_str());
+        // Alternative: Generate procedural sphere
         // Volume volume {glm::vec3(64,64,64), "uint_8", generateSphereVolume(64,64,64)};
-        std::cout << "Volume " << volumePath.c_str() << " is loaded.";
-        std::cout << "--- Debug: Printing C++ volume data values > 41 for cell (0,0,0) of block (0,0,0) ---" << std::endl;
-        // for (int i = 0; i < 1000 ; i++) {
-        //     std::cout << "CPU Vol: " << static_cast<unsigned int>(volume.volume_data[i]) << "\n" <<std::endl;
-        // }
-        std::cout << "--- End Debug: C++ specific volume data print ---" << std::endl;
-        // --- End of debug print section --
+        
+        std::cout << "Volume loaded: " << volumePath << std::endl;
+        std::cout << "Volume dimensions: " << volume.volume_dims.x << "x" 
+                  << volume.volume_dims.y << "x" << volume.volume_dims.z << std::endl;
+        std::cout << "Isovalue: " << isovalue << std::endl;
+        
+        // Setup push constants
         PushConstants pushConstants = {};
         pushConstants.volumeDim = glm::uvec4(volume.volume_dims, 1);
         pushConstants.blockDim = glm::uvec4(4, 4, 4, 1);
@@ -88,69 +101,79 @@ int main(int argc, char** argv) {
             1);
         pushConstants.isovalue = isovalue;
 
-        std::cout << "Loaded volume dims: ("
-                  << pushConstants.volumeDim.x << "x" << pushConstants.volumeDim.y << "x" << pushConstants.volumeDim.z << ")" << std::endl;
-        std::cout << "Block grid: " << pushConstants.blockGridDim.x << "x" << pushConstants.blockGridDim.y << "x" << pushConstants.blockGridDim.z << std::endl;
+        std::cout << "Block grid: " << pushConstants.blockGridDim.x << "x" 
+                  << pushConstants.blockGridDim.y << "x" << pushConstants.blockGridDim.z << std::endl;
 
+        // --- Marching Cubes Pipeline ---
+        std::cout << "\n--- Starting Marching Cubes Pipeline ---" << std::endl;
+        
+        // 1. Min-Max Octree Construction
+        auto startTime = std::chrono::high_resolution_clock::now();
         MinMaxOutput minMaxOutput = computeMinMaxMip(context, volume, pushConstants);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        std::cout << "Min-Max octree computed in " 
+                  << std::chrono::duration<float, std::milli>(endTime - startTime).count() 
+                  << " ms" << std::endl;
+        
+        // 2. Active Block Filtering
+        startTime = std::chrono::high_resolution_clock::now();
         FilteringOutput filteringResult = filterActiveBlocks(context, minMaxOutput, pushConstants);
-
-        std::cout << "Filtering complete. Received handles." << std::endl;
-        std::cout << "Active blocks: (count remains on GPU for GPU-driven pipeline)" << std::endl;
-        try {
-            ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants);
-            writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");
-        } catch (std::exception& e) {
-            std::cout << e.what() << std::endl;
+        endTime = std::chrono::high_resolution_clock::now();
+        std::cout << "Active blocks filtered in " 
+                  << std::chrono::duration<float, std::milli>(endTime - startTime).count() 
+                  << " ms" << std::endl;
+        
+        // 3. Mesh Extraction
+        startTime = std::chrono::high_resolution_clock::now();
+        ExtractionOutput extractionResult = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants);
+        endTime = std::chrono::high_resolution_clock::now();
+        std::cout << "Mesh extracted in " 
+                  << std::chrono::duration<float, std::milli>(endTime - startTime).count() 
+                  << " ms" << std::endl;
+        
+        // Optional: Write to OBJ file for debugging
+        // writeGPUExtractionToOBJ(context, extractionResult, "/tmp/meshtrex_output.obj");
+        
+        // --- Create Rendering Framework ---
+        std::cout << "\n--- Starting Rendering ---" << std::endl;
+        RenderingFramework renderer(context, 1280, 720);
+        
+        // Main rendering loop
+        double lastTime = glfwGetTime();
+        int frameCount = 0;
+        
+        while (!renderer.shouldClose()) {
+            // Calculate FPS
+            double currentTime = glfwGetTime();
+            frameCount++;
+            if (currentTime - lastTime >= 1.0) {
+                std::cout << "FPS: " << frameCount << std::endl;
+                frameCount = 0;
+                lastTime = currentTime;
+            }
+            
+            // Handle input
+            glfwPollEvents();
+            renderer.processInput();
+            
+            // Render frame
+            renderer.renderFrame(extractionResult);
         }
-
-
-        // CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
-        try {
-            // CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
-        } catch (std::exception& e) {
-            std::cout << e.what() << std::endl;
-        }
-
-        // Perform the comparison
-        // bool match = compareExtractionOutputs(context, extractionResultGPU, {});
-
-        // if (match) {
-        //     std::cout << "Verification Passed!" << std::endl;
-        // } else {
-        //     std::cout << "Verification Failed!" << std::endl;
-        // }
-        // --- Now use the results in the next stage ---
-        // Example: Setting up descriptors for a task/mesh shader
-        // VkDescriptorBufferInfo activeBlockCountInfo = { filteringResult.activeBlockCountBuffer.buffer, 0, VK_WHOLE_SIZE };
-        // VkDescriptorBufferInfo compactedBlockIdInfo = { filteringResult.compactedBlockIdBuffer.buffer, 0, VK_WHOLE_SIZE };
-        // VkDescriptorImageInfo volumeTextureInfo = { VK_NULL_HANDLE, filteringResult.volumeImage.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL }; // Assuming layout is transitioned
-
-        // ... bind these descriptors ...
-        // ... record task/mesh shader dispatch ...
-
-        // --- EVENTUALLY, when these resources are no longer needed ---
-        // (e.g., end of frame, shutdown)
-        // The caller MUST clean up the resources contained in filteringResult.
-        // It needs access to the VkDevice (and VmaAllocator if used).
-        // Get the device handle (e.g., from a global context or stored separately)
-        // VkDevice device = get_my_vulkan_device();
-
-        std::cout << "Cleaning up filtering resources..." << std::endl;
+        
+        // Wait for GPU to finish before cleanup
+        renderer.waitIdle();
+        
+        // Cleanup resources
+        std::cout << "\nCleaning up resources..." << std::endl;
         filteringResult.cleanup(context.getDevice());
         minMaxOutput.cleanup(context.getDevice());
-        // Assuming destroyImage/destroyBuffer take VkDevice:
-        // destroyImage(filteringResult.volumeImage, device);
-        // destroyImage(filteringResult.minMaxImage, device); // Destroy if created/returned
-        // destroyBuffer(filteringResult.compactedBlockIdBuffer, device);
-        // destroyBuffer(filteringResult.activeBlockCountBuffer, device);
-        // Or, if FilteringOutput has a cleanup method:
-        // filteringResult.cleanup(device);
-
+        // extractionResult cleanup is handled by its destructor
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
+    
+    std::cout << "MeshTrex completed successfully!" << std::endl;
     return 0;
 }
