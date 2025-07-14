@@ -15,7 +15,7 @@ inline VkCommandPool createCommandPool(VkDevice device, uint32_t familyIndex)
 {
     VkCommandPoolCreateInfo createInfo = {
         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    createInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    createInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     createInfo.queueFamilyIndex = familyIndex;
 
     VkCommandPool commandPool = 0;
@@ -46,7 +46,7 @@ inline VkQueryPool createQueryPool(VkDevice device, uint32_t queryCount,
 inline VkFence createFence(VkDevice device)
 {
     VkFenceCreateInfo createInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-
+    createInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     VkFence fence = nullptr;
     VK_CHECK(vkCreateFence(device, &createInfo, 0, &fence));
 

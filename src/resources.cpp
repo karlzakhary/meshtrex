@@ -42,7 +42,7 @@ VkImageMemoryBarrier2 imageBarrier(
     result.subresourceRange.aspectMask = aspectMask;
     result.subresourceRange.baseMipLevel = baseMipLevel;
     result.subresourceRange.levelCount = levelCount;
-    result.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+    result.subresourceRange.layerCount = 1;
 
     return result;
 }

@@ -33,11 +33,11 @@ struct alignas(16) PushConstants {
     float isovalue;           // Offset 48, Size 4.
 };
 
-struct SceneUniforms { // Data changing per frame (usually)
+struct alignas(16) SceneUniforms {
     glm::mat4 viewProjectionMatrix;
-    glm::mat4 modelMatrix; // Or pass via push constants if it changes per object
-    glm::vec3 cameraPos_world;
-    // Add other frequently changing params if any
+    glm::vec3 cameraPos;
+    float padding; // Ensure alignment
+    glm::vec4 lightPos;
 };
 
 struct LightingUniforms { // Data changing less frequently

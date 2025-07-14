@@ -16,12 +16,13 @@ public:
     RenderingPipeline(RenderingPipeline&& other) noexcept;
     RenderingPipeline& operator=(RenderingPipeline&& other) noexcept;
 
-    // Setup: Takes VS/FS shaders and vertex input layout
+    // Setup: Takes shaders and rendering formats
     bool setup(
         VkDevice device,
         VkFormat colorFormat,
         VkFormat depthFormat,
-        VkSampleCountFlagBits msaaSamples
+        VkSampleCountFlagBits msaaSamples,
+        uint32_t maxFramesInFlight
     );
 
     void cleanup();
@@ -32,14 +33,16 @@ public:
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> descriptorSets_;
 
 private:
-    // Vertex and Fragment shaders
+    // Task, Mesh, and Fragment shaders
     Shader taskShader_{};
     Shader meshShader_{};
     Shader fragmentShader_{};
 
     void releaseResources();
     void createPipelineLayout();
+    void createGraphicsPipeline(VkFormat colorFormat, VkFormat depthFormat, VkSampleCountFlagBits msaaSamples);
+    void createDescriptorPoolAndSets(uint32_t maxFramesInFlight);
 };

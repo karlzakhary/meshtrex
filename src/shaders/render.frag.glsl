@@ -1,56 +1,43 @@
-#version 460 core
+#version 450
 #extension GL_ARB_separate_shader_objects : enable
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
 
-layout(location = 0) in vec3 inNormal_world;
-layout(location = 1) in vec3 inPosition_world;
-// Add other inputs from vertex shader
+// Input from the mesh shader (interpolated by the rasterizer)
+layout(location = 0) in PerVertexData {
+    vec3 normal;
+    vec3 worldPos;
+} inData;
 
+// The final color output to the framebuffer
 layout(location = 0) out vec4 outColor;
 
-// --- Binding 0: Scene Data (only need cameraPos usually) ---
+// Uniforms for camera and lighting
 layout(binding = 0, std140) uniform SceneUBO {
-    mat4 viewProjectionMatrix; // Likely unused here
-    mat4 modelMatrix;          // Likely unused here
-    vec3 cameraPos_world;
-} sceneData;
-
-// --- Binding 1: Lighting Data ---
-layout(binding = 1, std140) uniform LightingUBO {
-    vec4 lightPosition_world; // w=1 point, w=0 directional
-    vec4 lightColor;
-    float ambientIntensity;
-// other params...
-} lightingData;
+    mat4 viewProjectionMatrix;
+    vec3 cameraPos;
+    float padding;
+    vec4 lightPos;
+} scene;
 
 void main() {
-    vec3 N = normalize(inNormal_world);
-    vec3 V = normalize(sceneData.cameraPos_world - inPosition_world); // View vector
+    // Normalize vectors for lighting calculation
+    vec3 N = normalize(inData.normal);
+    vec3 L = normalize(scene.lightPos.xyz - inData.worldPos);
+    vec3 V = normalize(scene.cameraPos - inData.worldPos);
+    vec3 H = normalize(L + V);
 
-    // Calculate light vector L
-    vec3 L;
-    float attenuation = 1.0;
-    if (lightingData.lightPosition_world.w == 0.0) {
-        L = normalize(-lightingData.lightPosition_world.xyz); // Directional light
-    } else {
-        vec3 lightDelta = lightingData.lightPosition_world.xyz - inPosition_world;
-        float dist = length(lightDelta);
-        L = normalize(lightDelta);
-        // Simple attenuation example
-        // attenuation = 1.0 / (1.0 + 0.1*dist + 0.01*dist*dist);
-    }
+    // Basic Blinn-Phong lighting components
+    float ambientStrength = 0.2;
+    vec3 ambient = ambientStrength * vec3(1.0);
 
-    // Simple Diffuse + Ambient + Specular (Blinn-Phong example)
-    float diffuseFactor = max(dot(N, L), 0.0);
-    vec3 diffuse = diffuseFactor * lightingData.lightColor.rgb * attenuation;
+    float diff = max(dot(N, L), 0.0);
+    vec3 diffuse = diff * vec3(1.0);
 
-    vec3 ambient = lightingData.ambientIntensity * lightingData.lightColor.rgb; // Assume ambientIntensity is from UBO or constant
-
-    vec3 H = normalize(L + V); // Halfway vector
-    float specFactor = pow(max(dot(N, H), 0.0), 32.0); // Shininess = 32
-    vec3 specular = specFactor * lightingData.lightColor.rgb * attenuation; // Assuming white specular highlights
-
+    float spec = pow(max(dot(N, H), 0.0), 32.0);
+    vec3 specular = 0.5 * spec * vec3(1.0);
+    
+    // Combine components for the final color
     vec3 finalColor = ambient + diffuse + specular;
 
+    // Write the final, defined color to the output
     outColor = vec4(finalColor, 1.0);
 }

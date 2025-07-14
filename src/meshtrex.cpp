@@ -1,83 +1,113 @@
-#include <fstream>    // For file operations
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+
+#include <fstream>
 #include <iostream>
+#include <vector>
+#include <chrono>
 
 #ifndef __APPLE__
 #include <cstdint>
 #endif
 
+#include <GLFW/glfw3.h>
+#include <glm/gtc/matrix_transform.hpp>
+#include "renderdoc_app.h"
+
 #include "common.h"
+#include "vulkan_context.h"
+#include "swapchain.h"
+#include "vulkan_utils.h"
 #include "minMaxManager.h"
 #include "filteringManager.h"
 #include "extractionManager.h"
-#include "blockFilteringTestUtils.h"
 #include "extractionTestUtils.h"
-#include <dlfcn.h>
-#include "renderdoc_app.h"
+#include "renderingPipeline.h"
+#include "renderingManager.h"
+#include "image.h"
+#include "resources.h"
 
-#include "vulkan_context.h"
 
-RENDERDOC_API_1_1_2 *rdoc_api = NULL;
+// --- Camera and Input State ---
+glm::vec3 cameraPos = glm::vec3(128.0f, 128.0f, 350.0f);
+glm::vec3 cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
+glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+float yaw = -90.0f;
+float pitch = 0.0f;
+double lastX = 512.0, lastY = 384.0;
+bool firstMouse = true;
 
-std::vector<uint8_t> generateSphereVolume(int width, int height, int depth) {
-    std::vector<uint8_t> data(width * height * depth);
-    
-    float radius = width * 0.4f;  // 40% of volume size
-    float centerX = width / 2.0f;
-    float centerY = height / 2.0f;
-    float centerZ = depth / 2.0f;
-    
-    for (int z = 0; z < depth; z++) {
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                float dx = x - centerX;
-                float dy = y - centerY;
-                float dz = z - centerZ;
-                float distance = sqrt(dx*dx + dy*dy + dz*dz) - radius;
-                
-                // Map distance to 0-255 range
-                // 0 = far inside, 128 = at surface, 255 = far outside
-                // Add small offset to avoid exact values
-                float normalized = (distance / radius) * 127.0f + 128.0f + 0.001f;
-                normalized = std::fmax(0.0f, std::fmin(255.0f, normalized));
-                
-                int index = z * width * height + y * width + x;
-                data[index] = static_cast<uint8_t>(normalized);
-            }
-        }
-    }
-    
-    return data;
+void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+    if (firstMouse) { lastX = xpos; lastY = ypos; firstMouse = false; }
+    float xoffset = (float)(xpos - lastX);
+    float yoffset = (float)(lastY - ypos);
+    lastX = xpos;
+    lastY = ypos;
+    float sensitivity = 0.1f;
+    xoffset *= sensitivity;
+    yoffset *= sensitivity;
+    yaw += xoffset;
+    pitch += yoffset;
+    if (pitch > 89.0f) pitch = 89.0f;
+    if (pitch < -89.0f) pitch = -89.0f;
+    glm::vec3 front;
+    front.x = cos(glm::radians(yaw)) * cos(glm::radians(pitch));
+    front.y = sin(glm::radians(pitch));
+    front.z = sin(glm::radians(yaw)) * cos(glm::radians(pitch));
+    cameraFront = glm::normalize(front);
 }
 
-// Use with isovalue = 128
+void processInput(GLFWwindow* window, float deltaTime) {
+    float cameraSpeed = 150.0f * deltaTime;
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) cameraPos += cameraSpeed * cameraFront;
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) cameraPos -= cameraSpeed * cameraFront;
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) cameraPos -= glm::normalize(glm::cross(cameraFront, cameraUp)) * cameraSpeed;
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) cameraPos += glm::normalize(glm::cross(cameraFront, cameraUp)) * cameraSpeed;
+}
 
+// --- Main Application ---
 int main(int argc, char** argv) {
     try {
-        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/bonsai_256x256x256_uint8.raw");
-        float isovalue = 80;
-        bool requestMeshShading = false;
-#ifndef __APPLE__
-        requestMeshShading = true;
-#endif
-        // For Linux, use dlopen() and dlsym()
-        void *mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
-        if (mod) {
-            pRENDERDOC_GetAPI RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)dlsym(mod, "RENDERDOC_GetAPI");
-            int ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_1_2, (void **)&rdoc_api);
-            assert(ret == 1);
-        }
-        VulkanContext context(requestMeshShading);
-        std::cout << "Vulkan context initialized for filtering." << std::endl;
+        glfwInit();
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        GLFWwindow* window = glfwCreateWindow(1024, 768, "MeshTrex", nullptr, nullptr);
+        glfwSetCursorPosCallback(window, mouse_callback);
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
+        VulkanContext context(true);
+        VkDevice device = context.getDevice();
+        VkQueue queue = context.getQueue();
+        VkCommandPool commandPool = context.getCommandPool();
+
+        VkSurfaceKHR surface = createSurface(context.getInstance(), window);
+        VkFormat swapchainFormat = getSwapchainFormat(context.getPhysicalDevice(), surface);
+        VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
+        Swapchain swapchain;
+        createSwapchain(swapchain, context.getPhysicalDevice(), device, surface, context.getGraphicsQueueFamilyIndex(), window, swapchainFormat);
+
+        std::vector<VkImageView> swapchainImageViews(swapchain.imageCount);
+        Image depthImage;
+        
+        auto createSwapchainResources = [&]() {
+            for (uint32_t i = 0; i < swapchain.imageCount; ++i) {
+                swapchainImageViews[i] = createImageView(device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
+            }
+            createImage(depthImage, device, context.getMemoryProperties(), VK_IMAGE_TYPE_2D, swapchain.width, swapchain.height, 1, 1, depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+            VkCommandBuffer cmd = beginSingleTimeCommands(device, commandPool);
+            VkImageMemoryBarrier2 depthBarrier = imageBarrier(depthImage.image, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            pipelineBarrier(cmd, {}, 0, nullptr, 1, &depthBarrier);
+            endSingleTimeCommands(device, commandPool, queue, cmd);
+        };
+        
+        auto destroySwapchainResources = [&]() {
+            destroyImage(depthImage, device);
+            for(auto& view : swapchainImageViews) { if(view) vkDestroyImageView(device, view, nullptr); }
+        };
+
+        createSwapchainResources();
+        
+        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/bonsai_256x256x256_uint8.raw");
         Volume volume = loadVolume(volumePath.c_str());
-        // Volume volume {glm::vec3(64,64,64), "uint_8", generateSphereVolume(64,64,64)};
-        std::cout << "Volume " << volumePath.c_str() << " is loaded.";
-        std::cout << "--- Debug: Printing C++ volume data values > 41 for cell (0,0,0) of block (0,0,0) ---" << std::endl;
-        // for (int i = 0; i < 1000 ; i++) {
-        //     std::cout << "CPU Vol: " << static_cast<unsigned int>(volume.volume_data[i]) << "\n" <<std::endl;
-        // }
-        std::cout << "--- End Debug: C++ specific volume data print ---" << std::endl;
-        // --- End of debug print section --
+        
         PushConstants pushConstants = {};
         pushConstants.volumeDim = glm::uvec4(volume.volume_dims, 1);
         pushConstants.blockDim = glm::uvec4(4, 4, 4, 1);
@@ -86,7 +116,7 @@ int main(int argc, char** argv) {
             (volume.volume_dims.y + pushConstants.blockDim.y - 1) / pushConstants.blockDim.y,
             (volume.volume_dims.z + pushConstants.blockDim.z - 1) / pushConstants.blockDim.z,
             1);
-        pushConstants.isovalue = isovalue;
+        pushConstants.isovalue = 80;
 
         std::cout << "Loaded volume dims: ("
                   << pushConstants.volumeDim.x << "x" << pushConstants.volumeDim.y << "x" << pushConstants.volumeDim.z << ")" << std::endl;
@@ -94,59 +124,148 @@ int main(int argc, char** argv) {
 
         MinMaxOutput minMaxOutput = computeMinMaxMip(context, volume, pushConstants);
         FilteringOutput filteringResult = filterActiveBlocks(context, minMaxOutput, pushConstants);
+        ExtractionOutput extractionResult = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants);
+        writeGPUExtractionToOBJ(context, extractionResult, "/tmp/meshtrex.obj");
+        extractionResult.meshletCount = mapCounterBuffer(context, extractionResult.meshletDescriptorCountBuffer);
+        std::cout << "Extraction complete. Found " << extractionResult.meshletCount << " meshlets." << std::endl;
+        vkDeviceWaitIdle(context.getDevice());
+        {
+            VkCommandBuffer setupCmd = beginSingleTimeCommands(device, commandPool);
 
-        std::cout << "Filtering complete. Received handles." << std::endl;
-        std::cout << "Active blocks: " << filteringResult.activeBlockCount << std::endl;
-        try {
-            ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants);
-            writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");
-        } catch (std::exception& e) {
-            std::cout << e.what() << std::endl;
+            std::vector<VkBufferMemoryBarrier2> bufferBarriers;
+            bufferBarriers.reserve(4);
+
+            VkPipelineStageFlags2 srcStage = VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+            VkAccessFlags2 srcAccess = VK_ACCESS_2_SHADER_WRITE_BIT;
+            VkPipelineStageFlags2 dstStage = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT; // First stage that reads the buffers
+            VkAccessFlags2 dstAccess = VK_ACCESS_2_SHADER_READ_BIT;
+
+            bufferBarriers.push_back(bufferBarrier(extractionResult.vertexBuffer.buffer, srcStage, srcAccess, dstStage, dstAccess, 0, VK_WHOLE_SIZE));
+            bufferBarriers.push_back(bufferBarrier(extractionResult.indexBuffer.buffer, srcStage, srcAccess, dstStage, dstAccess, 0, VK_WHOLE_SIZE));
+            bufferBarriers.push_back(bufferBarrier(extractionResult.meshletDescriptorBuffer.buffer, srcStage, srcAccess, dstStage, dstAccess, 0, VK_WHOLE_SIZE));
+            bufferBarriers.push_back(bufferBarrier(extractionResult.meshletDescriptorCountBuffer.buffer, srcStage, srcAccess, dstStage, dstAccess, 0, VK_WHOLE_SIZE));
+            
+            pipelineBarrier(setupCmd, {}, bufferBarriers.size(), bufferBarriers.data(), 0, nullptr);
+            
+            endSingleTimeCommands(device, commandPool, queue, setupCmd);
         }
 
+        const int MAX_FRAMES_IN_FLIGHT = 2;
+        RenderingPipeline renderingPipeline;
+        renderingPipeline.setup(device, swapchainFormat, depthFormat, VK_SAMPLE_COUNT_1_BIT, MAX_FRAMES_IN_FLIGHT);
 
-        // CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
-        try {
-            // CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
-        } catch (std::exception& e) {
-            std::cout << e.what() << std::endl;
+        Buffer sceneUbo;
+        createBuffer(sceneUbo, device, context.getMemoryProperties(), sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        // Create sync objects for frames in flight
+        std::vector<VkSemaphore> imageAvailableSemaphores(MAX_FRAMES_IN_FLIGHT);
+        std::vector<VkSemaphore> renderFinishedSemaphores(MAX_FRAMES_IN_FLIGHT);
+        std::vector<VkFence> inFlightFences(MAX_FRAMES_IN_FLIGHT);
+        std::vector<VkCommandBuffer> commandBuffers(MAX_FRAMES_IN_FLIGHT);
+
+        VkSemaphoreCreateInfo semaphoreInfo = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT};
+        VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, commandPool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, (uint32_t)commandBuffers.size()};
+        VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()));
+
+        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            VK_CHECK(vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphores[i]));
+            VK_CHECK(vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphores[i]));
+            VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &inFlightFences[i]));
         }
 
-        // Perform the comparison
-        // bool match = compareExtractionOutputs(context, extractionResultGPU, {});
+        uint32_t currentFrame = 0;
+        float lastFrameTime = 0.0f;
+        // return 0;
+        while (!glfwWindowShouldClose(window)) {
+            glfwPollEvents();
+            float currentFrameTime = (float)glfwGetTime();
+            float deltaTime = currentFrameTime - lastFrameTime;
+            lastFrameTime = currentFrameTime;
+            processInput(window, deltaTime);
 
-        // if (match) {
-        //     std::cout << "Verification Passed!" << std::endl;
-        // } else {
-        //     std::cout << "Verification Failed!" << std::endl;
-        // }
-        // --- Now use the results in the next stage ---
-        // Example: Setting up descriptors for a task/mesh shader
-        // VkDescriptorBufferInfo activeBlockCountInfo = { filteringResult.activeBlockCountBuffer.buffer, 0, VK_WHOLE_SIZE };
-        // VkDescriptorBufferInfo compactedBlockIdInfo = { filteringResult.compactedBlockIdBuffer.buffer, 0, VK_WHOLE_SIZE };
-        // VkDescriptorImageInfo volumeTextureInfo = { VK_NULL_HANDLE, filteringResult.volumeImage.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL }; // Assuming layout is transitioned
+            // **FIX: Use the sync objects for the current frame in flight**
+            VK_CHECK(vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX));
 
-        // ... bind these descriptors ...
-        // ... record task/mesh shader dispatch ...
+            uint32_t imageIndex;
+            VkResult acquireResult = vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
 
-        // --- EVENTUALLY, when these resources are no longer needed ---
-        // (e.g., end of frame, shutdown)
-        // The caller MUST clean up the resources contained in filteringResult.
-        // It needs access to the VkDevice (and VmaAllocator if used).
-        // Get the device handle (e.g., from a global context or stored separately)
-        // VkDevice device = get_my_vulkan_device();
+            if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR || acquireResult == VK_SUBOPTIMAL_KHR) {
+                vkDeviceWaitIdle(device);
+                destroySwapchainResources();
+                createSwapchain(swapchain, context.getPhysicalDevice(), device, surface, context.getGraphicsQueueFamilyIndex(), window, swapchainFormat);
+                createSwapchainResources();
+                continue;
+            }
+            VK_CHECK(acquireResult);
+            
+            VK_CHECK(vkResetFences(device, 1, &inFlightFences[currentFrame]));
+            VkCommandBuffer commandBuffer = commandBuffers[currentFrame];
+            VK_CHECK(vkResetCommandBuffer(commandBuffer, 0));
+            
+            VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, 0, nullptr};
+            VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
+            
+            SceneUniforms uniforms;
+            glm::mat4 projection = glm::perspective(glm::radians(45.0f), (float)swapchain.width / (float)swapchain.height, 0.1f, 1000.0f);
+            projection[1][1] *= -1; // Invert Y axis
+            uniforms.viewProjectionMatrix = projection * glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
+            uniforms.cameraPos = cameraPos;
+            uniforms.lightPos = glm::vec4(400.0f, 400.0f, 400.0f, 1.0f);
+            memcpy(sceneUbo.data, &uniforms, sizeof(SceneUniforms));
+            VkMemoryBarrier2 uboBarrier = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                .srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, // The first stage that reads the UBO
+                .dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT
+            };
+            VkDependencyInfo dependencyInfo = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &uboBarrier };
+            vkCmdPipelineBarrier2(commandBuffer, &dependencyInfo);
+            updateRenderingDescriptors(device, renderingPipeline, currentFrame, sceneUbo, extractionResult);
 
-        std::cout << "Cleaning up filtering resources..." << std::endl;
-        filteringResult.cleanup(context.getDevice());
-        minMaxOutput.cleanup(context.getDevice());
-        // Assuming destroyImage/destroyBuffer take VkDevice:
-        // destroyImage(filteringResult.volumeImage, device);
-        // destroyImage(filteringResult.minMaxImage, device); // Destroy if created/returned
-        // destroyBuffer(filteringResult.compactedBlockIdBuffer, device);
-        // destroyBuffer(filteringResult.activeBlockCountBuffer, device);
-        // Or, if FilteringOutput has a cleanup method:
-        // filteringResult.cleanup(device);
+            VkImageMemoryBarrier2 renderBeginBarrier = imageBarrier(swapchain.images[imageIndex], VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            pipelineBarrier(commandBuffer, 0, 0, nullptr, 1, &renderBeginBarrier);
 
+            recordRenderingCommands(commandBuffer, renderingPipeline, currentFrame, extractionResult, {swapchain.width, swapchain.height}, swapchainImageViews[imageIndex], depthImage.imageView);
+            
+            VkImageMemoryBarrier2 presentBarrier = imageBarrier(swapchain.images[imageIndex], VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+            pipelineBarrier(commandBuffer, 0, 0, nullptr, 1, &presentBarrier);
+            
+            VK_CHECK(vkEndCommandBuffer(commandBuffer));
+
+            VkSemaphore waitSemaphores[] = {imageAvailableSemaphores[currentFrame]};
+            VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+            VkSemaphore signalSemaphores[] = {renderFinishedSemaphores[currentFrame]};
+            VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 1, waitSemaphores, waitStages, 1, &commandBuffer, 1, signalSemaphores};
+            VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, inFlightFences[currentFrame]));
+
+            VkPresentInfoKHR presentInfo = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, nullptr, 1, signalSemaphores, 1, &swapchain.swapchain, &imageIndex, nullptr};
+            acquireResult = vkQueuePresentKHR(queue, &presentInfo);
+
+            if (acquireResult != VK_ERROR_OUT_OF_DATE_KHR && acquireResult != VK_SUBOPTIMAL_KHR) {
+                 VK_CHECK_SWAPCHAIN(acquireResult);
+            }
+
+            currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+        }
+
+        for(int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroyFence(device, inFlightFences[i], nullptr);
+            vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
+            vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
+        }
+        vkDestroyCommandPool(device, commandPool, nullptr);
+        destroyBuffer(sceneUbo, device);
+        destroySwapchainResources();
+        destroySwapchain(device, swapchain);
+        vkDestroySurfaceKHR(context.getInstance(), surface, nullptr);
+        extractionResult.cleanup();
+        filteringResult.cleanup(device);
+        minMaxOutput.cleanup(device);
+        renderingPipeline.cleanup();
+        glfwDestroyWindow(window);
+        glfwTerminate();
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

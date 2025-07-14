@@ -105,19 +105,35 @@ uvec3 unpack_block_id(uint id) {
 
 // This version clamps coordinates to prevent reading outside the volume texture.
 vec3 calculate_normal(ivec3 p) {
-    ivec3 dims = ivec3(ubo.volumeDim.xyz - 1);
-    float s1 = float(imageLoad(volumeImage, clamp(p + ivec3(-1, 0, 0), ivec3(0), dims)).r);
-    float s2 = float(imageLoad(volumeImage, clamp(p + ivec3( 1, 0, 0), ivec3(0), dims)).r);
-    float s3 = float(imageLoad(volumeImage, clamp(p + ivec3( 0,-1, 0), ivec3(0), dims)).r);
-    float s4 = float(imageLoad(volumeImage, clamp(p + ivec3( 0, 1, 0), ivec3(0), dims)).r);
-    float s5 = float(imageLoad(volumeImage, clamp(p + ivec3( 0, 0,-1), ivec3(0), dims)).r);
-    float s6 = float(imageLoad(volumeImage, clamp(p + ivec3( 0, 0, 1), ivec3(0), dims)).r);
-    return normalize(vec3(s1 - s2, s3 - s4, s5 - s6));
+    // De-normalize the sampled values to match the isolevel's scale
+    float v_xp = imageLoad(volumeImage, p + ivec3(1, 0, 0)).r * 255.0;
+    float v_xn = imageLoad(volumeImage, p - ivec3(1, 0, 0)).r * 255.0;
+    float v_yp = imageLoad(volumeImage, p + ivec3(0, 1, 0)).r * 255.0;
+    float v_yn = imageLoad(volumeImage, p - ivec3(0, 1, 0)).r * 255.0;
+    float v_zp = imageLoad(volumeImage, p + ivec3(0, 0, 1)).r * 255.0;
+    float v_zn = imageLoad(volumeImage, p - ivec3(0, 0, 1)).r * 255.0;
+
+    vec3 grad = vec3(v_xn - v_xp, v_yn - v_yp, v_zn - v_zp);
+
+    // **THE FIX:** Check if the length of the gradient is near zero.
+    // If it is, return a default, valid normal (e.g., up vector) to avoid
+    // normalizing a zero vector, which would produce NaNs.
+    if (length(grad) < 0.0001) {
+        return vec3(0.0, 1.0, 0.0);
+    }
+
+    return normalize(grad);
 }
 
+
+// --- Safe Vertex Interpolation ---
+/*
+ * Calculates the vertex position and normal along an edge.
+ */
 VertexData interpolate_vertex(float isolevel, ivec3 p1_coord, ivec3 p2_coord) {
-    float v1_val = float(imageLoad(volumeImage, p1_coord).r);
-    float v2_val = float(imageLoad(volumeImage, p2_coord).r);
+    // De-normalize texture values to match the isolevel
+    float v1_val = imageLoad(volumeImage, p1_coord).r * 255.0;
+    float v2_val = imageLoad(volumeImage, p2_coord).r * 255.0;
 
     vec3 n1 = calculate_normal(p1_coord);
     vec3 n2 = calculate_normal(p2_coord);
@@ -131,6 +147,8 @@ VertexData interpolate_vertex(float isolevel, ivec3 p1_coord, ivec3 p2_coord) {
     
     vec3 pos = mix(vec3(p1_coord), vec3(p2_coord), mu);
     vec3 norm = normalize(mix(n1, n2, mu));
+    
+    // Normalize final position to [-1, 1] model space
     vec3 final_pos = (pos / vec3(ubo.volumeDim.xyz)) * 2.0 - 1.0;
 
     return VertexData(vec4(final_pos, 1.0), vec4(norm, 0.0));
