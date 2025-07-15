@@ -15,3 +15,7 @@ void writeGPUExtractionToOBJ(
     VulkanContext& context,
     ExtractionOutput& extractionResult,
     const char* filePath);
+
+bool validateMeshletDescriptors(
+    VulkanContext& context,
+    const ExtractionOutput& extractionOutput);

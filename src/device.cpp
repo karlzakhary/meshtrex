@@ -235,9 +235,10 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
         VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
     };
 
-    if (meshShadingSupported)
+    if (meshShadingSupported) {
         extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
-
+        extensions.push_back(VK_NV_MESH_SHADER_EXTENSION_NAME);
+    }
     VkPhysicalDeviceFeatures2 features = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.features.multiDrawIndirect = true;
@@ -288,7 +289,11 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     featuresMesh.taskShader = true;
     featuresMesh.meshShader = true;
-
+    
+    VkPhysicalDeviceMeshShaderFeaturesNV featuresMeshNV = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_NV};
+    featuresMeshNV.taskShader = true;
+    featuresMeshNV.meshShader = true;
     VkPhysicalDeviceDynamicRenderingFeatures featuresDynamicRendering = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
     featuresDynamicRendering.dynamicRendering = true;
@@ -320,6 +325,8 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
     if (meshShadingSupported) {
         *ppNext = &featuresMesh;
         ppNext = &featuresMesh.pNext;
+        *ppNext = &featuresMeshNV;
+        ppNext = &featuresMeshNV.pNext;
     }
 
     VkDevice device = nullptr;

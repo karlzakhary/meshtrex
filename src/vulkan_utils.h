@@ -17,6 +17,7 @@ inline VkCommandPool createCommandPool(VkDevice device, uint32_t familyIndex)
         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     createInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     createInfo.queueFamilyIndex = familyIndex;
+    createInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
     VkCommandPool commandPool = 0;
     VK_CHECK(vkCreateCommandPool(device, &createInfo, 0, &commandPool));
@@ -46,7 +47,7 @@ inline VkQueryPool createQueryPool(VkDevice device, uint32_t queryCount,
 inline VkFence createFence(VkDevice device)
 {
     VkFenceCreateInfo createInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-
+    createInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     VkFence fence = nullptr;
     VK_CHECK(vkCreateFence(device, &createInfo, 0, &fence));
 
@@ -73,7 +74,7 @@ inline VkCommandBuffer beginSingleTimeCommands(VkDevice device, VkCommandPool co
     return commandBuffer;
 }
 
-// Helper to end and submit a single-use command buffer
+// Reverted to original, more complete implementation
 inline void endSingleTimeCommands(VkDevice device, VkCommandPool commandPool,
                            VkQueue queue, VkCommandBuffer commandBuffer) {
     VK_CHECK(vkEndCommandBuffer(commandBuffer));

@@ -1,170 +1,321 @@
-#include <iostream>
-
-#include "extractionOutput.h"
-#include "extractionPipeline.h"
-#include "minMaxOutput.h"
-#include "filteringOutput.h"
-#include "renderingPipeline.h"
+#include "renderingManager.h"
+#include "vulkan_utils.h"
 #include "resources.h"
+#include "buffer.h"
+#include "image.h"
 
-// Updates descriptors for Pipeline 2 (Extraction)
-void updateExtractionDescriptors(
-    VkDevice device,
-    ExtractionPipeline& extractionPipelineState,
-    const MinMaxOutput& minMaxOutput,
-    const FilteringOutput& filteringResult, // Input: Active block list/count
-    const Buffer& uboIsovalue,              // Input: UBO containing current isovalue etc.
-    const Buffer& marchingCubesTriTable,    // Input: MC Table
-    const ExtractionOutput& extractionOutput // Output: Target Vtx/Idx/Indirect buffers
-) {
-    if (extractionPipelineState.descriptorSet_ == VK_NULL_HANDLE) return;
+#include <GLFW/glfw3.h>
+#include <glm/gtc/matrix_transform.hpp>
+#include <iostream>
+#include <cstring>
 
-    std::vector<VkWriteDescriptorSet> writes;
-    // Binding 0: UBO (isovalue etc.)
-    VkDescriptorBufferInfo uboInfo = {uboIsovalue.buffer, 0, VK_WHOLE_SIZE};
-    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr});
-    // Binding 1: Volume Image
-    VkDescriptorImageInfo volInfo = {VK_NULL_HANDLE, minMaxOutput.volumeImage.imageView, VK_IMAGE_LAYOUT_GENERAL};
-    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &volInfo, nullptr, nullptr});
-    // Binding 2: Block IDs
-    VkDescriptorBufferInfo blockIdInfo = {filteringResult.compactedBlockIdBuffer.buffer, 0, VK_WHOLE_SIZE};
-    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &blockIdInfo, nullptr});
-    // Binding 3: MC Table
-    VkDescriptorBufferInfo mcTableInfo = {marchingCubesTriTable.buffer, 0, VK_WHOLE_SIZE};
-    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &mcTableInfo, nullptr});
-    // Binding 4: Output Vertex Buffer
-    VkDescriptorBufferInfo vbInfo = {extractionOutput.vertexBuffer.buffer, 0, VK_WHOLE_SIZE};
-    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &vbInfo, nullptr});
-    // Binding 5: Output Index Buffer
-    VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};
-    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ibInfo, nullptr});
-    // Binding 6: Output Indirect Draw Buffer (if used)
-    // VkDescriptorBufferInfo drawInfo = {extractionOutput.indirectDrawBuffer.buffer, 0, VK_WHOLE_SIZE};
-    // writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, extractionPipelineState.descriptorSet_, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &drawInfo, nullptr});
+struct RenderPushConstants {
+    glm::mat4 viewProj;
+};
 
+void RenderingManager::handleCameraInput(float deltaTime) {
+    const float moveSpeed = 100.0f * deltaTime; // units per second
+    glm::vec3 forward = glm::normalize(cameraTarget_ - cameraPos_);
+    glm::vec3 right = glm::normalize(glm::cross(forward, cameraUp_));
 
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    if (glfwGetKey(window_, GLFW_KEY_W) == GLFW_PRESS) {
+        cameraPos_ += forward * moveSpeed;
+    }
+    if (glfwGetKey(window_, GLFW_KEY_S) == GLFW_PRESS) {
+        cameraPos_ -= forward * moveSpeed;
+    }
+    if (glfwGetKey(window_, GLFW_KEY_A) == GLFW_PRESS) {
+        cameraPos_ -= right * moveSpeed;
+    }
+    if (glfwGetKey(window_, GLFW_KEY_D) == GLFW_PRESS) {
+        cameraPos_ += right * moveSpeed;
+    }
+    if (glfwGetKey(window_, GLFW_KEY_E) == GLFW_PRESS) {
+        cameraPos_ += cameraUp_ * moveSpeed;
+    }
+    if (glfwGetKey(window_, GLFW_KEY_Q) == GLFW_PRESS) {
+        cameraPos_ -= cameraUp_ * moveSpeed;
+    }
+    
+    // Update target to maintain view direction
+    cameraTarget_ = cameraPos_ + forward;
 }
 
-// Records commands for Pipeline 2 (Extraction) - Runs conditionally
-// Runs *inside* a Begin/EndRendering scope, even though rasterization is disabled.
-void recordExtractionDispatch(
-    VkCommandBuffer commandBuffer,
-    ExtractionPipeline& extractionPipelineState,
-    const FilteringOutput& filteringResult
-    // Add dynamic rendering info params similar to recordRenderingCommands if needed,
-    // or begin/end rendering outside this specific function call.
-    // VkExtent2D dummyExtent, VkImageView dummyView, VkImageLayout dummyLayout
-) {
-     if (extractionPipelineState.pipeline_ == VK_NULL_HANDLE || filteringResult.activeBlockCount == 0) return;
+RenderingManager::RenderingManager(VulkanContext& context, uint32_t width, uint32_t height, const char* title)
+    : context_(context) {
+    initWindow(width, height, title);
 
-    // Need to be inside vkCmdBegin/EndRendering for vkCmdDrawMeshTasks...
+    surface_ = createSurface(context_.getInstance(), window_);
+    assert(surface_);
 
-    // Bind Pipeline 2 and its descriptors
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, extractionPipelineState.pipeline_);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, extractionPipelineState.pipelineLayout_, 0, 1, &extractionPipelineState.descriptorSet_, 0, nullptr);
+    swapchainFormat_ = getSwapchainFormat(context_.getPhysicalDevice(), surface_);
+    depthFormat_ = VK_FORMAT_D32_SFLOAT;
 
-    // Dispatch Task shaders - one workgroup per active block
-    uint32_t numActiveBlocks = filteringResult.activeBlockCount;
-    vkCmdDrawMeshTasksEXT(commandBuffer, numActiveBlocks, 1, 1);
+    // Create Descriptor Set Layout
+    VkDescriptorSetLayoutBinding setBindings[3] = {};
+    setBindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_TASK_BIT_NV | VK_SHADER_STAGE_MESH_BIT_NV, nullptr}; // Vertex Buffer
+    setBindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_TASK_BIT_NV |VK_SHADER_STAGE_MESH_BIT_NV, nullptr}; // Index Buffer
+    setBindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_TASK_BIT_NV | VK_SHADER_STAGE_MESH_BIT_NV, nullptr}; // Meshlet Descriptors
+
+    VkDescriptorSetLayoutCreateInfo setLayoutInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    setLayoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    setLayoutInfo.bindingCount = 3;
+    setLayoutInfo.pBindings = setBindings;
+
+    VK_CHECK(vkCreateDescriptorSetLayout(context_.getDevice(), &setLayoutInfo, nullptr, &descriptorSetLayout_));
+
+    // Create Pipeline Layout
+    VkPushConstantRange pcRange = {};
+    pcRange.stageFlags = VK_SHADER_STAGE_MESH_BIT_NV;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(RenderPushConstants);
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout_;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pcRange;
+
+    VK_CHECK(vkCreatePipelineLayout(context_.getDevice(), &pipelineLayoutInfo, nullptr, &pipelineLayout_));
+
+    createSwapchainResources();
+    
+    renderingPipeline_.setup(context.getDevice(), swapchainFormat_, depthFormat_, pipelineLayout_);
 }
 
-// Updates descriptors for Pipeline 3 (Rendering)
-void updateRenderingDescriptors(
-    VkDevice device,
-    RenderingPipeline& renderingPipelineState,
-    const Buffer& sceneUboBuffer, // UBO containing MVP, lighting etc.
-    const ExtractionOutput& extractionOutput   // Contains MeshletDesc, VB, IB
-    // Add texture bindings if needed
-) {
-    if (renderingPipelineState.descriptorSet_ == VK_NULL_HANDLE) return;
+RenderingManager::~RenderingManager() {
+    vkDeviceWaitIdle(context_.getDevice());
+    
+    renderingPipeline_.cleanup();
+    cleanupSwapchainResources();
+    
+    // Destroy layouts and surface
+    vkDestroyPipelineLayout(context_.getDevice(), pipelineLayout_, nullptr);
+    vkDestroyDescriptorSetLayout(context_.getDevice(), descriptorSetLayout_, nullptr); // Now destroyed correctly
+    vkDestroySurfaceKHR(context_.getInstance(), surface_, nullptr);
+    
+    glfwDestroyWindow(window_);
+}
 
-    // Check if necessary buffers from extraction exist
-    if (extractionOutput.meshletDescriptorBuffer.buffer == VK_NULL_HANDLE ||
-        extractionOutput.vertexBuffer.buffer == VK_NULL_HANDLE ||
-        extractionOutput.indexBuffer.buffer == VK_NULL_HANDLE) {
-        std::cerr << "Warning: Missing necessary geometry buffers in updateRenderingDescriptors." << std::endl;
-        return;
+void RenderingManager::initWindow(uint32_t width, uint32_t height, const char* title) {
+    if (!glfwInit()) {
+        throw std::runtime_error("Failed to initialize GLFW");
+    }
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    window_ = glfwCreateWindow(width, height, title, nullptr, nullptr);
+    assert(window_);
+
+    glfwGetCursorPos(window_, &lastMouseX_, &lastMouseY_);
+}
+
+void RenderingManager::createSwapchainResources() {
+    createSwapchain(swapchain_, context_.getPhysicalDevice(), context_.getDevice(), surface_, context_.getGraphicsQueueFamilyIndex(), window_, swapchainFormat_);
+
+    createImage(depthImage_, context_.getDevice(), context_.getMemoryProperties(), VK_IMAGE_TYPE_2D, swapchain_.width, swapchain_.height, 1, 1, depthFormat_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    
+    swapchainImageViews_.resize(swapchain_.imageCount);
+    for (uint32_t i = 0; i < swapchain_.imageCount; ++i) {
+        swapchainImageViews_[i] = createImageView(context_.getDevice(), swapchain_.images[i], swapchainFormat_, VK_IMAGE_TYPE_2D, 0, 1);
+    }
+}
+
+void RenderingManager::cleanupSwapchainResources() {
+    destroyImage(depthImage_, context_.getDevice());
+
+    for (auto imageView : swapchainImageViews_) {
+        vkDestroyImageView(context_.getDevice(), imageView, nullptr);
+    }
+    destroySwapchain(context_.getDevice(), swapchain_);
+}
+
+uint32_t RenderingManager::readCounterFromBuffer(const Buffer& counterBuffer) {
+    uint32_t count = 0;
+    VkDeviceSize bufferSize = sizeof(uint32_t);
+
+    if (counterBuffer.buffer == VK_NULL_HANDLE || counterBuffer.size < bufferSize) return 0;
+
+    Buffer readbackBuffer{};
+    createBuffer(readbackBuffer, context_.getDevice(), context_.getMemoryProperties(), bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    
+    VkCommandBuffer cmd = beginSingleTimeCommands(context_.getDevice(), context_.getCommandPool());
+    
+    VkBufferCopy region = {0, 0, bufferSize};
+    vkCmdCopyBuffer(cmd, counterBuffer.buffer, readbackBuffer.buffer, 1, &region);
+
+    endSingleTimeCommands(context_.getDevice(), context_.getCommandPool(), context_.getQueue(), cmd);
+    
+    memcpy(&count, readbackBuffer.data, bufferSize);
+    
+    destroyBuffer(readbackBuffer, context_.getDevice());
+    
+    return count;
+}
+
+
+void RenderingManager::render(const ExtractionOutput& extractionOutput) {
+    VkDevice device = context_.getDevice();
+    uint32_t actualMeshletCount = readCounterFromBuffer(extractionOutput.meshletDescriptorCountBuffer);
+    
+    std::cout << "Rendering " << actualMeshletCount << " meshlets." << std::endl;
+    if (actualMeshletCount == 0) return;
+
+    VkSemaphore acquireSemaphore = createSemaphore(device);
+    VkSemaphore releaseSemaphore = createSemaphore(device);
+
+    VkFenceCreateInfo fenceCreateInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    VkFence frameFence = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFence));
+
+    // Allocate one command buffer to be reused for the render loop
+    VkCommandBuffer commandBuffer;
+    VkCommandBufferAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    allocInfo.commandPool = context_.getCommandPool();
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer));
+
+
+    while (!glfwWindowShouldClose(window_)) {
+        float currentTime = (float)glfwGetTime();
+        float deltaTime = currentTime - lastFrameTime_;
+        lastFrameTime_ = currentTime;
+        glfwPollEvents();
+        handleCameraInput(deltaTime);
+        // Update camera based on mouse input
+        double mouseX, mouseY;
+        glfwGetCursorPos(window_, &mouseX, &mouseY);
+        if (glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+            float dx = (float)(mouseX - lastMouseX_);
+            float dy = (float)(mouseY - lastMouseY_);
+
+            glm::mat4 rotationY = glm::rotate(glm::mat4(1.0f), -dx * 0.005f, glm::vec3(0,1,0));
+            cameraPos_ = glm::vec3(rotationY * glm::vec4(cameraPos_ - cameraTarget_, 1.0f)) + cameraTarget_;
+
+            glm::vec3 right = glm::normalize(glm::cross(cameraTarget_ - cameraPos_, glm::vec3(0,1,0)));
+            glm::mat4 rotationX = glm::rotate(glm::mat4(1.0f), -dy * 0.005f, right);
+            cameraPos_ = glm::vec3(rotationX * glm::vec4(cameraPos_ - cameraTarget_, 1.0f)) + cameraTarget_;
         }
+        lastMouseX_ = mouseX;
+        lastMouseY_ = mouseY;
 
-    std::vector<VkWriteDescriptorSet> writes;
-    // Binding 0: MVP/Lighting UBO
-    VkDescriptorBufferInfo uboInfo = {sceneUboBuffer.buffer, 0, VK_WHOLE_SIZE};
-    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, renderingPipelineState.descriptorSet_, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr});
+        VK_CHECK(vkWaitForFences(device, 1, &frameFence, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(device, 1, &frameFence));
 
-    // Binding 1: Meshlet Descriptor Buffer
-    VkDescriptorBufferInfo meshletDescInfo = {extractionOutput.meshletDescriptorBuffer.buffer, 0, VK_WHOLE_SIZE};
-    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, renderingPipelineState.descriptorSet_, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &meshletDescInfo, nullptr});
+        uint32_t imageIndex;
+        VkResult result = vkAcquireNextImageKHR(device, swapchain_.swapchain, UINT64_MAX, acquireSemaphore, VK_NULL_HANDLE, &imageIndex);
+        
+        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+            vkDeviceWaitIdle(device);
+            cleanupSwapchainResources();
+            createSwapchainResources();
+            continue;
+        }
+        assert(result == VK_SUCCESS);
 
-    // Binding 2: Vertex Buffer
-    VkDescriptorBufferInfo vbInfo = {extractionOutput.vertexBuffer.buffer, 0, VK_WHOLE_SIZE};
-    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, renderingPipelineState.descriptorSet_, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &vbInfo, nullptr});
-
-    // Binding 3: Index Buffer
-    VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};
-    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, renderingPipelineState.descriptorSet_, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ibInfo, nullptr});
-
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-}
+        // Reset the command buffer for new recording
+        VK_CHECK(vkResetCommandBuffer(commandBuffer, 0));
+        
+        VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
 
 
-// Records commands for Pipeline 3 (Rendering) - Runs every frame
-void recordRenderingCommands(
-    VkCommandBuffer commandBuffer,
-    RenderingPipeline& renderingPipelineState,
-    const ExtractionOutput& extractionOutput, // Input: Geometry buffers
-    VkExtent2D swapchainExtent,
-    VkImageView colorAttachmentView,
-    VkImageView depthAttachmentView,
-    VkImageLayout colorAttachmentLayout,
-    VkImageLayout depthAttachmentLayout
-) {
-     if (renderingPipelineState.pipeline_ == VK_NULL_HANDLE || extractionOutput.indexBuffer.buffer == VK_NULL_HANDLE) return; // Check if geometry exists
+        VkImageMemoryBarrier2 renderBeginBarrier = imageBarrier(swapchain_.images[imageIndex], VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        pipelineBarrier(commandBuffer, 0, 0, nullptr, 1, &renderBeginBarrier);
 
-    // --- Begin Dynamic Rendering ---
-    VkRenderingAttachmentInfo colorAttachmentInfo = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-    // ... populate colorAttachmentInfo ...
-    colorAttachmentInfo.imageView = colorAttachmentView; colorAttachmentInfo.imageLayout = colorAttachmentLayout; colorAttachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; colorAttachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE; colorAttachmentInfo.clearValue.color = {{0.1f, 0.1f, 0.1f, 1.0f}};
-    VkRenderingAttachmentInfo depthAttachmentInfo = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-    // ... populate depthAttachmentInfo ...
-    depthAttachmentInfo.imageView = depthAttachmentView; depthAttachmentInfo.imageLayout = depthAttachmentLayout; depthAttachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; depthAttachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE; depthAttachmentInfo.clearValue.depthStencil = {1.0f, 0};
-    VkRenderingInfo renderingInfo = { VK_STRUCTURE_TYPE_RENDERING_INFO };
-    // ... populate renderingInfo ...
-    renderingInfo.renderArea = {{0, 0}, swapchainExtent}; renderingInfo.layerCount = 1; renderingInfo.colorAttachmentCount = 1; renderingInfo.pColorAttachments = &colorAttachmentInfo; renderingInfo.pDepthAttachment = &depthAttachmentInfo;
+        VkClearColorValue clearColor = {0.1f, 0.2f, 0.3f, 1.0f};
+        VkClearDepthStencilValue clearDepth = {0.0f, 0};
 
-    vkCmdBeginRendering(commandBuffer, &renderingInfo);
+        VkRenderingAttachmentInfo colorAttachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        colorAttachment.imageView = swapchainImageViews_[imageIndex];
+        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.clearValue.color = clearColor;
 
-    // --- Bind Pipeline 3 and its descriptors ---
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderingPipelineState.pipeline_);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderingPipelineState.pipelineLayout_, 0, 1, &renderingPipelineState.descriptorSet_, 0, nullptr);
+        VkRenderingAttachmentInfo depthAttachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        depthAttachment.imageView = depthImage_.imageView;
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depthAttachment.clearValue.depthStencil = clearDepth;
 
-    // --- Set Dynamic States ---
-    VkViewport viewport = { 0.0f, 0.0f, (float)swapchainExtent.width, (float)swapchainExtent.height, 0.0f, 1.0f };
-    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    VkRect2D scissor = {{0, 0}, swapchainExtent};
-    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+        VkRenderingInfo renderingInfo = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+        renderingInfo.renderArea = {{0, 0}, {swapchain_.width, swapchain_.height}};
+        renderingInfo.layerCount = 1;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachments = &colorAttachment;
+        renderingInfo.pDepthAttachment = &depthAttachment;
 
-    // --- Issue Draw Call using Mesh Tasks ---
-    // Calculate number of task workgroups needed. Often based on total meshlets / workgroup size.
-    // The Task shader itself will then select individual meshlets based on the descriptor buffer.
-    // Example: Launch enough groups to cover all meshlets, assuming task shader handles 1 meshlet per invocation (adjust as needed)
-    uint32_t taskWorkgroupSize = 32; // Or query subgroup size / typical warp size
-    uint32_t numTaskWorkgroups = (extractionOutput.meshletCount + taskWorkgroupSize - 1) / taskWorkgroupSize;
+        vkCmdBeginRendering(commandBuffer, &renderingInfo);
 
-    if (numTaskWorkgroups > 0) {
-        // Ensure vkCmdDrawMeshTasksEXT function pointer is loaded!
-        vkCmdDrawMeshTasksEXT(commandBuffer, numTaskWorkgroups, 1, 1);
+        VkViewport viewport = {0.0f, (float)swapchain_.height, (float)swapchain_.width, -(float)swapchain_.height, 0.0f, 1.0f};
+        VkRect2D scissor = {{0, 0}, {swapchain_.width, swapchain_.height}};
+        vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+        vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-        // --- OR --- Use Indirect Mesh Draw if Pipeline 2 generated indirectMeshDrawBuffer
-        // if (extractionOutput.indirectMeshDrawBuffer.buffer != VK_NULL_HANDLE) {
-        //    vkCmdDrawMeshTasksIndirectEXT(commandBuffer,
-        //                                  extractionOutput.indirectMeshDrawBuffer.buffer,
-        //                                  0, // offset
-        //                                  extractionOutput.drawCommandCount, // draw count (often 1)
-        //                                  sizeof(VkDrawMeshTasksIndirectCommandEXT)); // stride
-        //}
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderingPipeline_.pipeline_);
+
+        RenderPushConstants pushConsts;
+        glm::mat4 proj = glm::perspective(glm::radians(60.0f), (float)swapchain_.width / (float)swapchain_.height, 0.1f, 1000.0f);
+        glm::mat4 view = glm::lookAt(cameraPos_, cameraTarget_, glm::vec3(0, 1, 0));
+        pushConsts.viewProj = proj * view;
+
+        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_MESH_BIT_NV, 0, sizeof(RenderPushConstants), &pushConsts);
+
+        VkDescriptorBufferInfo vbInfo = {extractionOutput.vertexBuffer.buffer, 0, VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo mbInfo = {extractionOutput.meshletDescriptorBuffer.buffer, 0, VK_WHOLE_SIZE};
+
+        VkWriteDescriptorSet writes[3] = {};
+        writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, 0, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &vbInfo, nullptr};
+        writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, 0, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ibInfo, nullptr};
+        writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, 0, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &mbInfo, nullptr};
+
+        vkCmdPushDescriptorSetKHR(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 3, writes);
+
+        vkCmdDrawMeshTasksNV(commandBuffer, actualMeshletCount, 0);
+
+        vkCmdEndRendering(commandBuffer);
+        
+        VkImageMemoryBarrier2 presentBarrier = imageBarrier(swapchain_.images[imageIndex], VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT_KHR, 0, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        pipelineBarrier(commandBuffer, 0, 0, nullptr, 1, &presentBarrier);
+
+        VK_CHECK(vkEndCommandBuffer(commandBuffer));
+
+        VkPipelineStageFlags submitStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = &acquireSemaphore;
+        submitInfo.pWaitDstStageMask = &submitStageMask;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = &releaseSemaphore;
+        
+        VK_CHECK(vkQueueSubmit(context_.getQueue(), 1, &submitInfo, frameFence));
+
+        VkPresentInfoKHR presentInfo = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        presentInfo.waitSemaphoreCount = 1;
+        presentInfo.pWaitSemaphores = &releaseSemaphore;
+        presentInfo.swapchainCount = 1;
+        presentInfo.pSwapchains = &swapchain_.swapchain;
+        presentInfo.pImageIndices = &imageIndex;
+        
+        result = vkQueuePresentKHR(context_.getQueue(), &presentInfo);
+
+        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+            // Handled at top of loop
+        } else {
+            assert(result == VK_SUCCESS);
+        }
     }
 
-    // --- End Dynamic Rendering ---
-    vkCmdEndRendering(commandBuffer);
+    vkDeviceWaitIdle(device);
+
+    vkFreeCommandBuffers(device, context_.getCommandPool(), 1, &commandBuffer);
+    vkDestroyFence(device, frameFence, nullptr);
+    vkDestroySemaphore(device, releaseSemaphore, nullptr);
+    vkDestroySemaphore(device, acquireSemaphore, nullptr);
 }

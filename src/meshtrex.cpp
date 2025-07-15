@@ -15,6 +15,7 @@
 #include "renderdoc_app.h"
 
 #include "vulkan_context.h"
+#include "renderingManager.h"
 
 RENDERDOC_API_1_1_2 *rdoc_api = NULL;
 
@@ -99,7 +100,16 @@ int main(int argc, char** argv) {
         std::cout << "Active blocks: " << filteringResult.activeBlockCount << std::endl;
         try {
             ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants);
-            writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");
+            // writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");
+            validateMeshletDescriptors(context, extractionResultGPU);
+            // --- NEW: Render the extracted mesh ---
+        if (extractionResultGPU.meshletCount > 0) {
+            std::cout << "\n--- Starting Renderer ---" << std::endl;
+            RenderingManager renderingManager(context);
+            renderingManager.render(extractionResultGPU);
+        } else {
+            std::cout << "\nSkipping rendering as no meshlets were generated." << std::endl;
+        }
         } catch (std::exception& e) {
             std::cout << e.what() << std::endl;
         }
