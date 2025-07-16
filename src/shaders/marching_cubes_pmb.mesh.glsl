@@ -22,8 +22,9 @@
 #define MAX_CELLS_IN_BLOCK 64u
 #define MAX_CELLS_PER_THREAD (MAX_CELLS_IN_BLOCK + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE
 #define MAX_PRIMS_PER_THREAD (MAX_CELLS_PER_THREAD * MAX_PRIMS_PER_CELL)
-#define MAX_VERTS_PER_MESHLET 256u
-#define MAX_PRIMS_PER_MESHLET 256u
+#define MAX_VERTS_PER_MESHLET 64u
+#define MAX_PRIMS_PER_MESHLET 126u
+#define MAX_MESHLETS_PER_BLOCK 8u
 
 /* ------------------  PMB edge ownership -------------------------- */
 const uint PMB_EDGE_X = 0u;
@@ -50,13 +51,15 @@ struct MeshletDescriptor {
     uint primitiveCount;
 };
 
-#define MAX_MESHLETS_PER_BLOCK 8u
+
 taskPayloadSharedEXT struct TaskPayload {
     uint blockID;
     uint meshletCount;
     uint firstCell[MAX_MESHLETS_PER_BLOCK];
     uint cellCount[MAX_MESHLETS_PER_BLOCK];
     uint packedCellData[BX * BY * BZ];
+    uint subblockMask[MAX_MESHLETS_PER_BLOCK];
+    bool isSubdivided;
 } taskPayloadIn;
 
 // --- Descriptor Set Bindings ---
@@ -153,21 +156,24 @@ uint calculate_configuration(ivec3 cell_coord_global) {
 
 
 // --- Shared Memory ---
-shared VertexData  shVerts[256];
+shared VertexData  shVerts[MAX_VERTS_PER_MESHLET];
 shared uint        shVertCount;
 // Map from [x][y][z][edge_type] in the 5x5x5 context block to a vertex index in shVerts
 shared uint        shVertMap[BLOCK_DIM_X][BLOCK_DIM_Y][BLOCK_DIM_Z][3];
 shared uint        shPrimCount;
-shared uint        shIdx[256*3];
+shared uint        shIdx[MAX_PRIMS_PER_MESHLET*3];
 
-shared uvec3 sh_temp_tris[128 * MAX_PRIMS_PER_THREAD];
+shared uvec3 sh_temp_tris[WORKGROUP_SIZE * MAX_PRIMS_PER_THREAD];
 shared uint sh_vert_subgroup_sums[32];
 shared uint sh_prim_subgroup_sums[32];
+shared uint sh_cellVertexMask[5]; // Which cells in 5x5x5 need vertices for this meshlet
 
 /* helper telling whether a cell in the 5x5x5 context grid owns an edge */
 bool ownsX(uvec3 c) { return c.x < BX; } // Core cells 0..3 own their +X edge
 bool ownsY(uvec3 c) { return c.y < BY; } // Core cells 0..3 own their +Y edge
 bool ownsZ(uvec3 c) { return c.z < BZ; } // Core cells 0..3 own their +Z edge
+
+// Note: We no longer need isVertexNeededBySubblocks() because we're doing per-meshlet generation
 
 // --- Workgroup size ---
 // NOTE: A workgroup size of 64 is small for this task. 128 is often better.
@@ -175,7 +181,7 @@ bool ownsZ(uvec3 c) { return c.z < BZ; } // Core cells 0..3 own their +Z edge
 layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 // --- Output limits ---
-layout(max_vertices = 256, max_primitives = 256) out;
+layout(max_vertices = MAX_VERTS_PER_MESHLET, max_primitives = MAX_PRIMS_PER_MESHLET) out;
 layout(triangles) out;
 
 void main ()
@@ -200,23 +206,65 @@ void main ()
     // --- 1. Generate all unique vertices for the 5x5x5 context region ---
     uvec3 blk_coord = unpack_block_id(taskPayloadIn.blockID);
     ivec3 base_coord = ivec3(blk_coord) * int(STRIDE);
+    
+    // Get meshlet-specific info
+    uint first_cell_idx = taskPayloadIn.firstCell[meshlet_idx_in_block];
+    uint num_cells = taskPayloadIn.cellCount[meshlet_idx_in_block];
+    uint subblockMask = taskPayloadIn.subblockMask[meshlet_idx_in_block];
+    bool isSubdivided = taskPayloadIn.isSubdivided;
 
     // =================================================================================
     // SECTION 1: THREE-PASS VERTEX GENERATION (SUBGROUP-BASED)
     // This entire section replaces the atomic-based vertex generation.
     // =================================================================================
 
-    // --- PASS 1A: COUNT - Each thread counts how many vertices it owns. ---
+    // --- PASS 1A: COUNT - Per-meshlet vertex generation ---
+    // We only generate vertices that could be referenced by THIS meshlet's cells
     uint local_vert_count = 0;
+    
+    // Initialize shared mask of which cells need vertices
+    if (gl_LocalInvocationIndex < 5) {
+        sh_cellVertexMask[gl_LocalInvocationIndex] = 0;
+    }
+    barrier();
+    
+    // Process each cell in this meshlet to determine which vertices it needs
+    for (uint i = 0; i < num_cells; i++) {
+        uint packed_data = taskPayloadIn.packedCellData[first_cell_idx + i];
+        uint cellID = (packed_data >> 16) & 0xFFFFu;
+        uvec3 c_core = uvec3(cellID % BX, (cellID / BX) % BY, cellID / (BX*BY));
+        
+        // For each edge this cell might reference, mark the owning cell
+        uint cfg = calculate_configuration(base_coord + ivec3(c_core));
+        uint eMask = mcEdgeTable.edgeTable[cfg];
+        
+        for (uint e = 0; e < 12; e++) {
+            if ((eMask & (1u << e)) != 0) {
+                uvec4 owner = edgeOwner[e];
+                uvec3 ownerCell = c_core + owner.xyz;
+                // Mark this cell as needing vertex generation
+                if (all(lessThan(ownerCell, uvec3(BLOCK_DIM_X, BLOCK_DIM_Y, BLOCK_DIM_Z)))) {
+                    uint cellIdx = ownerCell.x + ownerCell.y * 5u + ownerCell.z * 25u;
+                    atomicOr(sh_cellVertexMask[cellIdx / 25u], (1u << (cellIdx % 25u)));
+                }
+            }
+        }
+    }
+    barrier(); // Wait for all threads to finish marking cells
+    
+    // Now count vertices only for cells that are needed by this meshlet
     const uint TOTAL_CONTEXT_CELLS = BLOCK_DIM_X * BLOCK_DIM_Y * BLOCK_DIM_Z;
     for (uint cell_idx = gl_LocalInvocationIndex; cell_idx < TOTAL_CONTEXT_CELLS; cell_idx += WORKGROUP_SIZE)
     {
+        // Check if this cell needs vertex generation
+        if ((sh_cellVertexMask[cell_idx / 25u] & (1u << (cell_idx % 25u))) == 0) continue;
+        
         uvec3 cLoc = uvec3(cell_idx % BLOCK_DIM_X, (cell_idx / BLOCK_DIM_X) % BLOCK_DIM_Y, cell_idx / (BLOCK_DIM_X * BLOCK_DIM_Y));
         if (any(greaterThanEqual(base_coord + ivec3(cLoc) + ivec3(1), ivec3(ubo.volumeDim.xyz)))) continue;
+        
         uint eMask = mcEdgeTable.edgeTable[calculate_configuration(base_coord + ivec3(cLoc))];
-        if (eMask == 0u) {
-            continue;                     // nothing else to do for this cell
-        }
+        if (eMask == 0u) continue;
+        
         if ((eMask & (1u << PMB_EDGE_X)) != 0u && ownsX(cLoc)) local_vert_count++;
         if ((eMask & (1u << PMB_EDGE_Y)) != 0u && ownsY(cLoc)) local_vert_count++;
         if ((eMask & (1u << PMB_EDGE_Z)) != 0u && ownsZ(cLoc)) local_vert_count++;
@@ -240,7 +288,14 @@ void main ()
 
     uint final_vert_offset = sh_vert_subgroup_sums[gl_SubgroupID] + subgroup_vert_offset;
     if (gl_LocalInvocationIndex == WORKGROUP_SIZE - 1) { 
-        shVertCount = final_vert_offset + local_vert_count; 
+        shVertCount = final_vert_offset + local_vert_count;
+        
+        // Debug output for per-meshlet vertex generation
+        debugPrintfEXT(
+            "MESH DEBUG: block %u meshlet %u generated %u vertices (per-meshlet)",
+            taskPayloadIn.blockID, meshlet_idx_in_block,
+            final_vert_offset + local_vert_count
+        );
     }
     barrier();
 
@@ -248,6 +303,9 @@ void main ()
     uint running_vert_offset = 0;
     for (uint cell_idx = gl_LocalInvocationIndex; cell_idx < TOTAL_CONTEXT_CELLS; cell_idx += WORKGROUP_SIZE) {
         uvec3 cLoc = uvec3(cell_idx % BLOCK_DIM_X, (cell_idx / BLOCK_DIM_X) % BLOCK_DIM_Y, cell_idx / (BLOCK_DIM_X * BLOCK_DIM_Y));
+        // Check if this cell needs vertex generation for this meshlet
+        if ((sh_cellVertexMask[cell_idx / 25u] & (1u << (cell_idx % 25u))) == 0) continue;
+        
         ivec3 gLoc = base_coord + ivec3(cLoc);
         if (any(greaterThanEqual(gLoc + ivec3(1), ivec3(ubo.volumeDim.xyz)))) continue;
 
@@ -285,15 +343,14 @@ void main ()
     barrier();
 
     // --- 2. Generate triangles for cells belonging to this specific meshlet ---
-    uint first_cell_idx = taskPayloadIn.firstCell[meshlet_idx_in_block];
-    uint num_cells      = taskPayloadIn.cellCount[meshlet_idx_in_block];
+    // (first_cell_idx and num_cells already declared above)
     uint local_prim_count = 0;
 
     for (uint i = gl_LocalInvocationIndex; i < num_cells; i += WORKGROUP_SIZE)
     {
         uint packed_data = taskPayloadIn.packedCellData[first_cell_idx + i];
         uint cellID = (packed_data >> 16) & 0xFFFFu;
-        uint prims  = (packed_data >>  8) & 0xFFu;
+        uint prims  = packed_data & 0xFu;  // Updated format: prims in low 4 bits
         
         // Configuration must be recalculated as it's not passed from task shader
         uvec3 c_core = uvec3(cellID % BX, (cellID / BX) % BY, cellID / (BX*BY));

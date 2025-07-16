@@ -16,8 +16,10 @@
 /* voxel region you must read (core + 1-voxel halo) ----------------- */
 #define STRIDE 4u           /* overlap = 1 voxel */
 
-#define MAX_VERTS_PER_MESHLET 256u
-#define MAX_PRIMS_PER_MESHLET 256u
+#define MAX_VERTS_PER_MESHLET 64u
+#define MAX_PRIMS_PER_MESHLET 126u
+// Safety margin for vertex counting due to halo cells
+#define VERTEX_COUNT_SAFETY_MARGIN 0.8  // Use 80% of limit
 #define MAX_MESHLETS_PER_BLOCK 8u        /* 64 cells / 5-tris ~= 13 → 8 is safe for 4³ */
 #define MAX_OCC_CELLS_PER_THREAD (CELLS_PER_BLOCK + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE
 
@@ -34,6 +36,9 @@ taskPayloadSharedEXT struct TaskPayload {
     uint cellCount[MAX_MESHLETS_PER_BLOCK];
     // Storing more info: (cellID << 16) | (prims << 8) | owner_verts
     uint packedCellData[CELLS_PER_BLOCK];
+    // For subdivision: which 2x2x2 subblock each meshlet represents
+    uint subblockMask[MAX_MESHLETS_PER_BLOCK]; // Bit i set = subblock i included
+    bool isSubdivided; // True if block was subdivided into 2x2x2 subblocks
 } TP;
 
 
@@ -90,6 +95,59 @@ uint calculate_configuration(ivec3 cell_coord_global) {
     return configuration;
 }
 
+// Count vertices for a subregion of the 5x5x5 block
+uint countVerticesForSubregion(ivec3 base, uvec3 subMin, uvec3 subMax) {
+    uint vertexCount = 0;
+    
+    // Check all cells in the 5x5x5 region
+    for (uint cz = 0; cz < 5u; cz++) {
+        for (uint cy = 0; cy < 5u; cy++) {
+            for (uint cx = 0; cx < 5u; cx++) {
+                uvec3 cLoc = uvec3(cx, cy, cz);
+                ivec3 gLoc = base + ivec3(cLoc);
+                
+                if (any(greaterThanEqual(gLoc, ivec3(ubo.volumeDim.xyz) - 1))) continue;
+                
+                uint cfg = calculate_configuration(gLoc);
+                uint eMask = mcEdgeTable.edgeTable[cfg];
+                if (eMask == 0u) continue;
+                
+                // Only count vertices owned by cells that would be processed by this subregion
+                // A vertex at cell (cx,cy,cz) is used by triangles in cells within range
+                bool isRelevant = false;
+                
+                // Check if any cell in the subregion could reference this vertex
+                // Vertices can be referenced by cells up to 1 unit away
+                if (cx < 4u && (eMask & (1u << PMB_EDGE_X)) != 0u) {
+                    // X edge owned by (cx,cy,cz), used by cells (cx,cy,cz) to (cx,cy+1,cz+1)
+                    if (cx >= subMin.x && cx <= subMax.x &&
+                        cy >= subMin.y && cy <= min(subMax.y + 1u, 3u) &&
+                        cz >= subMin.z && cz <= min(subMax.z + 1u, 3u)) {
+                        vertexCount++;
+                    }
+                }
+                if (cy < 4u && (eMask & (1u << PMB_EDGE_Y)) != 0u) {
+                    // Y edge owned by (cx,cy,cz), used by cells (cx,cy,cz) to (cx+1,cy,cz+1)
+                    if (cx >= subMin.x && cx <= min(subMax.x + 1u, 3u) &&
+                        cy >= subMin.y && cy <= subMax.y &&
+                        cz >= subMin.z && cz <= min(subMax.z + 1u, 3u)) {
+                        vertexCount++;
+                    }
+                }
+                if (cz < 4u && (eMask & (1u << PMB_EDGE_Z)) != 0u) {
+                    // Z edge owned by (cx,cy,cz), used by cells (cx,cy,cz) to (cx+1,cy+1,cz)
+                    if (cx >= subMin.x && cx <= min(subMax.x + 1u, 3u) &&
+                        cy >= subMin.y && cy <= min(subMax.y + 1u, 3u) &&
+                        cz >= subMin.z && cz <= subMax.z) {
+                        vertexCount++;
+                    }
+                }
+            }
+        }
+    }
+    
+    return vertexCount;
+}
 
 layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
@@ -123,14 +181,11 @@ void main()
         if (eMask == 0u) {
             continue;                     // nothing else to do for this cell
         }
-        uint owner_verts = 0;
-        if ((eMask & (1u << PMB_EDGE_X)) != 0) owner_verts++;
-        if ((eMask & (1u << PMB_EDGE_Y)) != 0) owner_verts++;
-        if ((eMask & (1u << PMB_EDGE_Z)) != 0) owner_verts++;
 
         // Instead of atomicAdd, write to a private temporary slot
         if (local_occ_count < MAX_OCC_CELLS_PER_THREAD) {
-            uint packed_data = (cell & 0xFFFFu) << 16 | (prims & 0xFFu) << 8 | (owner_verts & 0xFFu);
+            // Store cell ID, prims, and the FULL edge mask (12 bits)
+            uint packed_data = (cell & 0xFFFFu) << 16 | (eMask & 0xFFFu) << 4 | (prims & 0xFu);
             sh_temp_occ_list[lane * MAX_OCC_CELLS_PER_THREAD + local_occ_count] = packed_data;
             local_occ_count++;
         }
@@ -178,30 +233,132 @@ void main()
     {
         uint occ = total_occ_count; // Use the precise count from the scan
         uint m = 0;
+        
         if (occ > 0) {
-            uint runV = 0, runP = 0, first = 0;
-            for (uint i = 0; i < occ; ++i) {
-                // Read from the now-compacted list in the TaskPayload
-                uint packed_data = TP.packedCellData[i];
-                uint prims = (packed_data >> 8) & 0xFFu;
-                uint owner_verts = packed_data & 0xFFu;
-
-                if (i > first && (runV + owner_verts > MAX_VERTS_PER_MESHLET || runP + prims > MAX_PRIMS_PER_MESHLET)) {
-                    TP.firstCell[m] = first;
-                    TP.cellCount[m] = i - first;
-                    m++;
-                    first = i;
-                    runV = 0;
-                    runP = 0;
+            // First, try the full 4x4x4 block
+            uint totalBlockVertices = countVerticesForSubregion(base, uvec3(0,0,0), uvec3(3,3,3));
+            
+            debugPrintfEXT(
+                "TASK INFO: block %u needs %u total vertices for 4x4x4 region",
+                blockID, totalBlockVertices
+            );
+            
+            // Check if we need to subdivide
+            if (totalBlockVertices > MAX_VERTS_PER_MESHLET) {
+                // Subdivide into 2x2x2 subblocks
+                debugPrintfEXT(
+                    "TASK INFO: block %u exceeds limit, subdividing into 2x2x2 subblocks",
+                    blockID
+                );
+                
+                TP.isSubdivided = true;
+                
+                // Process each 2x2x2 subblock
+                for (uint sz = 0; sz < 2; sz++) {
+                    for (uint sy = 0; sy < 2; sy++) {
+                        for (uint sx = 0; sx < 2; sx++) {
+                            uvec3 subMin = uvec3(sx * 2, sy * 2, sz * 2);
+                            uvec3 subMax = uvec3(sx * 2 + 1, sy * 2 + 1, sz * 2 + 1);
+                            
+                            // Count cells and primitives in this subblock
+                            uint subCellCount = 0;
+                            uint subPrimCount = 0;
+                            uint firstSubCell = 0;
+                            bool foundFirst = false;
+                            
+                            for (uint i = 0; i < occ; i++) {
+                                uint packed_data = TP.packedCellData[i];
+                                uint cellID = (packed_data >> 16) & 0xFFFFu;
+                                uint prims = (packed_data >> 8) & 0xFFu;
+                                
+                                uvec3 cLoc = uvec3(cellID % BX, (cellID / BX) % BY, cellID / (BX * BY));
+                                
+                                // Check if cell is in this subblock
+                                if (cLoc.x >= subMin.x && cLoc.x <= subMax.x &&
+                                    cLoc.y >= subMin.y && cLoc.y <= subMax.y &&
+                                    cLoc.z >= subMin.z && cLoc.z <= subMax.z) {
+                                    
+                                    if (!foundFirst) {
+                                        firstSubCell = i;
+                                        foundFirst = true;
+                                    }
+                                    subCellCount++;
+                                    subPrimCount += prims;
+                                }
+                            }
+                            
+                            // If subblock has cells, emit it as a meshlet
+                            if (subCellCount > 0 && m < MAX_MESHLETS_PER_BLOCK) {
+                                uint subblockIdx = sx + sy * 2 + sz * 4;
+                                uint subVertCount = countVerticesForSubregion(base, subMin, subMax);
+                                
+                                TP.firstCell[m] = firstSubCell;
+                                TP.cellCount[m] = subCellCount;
+                                TP.subblockMask[m] = (1u << subblockIdx); // Mark which subblock this is
+                                
+                                debugPrintfEXT(
+                                    "TASK INFO: subblock %u (%u,%u,%u)-(%u,%u,%u) has %u cells, %u verts",
+                                    subblockIdx, subMin.x, subMin.y, subMin.z, 
+                                    subMax.x, subMax.y, subMax.z, subCellCount, subVertCount
+                                );
+                                
+                                m++;
+                            }
+                        }
+                    }
                 }
-                runV += owner_verts;
-                runP += prims;
-            }
-
-            if (m < MAX_MESHLETS_PER_BLOCK) {
-                TP.firstCell[m] = first;
-                TP.cellCount[m] = occ - first;
-                m++;
+            } else {
+                // Full block fits, but we need more conservative partitioning
+                TP.isSubdivided = false;
+                
+                // Use primitive count based partitioning with very conservative vertex limit
+                // Since we can't accurately predict vertices with PMB + per-meshlet generation
+                uint runP = 0, first = 0;
+                uint cellsInMeshlet = 0;
+                
+                // Even more conservative: some cells can generate many vertices due to halo
+                const uint MAX_CELLS_PER_MESHLET = 15u; // Empirically safer limit
+                
+                for (uint i = 0; i < occ; ++i) {
+                    uint packed_data = TP.packedCellData[i];
+                    uint prims = packed_data & 0xFu;
+                    
+                    if (i > first && (cellsInMeshlet >= MAX_CELLS_PER_MESHLET || runP + prims > MAX_PRIMS_PER_MESHLET)) {
+                        // Emit current meshlet
+                        TP.firstCell[m] = first;
+                        TP.cellCount[m] = i - first;
+                        TP.subblockMask[m] = 0xFFu; // Full block
+                        
+                        debugPrintfEXT(
+                            "TASK: block %u meshlet %u has %u cells (conservative)",
+                            blockID, m, i - first
+                        );
+                        
+                        m++;
+                        
+                        // Start new meshlet
+                        first = i;
+                        runP = prims;
+                        cellsInMeshlet = 1;
+                    } else {
+                        runP += prims;
+                        cellsInMeshlet++;
+                    }
+                }
+                
+                // Emit final meshlet only if it has primitives
+                if (first < occ && runP > 0 && m < MAX_MESHLETS_PER_BLOCK) {
+                    TP.firstCell[m] = first;
+                    TP.cellCount[m] = occ - first;
+                    TP.subblockMask[m] = 0xFFu; // Full block
+                    
+                    debugPrintfEXT(
+                        "TASK: block %u meshlet %u has %u cells, %u prims (final, conservative)",
+                        blockID, m, occ - first, runP
+                    );
+                    
+                    m++;
+                }
             }
         }
         TP.meshletCount = m;
