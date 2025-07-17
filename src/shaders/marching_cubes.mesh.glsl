@@ -16,7 +16,7 @@
 layout(local_size_x = CELLS_PER_BLOCK, local_size_y = 1, local_size_z = 1) in;
 
 // --- Output limits ---
-layout(max_vertices = 256, max_primitives = 256) out;
+layout(max_vertices = 64, max_primitives = 126) out;
 layout(triangles) out;
 
 // --- Structures ---
@@ -96,34 +96,95 @@ uvec3 unpack_block_id(uint id) {
     return uvec3(id % grid_width, (id / grid_width) % ubo.blockGridDim.y, id / grid_slice);
 }
 
-// This version clamps coordinates to prevent reading outside the volume texture.
+// Safely calculates the normal vector at a point using a robust combination of
+// central, forward, and backward differencing to correctly handle volume boundaries.
 vec3 calculate_normal(ivec3 p) {
-    ivec3 dims = ivec3(ubo.volumeDim.xyz - 1);
-    float s1 = float(imageLoad(volumeImage, clamp(p + ivec3(-1, 0, 0), ivec3(0), dims)).r);
-    float s2 = float(imageLoad(volumeImage, clamp(p + ivec3( 1, 0, 0), ivec3(0), dims)).r);
-    float s3 = float(imageLoad(volumeImage, clamp(p + ivec3( 0,-1, 0), ivec3(0), dims)).r);
-    float s4 = float(imageLoad(volumeImage, clamp(p + ivec3( 0, 1, 0), ivec3(0), dims)).r);
-    float s5 = float(imageLoad(volumeImage, clamp(p + ivec3( 0, 0,-1), ivec3(0), dims)).r);
-    float s6 = float(imageLoad(volumeImage, clamp(p + ivec3( 0, 0, 1), ivec3(0), dims)).r);
-    return normalize(vec3(s1 - s2, s3 - s4, s5 - s6));
+    ivec3 dims = ivec3(ubo.volumeDim.xyz);
+    
+    // The value at the point itself, needed for one-sided differences
+    float s_center = float(imageLoad(volumeImage, p).r);
+
+    // --- X-axis gradient ---
+    float gx = 0.0;
+    if (p.x == 0) { // Left boundary: use forward difference
+        gx = float(imageLoad(volumeImage, p + ivec3(1, 0, 0)).r) - s_center;
+    } else if (p.x == dims.x - 1) { // Right boundary: use backward difference
+        gx = s_center - float(imageLoad(volumeImage, p - ivec3(1, 0, 0)).r);
+    } else { // Interior: use central difference
+        float s1 = float(imageLoad(volumeImage, p - ivec3(1, 0, 0)).r);
+        float s2 = float(imageLoad(volumeImage, p + ivec3(1, 0, 0)).r);
+        gx = (s2 - s1) / 2.0;
+    }
+
+    // --- Y-axis gradient ---
+    float gy = 0.0;
+    if (p.y == 0) { // Bottom boundary
+        gy = float(imageLoad(volumeImage, p + ivec3(0, 1, 0)).r) - s_center;
+    } else if (p.y == dims.y - 1) { // Top boundary
+        gy = s_center - float(imageLoad(volumeImage, p - ivec3(0, 1, 0)).r);
+    } else { // Interior
+        float s3 = float(imageLoad(volumeImage, p - ivec3(0, 1, 0)).r);
+        float s4 = float(imageLoad(volumeImage, p + ivec3(0, 1, 0)).r);
+        gy = (s4 - s3) / 2.0;
+    }
+
+    // --- Z-axis gradient ---
+    float gz = 0.0;
+    if (p.z == 0) { // Front boundary
+        gz = float(imageLoad(volumeImage, p + ivec3(0, 0, 1)).r) - s_center;
+    } else if (p.z == dims.z - 1) { // Back boundary
+        gz = s_center - float(imageLoad(volumeImage, p - ivec3(0, 0, 1)).r);
+    } else { // Interior
+        float s5 = float(imageLoad(volumeImage, p - ivec3(0, 0, 1)).r);
+        float s6 = float(imageLoad(volumeImage, p + ivec3(0, 0, 1)).r);
+        gz = (s6 - s5) / 2.0;
+    }
+    
+    // The final gradient vector
+    vec3 gradient = vec3(gx, gy, gz);
+
+    // Return a default, valid normal in this case to prevent NaN from normalize().
+    if (length(gradient) < 0.00001) {
+        return vec3(0.0, 1.0, 0.0);
+    }
+
+    // Note: The gradient points from lower to higher density. For an isosurface, the normal
+    // should typically point "out", which is towards lower density. Hence, we negate the gradient.
+    return -normalize(gradient);
 }
 
+// Interpolates vertex data between two points to find the precise surface location.
+// Relies on the robust `calculate_normal` function to avoid NaN values.
 VertexData interpolate_vertex(float isolevel, ivec3 p1_coord, ivec3 p2_coord) {
     float v1_val = float(imageLoad(volumeImage, p1_coord).r);
     float v2_val = float(imageLoad(volumeImage, p2_coord).r);
 
+    // Calculate normals at the two endpoints using the new, safe function
     vec3 n1 = calculate_normal(p1_coord);
     vec3 n2 = calculate_normal(p2_coord);
 
-    float mu = 0.5;
+    float mu = 0.5; // Default value in case of flat surface
     float denominator = v2_val - v1_val;
+
+    // Safety Check: Avoid division by zero
     if (abs(denominator) > 0.00001) {
         mu = (isolevel - v1_val) / denominator;
     }
+    
+    // Clamp mu to ensure the position stays on the edge between p1 and p2
     mu = clamp(mu, 0.0, 1.0);
     
     vec3 pos = mix(vec3(p1_coord), vec3(p2_coord), mu);
-    vec3 norm = normalize(mix(n1, n2, mu));
+    vec3 interpolated_norm = mix(n1, n2, mu);
+
+    // Final safety check on the *interpolated* normal before normalizing
+    if (length(interpolated_norm) < 0.00001) {
+        interpolated_norm = n1; // Fallback to one of the endpoint normals if interpolation results in zero
+    }
+    
+    vec3 norm = normalize(interpolated_norm);
+
+    // Convert position to normalized device coordinates (e.g., [-1, 1])
     vec3 final_pos = (pos / vec3(ubo.volumeDim.xyz)) * 2.0 - 1.0;
 
     return VertexData(vec4(final_pos, 1.0), vec4(norm, 0.0));

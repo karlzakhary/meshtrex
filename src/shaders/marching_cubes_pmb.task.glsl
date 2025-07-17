@@ -39,7 +39,7 @@ taskPayloadSharedEXT struct TaskPayload {
 
 /* ---------------- shared scratch ------------------------------------------ */
 shared uint sh_temp_occ_list[WORKGROUP_SIZE * MAX_OCC_CELLS_PER_THREAD];
-shared uint sh_subgroup_sums[32];
+shared uint sh_subgroup_sums[WORKGROUP_SIZE];
 shared uint total_occ_count;
 
 

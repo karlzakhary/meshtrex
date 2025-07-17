@@ -53,9 +53,9 @@ RenderingManager::RenderingManager(VulkanContext& context, uint32_t width, uint3
 
     // Create Descriptor Set Layout
     VkDescriptorSetLayoutBinding setBindings[3] = {};
-    setBindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_TASK_BIT_NV | VK_SHADER_STAGE_MESH_BIT_NV, nullptr}; // Vertex Buffer
-    setBindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_TASK_BIT_NV |VK_SHADER_STAGE_MESH_BIT_NV, nullptr}; // Index Buffer
-    setBindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_TASK_BIT_NV | VK_SHADER_STAGE_MESH_BIT_NV, nullptr}; // Meshlet Descriptors
+    setBindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, nullptr}; // Vertex Buffer
+    setBindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_TASK_BIT_EXT |VK_SHADER_STAGE_MESH_BIT_EXT, nullptr}; // Index Buffer
+    setBindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, nullptr}; // Meshlet Descriptors
 
     VkDescriptorSetLayoutCreateInfo setLayoutInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     setLayoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
@@ -66,7 +66,7 @@ RenderingManager::RenderingManager(VulkanContext& context, uint32_t width, uint3
 
     // Create Pipeline Layout
     VkPushConstantRange pcRange = {};
-    pcRange.stageFlags = VK_SHADER_STAGE_MESH_BIT_NV;
+    pcRange.stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT;
     pcRange.offset = 0;
     pcRange.size = sizeof(RenderPushConstants);
 
@@ -275,7 +275,7 @@ void RenderingManager::render(const ExtractionOutput& extractionOutput) {
 
         vkCmdPushDescriptorSetKHR(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 3, writes);
 
-        vkCmdDrawMeshTasksNV(commandBuffer, actualMeshletCount, 0);
+        vkCmdDrawMeshTasksEXT(commandBuffer, actualMeshletCount, 1, 1);
 
         vkCmdEndRendering(commandBuffer);
         

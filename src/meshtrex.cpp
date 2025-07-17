@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
         try {
             ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants);
             // writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");
-            validateMeshletDescriptors(context, extractionResultGPU);
+            // validateMeshletDescriptors(context, extractionResultGPU);
             // --- NEW: Render the extracted mesh ---
         if (extractionResultGPU.meshletCount > 0) {
             std::cout << "\n--- Starting Renderer ---" << std::endl;

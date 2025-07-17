@@ -153,12 +153,12 @@ uint calculate_configuration(ivec3 cell_coord_global) {
 
 
 // --- Shared Memory ---
-shared VertexData  shVerts[256];
+shared VertexData  shVerts[MAX_VERTS_PER_MESHLET];
 shared uint        shVertCount;
 // Map from [x][y][z][edge_type] in the 5x5x5 context block to a vertex index in shVerts
 shared uint        shVertMap[BLOCK_DIM_X][BLOCK_DIM_Y][BLOCK_DIM_Z][3];
 shared uint        shPrimCount;
-shared uint        shIdx[256*3];
+shared uint        shIdx[MAX_PRIMS_PER_MESHLET*3];
 
 shared uvec3 sh_temp_tris[128 * MAX_PRIMS_PER_THREAD];
 shared uint sh_vert_subgroup_sums[32];
@@ -175,7 +175,7 @@ bool ownsZ(uvec3 c) { return c.z < BZ; } // Core cells 0..3 own their +Z edge
 layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 // --- Output limits ---
-layout(max_vertices = 256, max_primitives = 256) out;
+layout(max_vertices = MAX_VERTS_PER_MESHLET, max_primitives = MAX_PRIMS_PER_MESHLET) out;
 layout(triangles) out;
 
 void main ()

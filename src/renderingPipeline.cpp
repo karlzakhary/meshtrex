@@ -14,11 +14,12 @@ void RenderingPipeline::setup(VkDevice device, VkFormat colorFormat, VkFormat de
 
     VkPipelineShaderStageCreateInfo stages[3] = {};
     // stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_TASK_BIT_NV, taskShader_.module, "main", nullptr};
-    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_MESH_BIT_NV, meshShader_.module, "main", nullptr};
-    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragShader_.module, "main", nullptr};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_TASK_BIT_EXT, taskShader_.module, "main", nullptr};
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_MESH_BIT_EXT, meshShader_.module, "main", nullptr};
+    stages[2] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragShader_.module, "main", nullptr};
 
     VkGraphicsPipelineCreateInfo createInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-    createInfo.stageCount = 2;
+    createInfo.stageCount = 3;
     createInfo.pStages = stages;
 
     VkPipelineVertexInputStateCreateInfo vertexInput = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
@@ -35,7 +36,7 @@ void RenderingPipeline::setup(VkDevice device, VkFormat colorFormat, VkFormat de
 
     VkPipelineRasterizationStateCreateInfo rasterizationState = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
     rasterizationState.lineWidth = 1.f;
-    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizationState.frontFace = VK_FRONT_FACE_CLOCKWISE;
     rasterizationState.cullMode = VK_CULL_MODE_BACK_BIT; // Re-enabled backface culling
     createInfo.pRasterizationState = &rasterizationState;
 
