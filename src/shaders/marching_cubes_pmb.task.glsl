@@ -44,7 +44,7 @@ taskPayloadSharedEXT struct TaskPayload {
 
 /* ---------------- shared scratch ------------------------------------------ */
 shared uint sh_temp_occ_list[WORKGROUP_SIZE * MAX_OCC_CELLS_PER_THREAD];
-shared uint sh_subgroup_sums[32];
+shared uint sh_subgroup_sums[WORKGROUP_SIZE];
 shared uint total_occ_count;
 
 
@@ -118,7 +118,7 @@ uint countVerticesForSubregion(ivec3 base, uvec3 subMin, uvec3 subMax) {
                 
                 // Check if any cell in the subregion could reference this vertex
                 // Vertices can be referenced by cells up to 1 unit away
-                if (cx < 4u && (eMask & (1u << PMB_EDGE_X)) != 0u) {
+                if (cx < BX && (eMask & (1u << PMB_EDGE_X)) != 0u) {
                     // X edge owned by (cx,cy,cz), used by cells (cx,cy,cz) to (cx,cy+1,cz+1)
                     if (cx >= subMin.x && cx <= subMax.x &&
                         cy >= subMin.y && cy <= min(subMax.y + 1u, 3u) &&
@@ -126,7 +126,7 @@ uint countVerticesForSubregion(ivec3 base, uvec3 subMin, uvec3 subMax) {
                         vertexCount++;
                     }
                 }
-                if (cy < 4u && (eMask & (1u << PMB_EDGE_Y)) != 0u) {
+                if (cy < BY && (eMask & (1u << PMB_EDGE_Y)) != 0u) {
                     // Y edge owned by (cx,cy,cz), used by cells (cx,cy,cz) to (cx+1,cy,cz+1)
                     if (cx >= subMin.x && cx <= min(subMax.x + 1u, 3u) &&
                         cy >= subMin.y && cy <= subMax.y &&
@@ -134,7 +134,7 @@ uint countVerticesForSubregion(ivec3 base, uvec3 subMin, uvec3 subMax) {
                         vertexCount++;
                     }
                 }
-                if (cz < 4u && (eMask & (1u << PMB_EDGE_Z)) != 0u) {
+                if (cz < BZ && (eMask & (1u << PMB_EDGE_Z)) != 0u) {
                     // Z edge owned by (cx,cy,cz), used by cells (cx,cy,cz) to (cx+1,cy+1,cz)
                     if (cx >= subMin.x && cx <= min(subMax.x + 1u, 3u) &&
                         cy >= subMin.y && cy <= min(subMax.y + 1u, 3u) &&
