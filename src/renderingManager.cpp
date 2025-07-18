@@ -14,7 +14,7 @@ struct RenderPushConstants {
 };
 
 void RenderingManager::handleCameraInput(float deltaTime) {
-    const float moveSpeed = 100.0f * deltaTime; // units per second
+    const float moveSpeed = 1.0f * deltaTime; // units per second
     glm::vec3 forward = glm::normalize(cameraTarget_ - cameraPos_);
     glm::vec3 right = glm::normalize(glm::cross(forward, cameraUp_));
 
@@ -221,11 +221,18 @@ void RenderingManager::render(const ExtractionOutput& extractionOutput) {
         VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
 
 
-        VkImageMemoryBarrier2 renderBeginBarrier = imageBarrier(swapchain_.images[imageIndex], VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        pipelineBarrier(commandBuffer, 0, 0, nullptr, 1, &renderBeginBarrier);
+        // Transition color image
+        VkImageMemoryBarrier2 colorBarrier = imageBarrier(swapchain_.images[imageIndex], VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        
+        // Transition depth image
+        VkImageMemoryBarrier2 depthBarrier = imageBarrier(depthImage_.image, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+        depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        
+        VkImageMemoryBarrier2 barriers[] = {colorBarrier, depthBarrier};
+        pipelineBarrier(commandBuffer, 0, 0, nullptr, 2, barriers);
 
         VkClearColorValue clearColor = {0.1f, 0.2f, 0.3f, 1.0f};
-        VkClearDepthStencilValue clearDepth = {0.0f, 0};
+        VkClearDepthStencilValue clearDepth = {0.0f, 0}; // Clear to far plane for reversed-Z
 
         VkRenderingAttachmentInfo colorAttachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         colorAttachment.imageView = swapchainImageViews_[imageIndex];
@@ -258,11 +265,23 @@ void RenderingManager::render(const ExtractionOutput& extractionOutput) {
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderingPipeline_.pipeline_);
 
         RenderPushConstants pushConsts;
-        glm::mat4 proj = glm::perspective(glm::radians(60.0f), (float)swapchain_.width / (float)swapchain_.height, 0.1f, 1000.0f);
+        // Create reversed-Z projection matrix for better depth precision
+        float fov = glm::radians(60.0f);
+        float aspect = (float)swapchain_.width / (float)swapchain_.height;
+        float nearPlane = 0.1f;
+        float farPlane = 1000.0f;
+        
+        glm::mat4 proj = glm::mat4(0.0f);
+        float tanHalfFov = tan(fov / 2.0f);
+        proj[0][0] = 1.0f / (aspect * tanHalfFov);
+        proj[1][1] = 1.0f / tanHalfFov;
+        proj[2][2] = nearPlane / (farPlane - nearPlane);
+        proj[2][3] = -1.0f;
+        proj[3][2] = (farPlane * nearPlane) / (farPlane - nearPlane);
         glm::mat4 view = glm::lookAt(cameraPos_, cameraTarget_, glm::vec3(0, 1, 0));
         pushConsts.viewProj = proj * view;
 
-        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_MESH_BIT_NV, 0, sizeof(RenderPushConstants), &pushConsts);
+        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_MESH_BIT_EXT, 0, sizeof(RenderPushConstants), &pushConsts);
 
         VkDescriptorBufferInfo vbInfo = {extractionOutput.vertexBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};

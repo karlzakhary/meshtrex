@@ -36,7 +36,7 @@ void RenderingPipeline::setup(VkDevice device, VkFormat colorFormat, VkFormat de
 
     VkPipelineRasterizationStateCreateInfo rasterizationState = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
     rasterizationState.lineWidth = 1.f;
-    rasterizationState.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; // Marching cubes typically generates CCW triangles
     rasterizationState.cullMode = VK_CULL_MODE_BACK_BIT; // Re-enabled backface culling
     createInfo.pRasterizationState = &rasterizationState;
 
@@ -52,6 +52,7 @@ void RenderingPipeline::setup(VkDevice device, VkFormat colorFormat, VkFormat de
     createInfo.pDepthStencilState = &depthStencilState;
 
     VkPipelineColorBlendAttachmentState colorAttachmentState = {};
+    colorAttachmentState.blendEnable = VK_FALSE; // Disable blending for opaque geometry
     colorAttachmentState.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
     VkPipelineColorBlendStateCreateInfo colorBlendState = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
