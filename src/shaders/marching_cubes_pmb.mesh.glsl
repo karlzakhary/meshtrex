@@ -22,8 +22,8 @@
 #define MAX_CELLS_IN_BLOCK 64u
 #define MAX_CELLS_PER_THREAD (MAX_CELLS_IN_BLOCK + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE
 #define MAX_PRIMS_PER_THREAD (MAX_CELLS_PER_THREAD * MAX_PRIMS_PER_CELL)
-#define MAX_VERTS_PER_MESHLET 256u
-#define MAX_PRIMS_PER_MESHLET 256u
+#define MAX_VERTS_PER_MESHLET 64u
+#define MAX_PRIMS_PER_MESHLET 126u
 
 /* ------------------  PMB edge ownership -------------------------- */
 const uint PMB_EDGE_X = 0u;
@@ -160,9 +160,9 @@ shared uint        shVertMap[BLOCK_DIM_X][BLOCK_DIM_Y][BLOCK_DIM_Z][3];
 shared uint        shPrimCount;
 shared uint        shIdx[MAX_PRIMS_PER_MESHLET*3];
 
-shared uvec3 sh_temp_tris[128 * MAX_PRIMS_PER_THREAD];
-shared uint sh_vert_subgroup_sums[32];
-shared uint sh_prim_subgroup_sums[32];
+shared uvec3 sh_temp_tris[MAX_PRIMS_PER_MESHLET * MAX_PRIMS_PER_THREAD];
+shared uint sh_vert_subgroup_sums[WORKGROUP_SIZE];
+shared uint sh_prim_subgroup_sums[WORKGROUP_SIZE];
 
 /* helper telling whether a cell in the 5x5x5 context grid owns an edge */
 bool ownsX(uvec3 c) { return c.x < BX; } // Core cells 0..3 own their +X edge

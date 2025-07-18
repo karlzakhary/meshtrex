@@ -16,8 +16,8 @@
 /* voxel region you must read (core + 1-voxel halo) ----------------- */
 #define STRIDE 4u           /* overlap = 1 voxel */
 
-#define MAX_VERTS_PER_MESHLET 256u
-#define MAX_PRIMS_PER_MESHLET 256u
+#define MAX_VERTS_PER_MESHLET 64u
+#define MAX_PRIMS_PER_MESHLET 126u
 #define MAX_MESHLETS_PER_BLOCK 8u        /* 64 cells / 5-tris ~= 13 → 8 is safe for 4³ */
 #define MAX_OCC_CELLS_PER_THREAD (CELLS_PER_BLOCK + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE
 
