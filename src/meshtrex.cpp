@@ -132,9 +132,7 @@ int main(int argc, char** argv) {
                 extractionResultGPU.tempResources.cleanup();
                 minMaxOutput.cleanup(context.getDevice());
                 filteringResult.cleanup(context.getDevice());
-                
-                std::cout << "GPU pipeline complete. Active block count remains on GPU for indirect dispatch." << std::endl;
-                
+                                
                 profiler.setExtractionStats(
                     0, // Active block count stays on GPU
                     extractionResultGPU.vertexCount,
