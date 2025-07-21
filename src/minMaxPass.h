@@ -30,6 +30,24 @@ public:
 
     VkPipelineLayout getLeafPipelineLayout() const { return leafPipelineLayout_; }
     VkPipelineLayout getOctreePipelineLayout() const { return octreePipelineLayout_; }
+    VkPipeline getLeafPipeline() const { return leafPipeline_; }
+    VkPipeline getOctreePipeline() const { return octreePipeline_; }
+    VkDescriptorSetLayout getLeafDescriptorSetLayout() const { return leafDescriptorSetLayout_; }
+    VkDescriptorSetLayout getOctreeDescriptorSetLayout() const { return octreeDescriptorSetLayout_; }
+    VkShaderModule getLeafShaderModule() const { return leafMinMaxComputeShader_.module; }
+    VkShaderModule getOctreeShaderModule() const { return octreeMinMaxComputeShader_.module; }
+    
+    // Transfer ownership of resources to prevent destruction
+    void transferResourceOwnership() {
+        leafPipeline_ = VK_NULL_HANDLE;
+        octreePipeline_ = VK_NULL_HANDLE;
+        leafPipelineLayout_ = VK_NULL_HANDLE;
+        octreePipelineLayout_ = VK_NULL_HANDLE;
+        leafDescriptorSetLayout_ = VK_NULL_HANDLE;
+        octreeDescriptorSetLayout_ = VK_NULL_HANDLE;
+        leafMinMaxComputeShader_.module = VK_NULL_HANDLE;
+        octreeMinMaxComputeShader_.module = VK_NULL_HANDLE;
+    }
 
 private:
     void createLeafPipelineLayout();

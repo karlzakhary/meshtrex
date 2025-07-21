@@ -5,4 +5,7 @@
 #include "filteringOutput.h"
 #include "vulkan_context.h"
 
-ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxOutput& minMaxOutput, FilteringOutput& filterOutput, PushConstants& pushConstants);
+class GPUProfiler;
+
+ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxOutput& minMaxOutput, FilteringOutput& filterOutput, PushConstants& pushConstants,
+                                          VkCommandBuffer externalCmd = VK_NULL_HANDLE, GPUProfiler* profiler = nullptr);

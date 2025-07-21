@@ -4,13 +4,19 @@
 #include "image.h"
 #include "buffer.h"
 #include "resources.h" // Defines Image and Buffer structs
+#include "temporaryResources.h"
 #include <cstdint>
 
 // Structure to hold the results and persistent resources from the filtering process
 struct FilteringOutput {
     Buffer compactedBlockIdBuffer{}; // Buffer containing IDs of active blocks
     Buffer activeBlockCountBuffer{}; // Buffer containing the count of active blocks (atomic counter)
-    uint32_t activeBlockCount = 0; // The actual count read back from the buffer
+    // Buffer indirectDispatchBuffer{}; // Buffer for indirect mesh task dispatch (VkDrawMeshTasksIndirectCommandEXT)
+    uint32_t activeBlockCount = 0; // The actual count read back from the buffer (0 when using GPU-driven)
+    
+    // Temporary resources that need cleanup after command buffer submission
+    // Only populated when using external command buffer
+    TemporaryResources tempResources;
 
     // Add handles needed for destruction by the caller
     // If Image/Buffer structs don't store these, add them here.
@@ -23,7 +29,9 @@ struct FilteringOutput {
     FilteringOutput(FilteringOutput&& other) noexcept :
         compactedBlockIdBuffer(std::move(other.compactedBlockIdBuffer)),
         activeBlockCountBuffer(std::move(other.activeBlockCountBuffer)),
-        activeBlockCount(other.activeBlockCount)
+        // indirectDispatchBuffer(std::move(other.indirectDispatchBuffer)),
+        activeBlockCount(other.activeBlockCount),
+        tempResources(std::move(other.tempResources))
         // Move device/allocator if added
          {
             // Reset other's handles if Image/Buffer move semantics don't already
@@ -42,7 +50,9 @@ struct FilteringOutput {
 
              compactedBlockIdBuffer = std::move(other.compactedBlockIdBuffer);
              activeBlockCountBuffer = std::move(other.activeBlockCountBuffer);
+             // indirectDispatchBuffer = std::move(other.indirectDispatchBuffer);
              activeBlockCount = other.activeBlockCount;
+             tempResources = std::move(other.tempResources);
              // Move device/allocator if added
 
              other.activeBlockCount = 0; // Reset scalar type
@@ -59,6 +69,7 @@ struct FilteringOutput {
     void cleanup(VkDevice device) const {
         destroyBuffer(compactedBlockIdBuffer, device);
         destroyBuffer(activeBlockCountBuffer, device);
+        // destroyBuffer(indirectDispatchBuffer, device);
         // Reset members to indicate they are cleaned up
     }
 };

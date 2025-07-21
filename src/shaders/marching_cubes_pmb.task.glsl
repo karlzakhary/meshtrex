@@ -5,21 +5,26 @@
 #extension GL_KHR_shader_subgroup_arithmetic: require
 #extension GL_EXT_debug_printf : enable
 
+// --- Specialization Constants for Dynamic Block Dimensions ---
+layout(constant_id = 0) const uint BX = 3u;
+layout(constant_id = 1) const uint BY = 3u;
+layout(constant_id = 2) const uint BZ = 3u;
+
 // --- Configurable Parameters ---
 #define WORKGROUP_SIZE 32
+
 /* core-cell grid ---------------------------------------------------- */
-#define BX 4u
-#define BY 4u
-#define BZ 4u
-#define CELLS_PER_BLOCK 64u      /* 4×4×4 */
+const uint CELLS_PER_BLOCK = BX * BY * BZ;
+// For array sizing, use maximum expected block size
+#define MAX_CELLS_PER_BLOCK 64u  /* max 4×4×4 */
 
 /* voxel region you must read (core + 1-voxel halo) ----------------- */
-#define STRIDE 4u           /* overlap = 1 voxel */
+const uint STRIDE = BX;           /* overlap = 1 voxel */
 
 #define MAX_VERTS_PER_MESHLET 64u
 #define MAX_PRIMS_PER_MESHLET 126u
 #define MAX_MESHLETS_PER_BLOCK 8u        /* 64 cells / 5-tris ~= 13 → 8 is safe for 4³ */
-#define MAX_OCC_CELLS_PER_THREAD (CELLS_PER_BLOCK + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE
+const uint MAX_OCC_CELLS_PER_THREAD = (MAX_CELLS_PER_BLOCK + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
 
 // --- PMB Vertex Ownership Edges ---
 // These are the indices of the 3 edges a cell is responsible for generating vertices on.
@@ -33,7 +38,7 @@ taskPayloadSharedEXT struct TaskPayload {
     uint firstCell[MAX_MESHLETS_PER_BLOCK];
     uint cellCount[MAX_MESHLETS_PER_BLOCK];
     // Storing more info: (cellID << 16) | (prims << 8) | owner_verts
-    uint packedCellData[CELLS_PER_BLOCK];
+    uint packedCellData[MAX_CELLS_PER_BLOCK]; // Use max size, but only access CELLS_PER_BLOCK
 } TP;
 
 

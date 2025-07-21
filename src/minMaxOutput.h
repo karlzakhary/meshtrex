@@ -4,12 +4,17 @@
 #include "image.h"
 #include "buffer.h"
 #include "resources.h" // Defines Image and Buffer structs
+#include "temporaryResources.h"
 #include <cstdint>
 
 struct MinMaxOutput {
     Image volumeImage{};             // Handle to the uploaded volume data image
     Image minMaxImage{};             // Handle to the intermediate min/max image (optional need)
     std::vector<VkImageView> minMaxMipViews;
+    
+    // Temporary resources that need cleanup after command buffer submission
+    // Only populated when using external command buffer
+    TemporaryResources tempResources;
 
     // Add handles needed for destruction by the caller
     // If Image/Buffer structs don't store these, add them here.
@@ -22,7 +27,8 @@ struct MinMaxOutput {
     MinMaxOutput(MinMaxOutput&& other) noexcept :
         volumeImage(std::move(other.volumeImage)),
         minMaxImage(std::move(other.minMaxImage)),
-        minMaxMipViews(std::move(other.minMaxMipViews))
+        minMaxMipViews(std::move(other.minMaxMipViews)),
+        tempResources(std::move(other.tempResources))
     {}
     // Move assignment operator (optional, but good practice)
     MinMaxOutput& operator=(MinMaxOutput&& other) noexcept {
@@ -37,6 +43,7 @@ struct MinMaxOutput {
              volumeImage = std::move(other.volumeImage);
              minMaxImage = std::move(other.minMaxImage);
              minMaxMipViews = std::move(other.minMaxMipViews);
+             tempResources = std::move(other.tempResources);
         }
         return *this;
     }

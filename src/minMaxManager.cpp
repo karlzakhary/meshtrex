@@ -10,6 +10,7 @@
 #include "minMaxOutput.h"
 #include "blockFilteringTestUtils.h"
 #include "activeBlockFilteringPass.h"
+#include "gpuProfiler.h"
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -59,7 +60,8 @@ void uploadVolumeData(VkCommandBuffer commandBuffer,
 
 // --- Modified Main Orchestrating Function ---
 // Returns a struct containing handles to persistent resources
-MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstants& pushConstants)
+MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstants& pushConstants, 
+                              VkCommandBuffer externalCmd, GPUProfiler* profiler)
 {
     // --- Create Pass Objects ---
     std::string minMaxLeafShaderPath = "/spirv/minMaxLeaf.comp.spv";
@@ -70,7 +72,6 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
     // --- Prepare Resources (some persistent, some temporary) ---
     MinMaxOutput output{}; // Create the output struct to hold persistent resources
     Buffer stagingBuffer = {}; // Temporary for upload
-    Buffer countReadbackBuffer = {}; // Temporary for readback
 
     // Create MinMax output image (persistent)
     auto mipExtent = [](VkExtent3D e, uint32_t level) {
@@ -91,7 +92,14 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     
     // --- Record Command Buffer ---
-    VkCommandBuffer cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
+    VkCommandBuffer cmd;
+    bool ownCommandBuffer = (externalCmd == VK_NULL_HANDLE);
+    
+    if (ownCommandBuffer) {
+        cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
+    } else {
+        cmd = externalCmd;
+    }
     for (uint32_t l = 0; l < fullMipCount; ++l) {
         output.minMaxMipViews.push_back(createImageView(context.getDevice(), output.minMaxImage.image, VK_FORMAT_R32G32_UINT, VK_IMAGE_TYPE_3D, l, 1));
         VkImageMemoryBarrier2 minMaxPreComputeBarrier = imageBarrier(
@@ -118,9 +126,21 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
 
 
     // 3. Run MinMax Pass
+    if (profiler) {
+        profiler->beginProfileRegion(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, "MinMax_Leaf_Pass");
+    }
+    
     minMaxPass.recordLeafDispatch(cmd, output.volumeImage.imageView, output.minMaxImage.imageView, pushConstants);
+    
+    if (profiler) {
+        profiler->endProfileRegion(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
 
     /* ---- reduction passes (mip 0 → 1, 1 → 2, …) ------------------- */
+    if (profiler && fullMipCount > 1) {
+        profiler->beginProfileRegion(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, "MinMax_Octree_Reduction");
+    }
+    
     VkExtent3D extent = leafExtent;
     for (uint32_t l = 0; l < fullMipCount - 1; ++l)
     {
@@ -157,6 +177,10 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
         minMaxPass.recordOctreeDispatch(cmd, output.minMaxMipViews[l], extent, output.minMaxMipViews[l+1], dstExtent);
         extent = dstExtent;
     }
+    
+    if (profiler && fullMipCount > 1) {
+        profiler->endProfileRegion(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
 
     for (uint32_t l = 0; l < fullMipCount; ++l)
     {
@@ -170,15 +194,32 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
     }
 
     // --- End and Submit Command Buffer ---
-    endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
-    VK_CHECK(vkDeviceWaitIdle(context.getDevice()));
-    std::cout << "MinMax Compute passes finished." << std::endl;
-
-    VK_CHECK(vkDeviceWaitIdle(context.getDevice()));
-
-    // --- Cleanup Only Temporary Resources ---
-    destroyBuffer(countReadbackBuffer, context.getDevice());
-    destroyBuffer(stagingBuffer, context.getDevice());
+    if (ownCommandBuffer) {
+        endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
+        std::cout << "MinMax Compute passes finished." << std::endl;
+        
+        // --- Cleanup Only Temporary Resources ---
+        // Only destroy buffers if we own the command buffer (already submitted)
+        destroyBuffer(stagingBuffer, context.getDevice());
+    } else {
+        // When using external command buffer, we cannot destroy buffers
+        // until the command buffer is submitted by the caller
+        
+        // Store temporary buffers for later cleanup
+        output.tempResources.device = context.getDevice();
+        output.tempResources.addBuffer(stagingBuffer);
+        output.tempResources.addPipeline(minMaxPass.getLeafPipeline());
+        output.tempResources.addPipeline(minMaxPass.getOctreePipeline());
+        output.tempResources.addPipelineLayout(minMaxPass.getLeafPipelineLayout());
+        output.tempResources.addPipelineLayout(minMaxPass.getOctreePipelineLayout());
+        output.tempResources.addDescriptorSetLayout(minMaxPass.getLeafDescriptorSetLayout());
+        output.tempResources.addDescriptorSetLayout(minMaxPass.getOctreeDescriptorSetLayout());
+        output.tempResources.addShaderModule(minMaxPass.getLeafShaderModule());
+        output.tempResources.addShaderModule(minMaxPass.getOctreeShaderModule());
+        
+        // Transfer ownership to prevent double-free
+        minMaxPass.transferResourceOwnership();
+    }
 
     return output;
 }

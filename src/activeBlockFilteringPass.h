@@ -27,6 +27,17 @@ public:
                         const PushConstants& pushConstants) const;
 
     [[nodiscard]] VkPipelineLayout getPipelineLayout() const { return pipelineLayout_; }
+    [[nodiscard]] VkPipeline getPipeline() const { return pipeline_; }
+    [[nodiscard]] VkDescriptorSetLayout getDescriptorSetLayout() const { return descriptorSetLayout_; }
+    [[nodiscard]] VkShaderModule getShaderModule() const { return computeShader_.module; }
+    
+    // Transfer ownership of resources to prevent destruction
+    void transferResourceOwnership() {
+        pipeline_ = VK_NULL_HANDLE;
+        pipelineLayout_ = VK_NULL_HANDLE;
+        descriptorSetLayout_ = VK_NULL_HANDLE;
+        computeShader_.module = VK_NULL_HANDLE;
+    }
 
 private:
     void createPipelineLayout();

@@ -41,68 +41,33 @@ void main() {
     uint invocationMin = 0xFFFFFFFFu;
     uint invocationMax = 0u;
     
-    // Strategy: Each thread checks exactly 2 voxels to cover all 125 voxels
-    // 64 threads × 2 voxels = 128 > 125 needed
+    // Calculate total voxels needed for this block (blockDim + 1 in each dimension for marching cubes)
+    const uvec3 voxelsPerBlock = pc.blockDim.xyz + uvec3(1);
+    const uint totalVoxelsNeeded = voxelsPerBlock.x * voxelsPerBlock.y * voxelsPerBlock.z;
     
-    // First voxel: Regular 4x4x4 grid
-    {
-        ivec3 voxelCoord = blockStart + ivec3(localInvocationID);
-        if (all(lessThan(voxelCoord, ivec3(pc.volumeDim.xyz)))) {
-            uint value = imageLoad(volume, voxelCoord).x;
-            invocationMin = min(invocationMin, value);
-            invocationMax = max(invocationMax, value);
-        }
-    }
+    // Each thread will process multiple voxels to cover all needed voxels
+    const uint voxelsPerThread = (totalVoxelsNeeded + totalInvocations - 1) / totalInvocations;
     
-    // Second voxel: Handle the boundary layer (position 4 in each dimension)
-    // We need to cover 64 additional voxels (128 - 64 = 64)
-    if (localInvocationIndex < 61) {
-        ivec3 extraVoxel;
+    // Process voxels assigned to this thread
+    for (uint i = 0; i < voxelsPerThread; ++i) {
+        uint voxelIndex = localInvocationIndex * voxelsPerThread + i;
         
-        if (localInvocationIndex < 16) {
-            // Handle x=4 face: (4, y, z) where y,z ∈ [0,3]
-            uint y = localInvocationIndex % pc.blockDim.x;
-            uint z = localInvocationIndex / pc.blockDim.z;
-            extraVoxel = blockStart + ivec3(pc.blockDim.x, y, z);
-        }
-        else if (localInvocationIndex < 32) {
-            // Handle y=4 face: (x, 4, z) where x ∈ [0,3], z ∈ [0,3]
-            uint idx = localInvocationIndex - 16;
-            uint x = idx % pc.blockDim.x;
-            uint z = idx / pc.blockDim.z;
-            extraVoxel = blockStart + ivec3(x, pc.blockDim.y, z);
-        }
-        else if (localInvocationIndex < 48) {
-            // Handle z=4 face: (x, y, 4) where x,y ∈ [0,3]
-            uint idx = localInvocationIndex - 32;
-            uint x = idx % pc.blockDim.x;
-            uint y = idx / pc.blockDim.y;
-            extraVoxel = blockStart + ivec3(x, y, pc.blockDim.z);
-        }
-        else if (localInvocationIndex < 52) {
-            // Handle x=4, y=4 edge: (4, 4, z) where z ∈ [0,3]
-            uint z = localInvocationIndex - 48;
-            extraVoxel = blockStart + ivec3(pc.blockDim.x, pc.blockDim.y, z);
-        }
-        else if (localInvocationIndex < 56) {
-            // Handle x=4, z=4 edge: (4, y, 4) where y ∈ [0,3]
-            uint y = localInvocationIndex - 52;
-            extraVoxel = blockStart + ivec3(pc.blockDim.x, y, pc.blockDim.z);
-        }
-        else if (localInvocationIndex < 60) {
-            // Handle y=4, z=4 edge: (x, 4, 4) where x ∈ [0,3]
-            uint x = localInvocationIndex - 56;
-            extraVoxel = blockStart + ivec3(x, pc.blockDim.y, pc.blockDim.z);
-        }
-        else {
-            // Handle the corner: (4, 4, 4)
-            extraVoxel = blockStart + ivec3(pc.blockDim.xyz);
-        }
-        
-        if (all(lessThan(extraVoxel, ivec3(pc.volumeDim.xyz)))) {
-            uint value = imageLoad(volume, extraVoxel).x;
-            invocationMin = min(invocationMin, value);
-            invocationMax = max(invocationMax, value);
+        if (voxelIndex < totalVoxelsNeeded) {
+            // Convert linear index to 3D coordinates within the block
+            uvec3 localVoxel;
+            localVoxel.x = voxelIndex % voxelsPerBlock.x;
+            localVoxel.y = (voxelIndex / voxelsPerBlock.x) % voxelsPerBlock.y;
+            localVoxel.z = voxelIndex / (voxelsPerBlock.x * voxelsPerBlock.y);
+            
+            // Calculate global voxel coordinate
+            ivec3 voxelCoord = blockStart + ivec3(localVoxel);
+            
+            // Check bounds and sample
+            if (all(lessThan(voxelCoord, ivec3(pc.volumeDim.xyz)))) {
+                uint value = imageLoad(volume, voxelCoord).x;
+                invocationMin = min(invocationMin, value);
+                invocationMax = max(invocationMax, value);
+            }
         }
     }
     

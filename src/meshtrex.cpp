@@ -1,4 +1,4 @@
-#include <fstream>    // For file operations
+#include <fstream>
 #include <iostream>
 
 #ifndef __APPLE__
@@ -16,6 +16,7 @@
 
 #include "vulkan_context.h"
 #include "renderingManager.h"
+#include "profilingManager.h"
 
 RENDERDOC_API_1_1_2 *rdoc_api = NULL;
 
@@ -50,11 +51,9 @@ std::vector<uint8_t> generateSphereVolume(int width, int height, int depth) {
     return data;
 }
 
-// Use with isovalue = 128
-
 int main(int argc, char** argv) {
     try {
-        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/bonsai_256x256x256_uint8.raw");
+        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/marmoset_neurons_1024x1024x314_uint8.raw");
         float isovalue = 80;
         bool requestMeshShading = false;
 #ifndef __APPLE__
@@ -68,20 +67,15 @@ int main(int argc, char** argv) {
             assert(ret == 1);
         }
         VulkanContext context(requestMeshShading);
-        std::cout << "Vulkan context initialized for filtering." << std::endl;
 
         Volume volume = loadVolume(volumePath.c_str());
+        // Use with isovalue = 128
         // Volume volume {glm::vec3(64,64,64), "uint_8", generateSphereVolume(64,64,64)};
         std::cout << "Volume " << volumePath.c_str() << " is loaded.";
-        std::cout << "--- Debug: Printing C++ volume data values > 41 for cell (0,0,0) of block (0,0,0) ---" << std::endl;
-        // for (int i = 0; i < 1000 ; i++) {
-        //     std::cout << "CPU Vol: " << static_cast<unsigned int>(volume.volume_data[i]) << "\n" <<std::endl;
-        // }
-        std::cout << "--- End Debug: C++ specific volume data print ---" << std::endl;
-        // --- End of debug print section --
+        
         PushConstants pushConstants = {};
         pushConstants.volumeDim = glm::uvec4(volume.volume_dims, 1);
-        pushConstants.blockDim = glm::uvec4(4, 4, 4, 1);
+        pushConstants.blockDim = glm::uvec4(3, 3, 3, 1);
         pushConstants.blockGridDim = glm::uvec4(
             (volume.volume_dims.x + pushConstants.blockDim.x - 1) / pushConstants.blockDim.x,
             (volume.volume_dims.y + pushConstants.blockDim.y - 1) / pushConstants.blockDim.y,
@@ -93,71 +87,109 @@ int main(int argc, char** argv) {
                   << pushConstants.volumeDim.x << "x" << pushConstants.volumeDim.y << "x" << pushConstants.volumeDim.z << ")" << std::endl;
         std::cout << "Block grid: " << pushConstants.blockGridDim.x << "x" << pushConstants.blockGridDim.y << "x" << pushConstants.blockGridDim.z << std::endl;
 
-        MinMaxOutput minMaxOutput = computeMinMaxMip(context, volume, pushConstants);
-        FilteringOutput filteringResult = filterActiveBlocks(context, minMaxOutput, pushConstants);
-
-        std::cout << "Filtering complete. Received handles." << std::endl;
-        std::cout << "Active blocks: " << filteringResult.activeBlockCount << std::endl;
-        try {
-            ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants);
-            // writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");
-            // validateMeshletDescriptors(context, extractionResultGPU);
-            // --- NEW: Render the extracted mesh ---
-        if (extractionResultGPU.meshletCount > 0) {
-            std::cout << "\n--- Starting Renderer ---" << std::endl;
-            RenderingManager renderingManager(context);
-            renderingManager.render(extractionResultGPU);
+        // Add profiling option
+        bool enableProfiling = true; // You can make this a command line argument
+        
+        MinMaxOutput minMaxOutput;
+        FilteringOutput filteringResult;
+        
+        if (enableProfiling) {
+            std::cout << "\n--- Running with Performance Profiling ---" << std::endl;
+            
+            try {
+                ProfilingManager profiler(context.getDevice(), context.getPhysicalDevice());
+                
+                // Create command buffer for profiled GPU execution
+                VkCommandBuffer cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
+                profiler.beginFrame(cmd);
+                
+                // Run min-max generation with GPU profiling
+                minMaxOutput = computeMinMaxMip(context, volume, pushConstants, cmd, &profiler.gpu());
+                
+                // Run filtering with GPU profiling  
+                filteringResult = filterActiveBlocks(context, minMaxOutput, pushConstants, cmd, &profiler.gpu());
+                
+                // Submit the command buffer and wait for completion
+                endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
+                
+                // Read back the active block count from GPU now that command buffer is submitted
+                readActiveBlockCount(context, filteringResult);
+                
+                // Clean up temporary resources from min-max and filtering
+                minMaxOutput.tempResources.cleanup();
+                filteringResult.tempResources.cleanup();
+                
+                // Create new command buffer for extraction
+                cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
+                
+                // Run extraction with GPU profiling
+                ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants, cmd, &profiler.gpu());
+                
+                // Submit the extraction command buffer
+                endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
+                
+                // Clean up extraction temporary resources
+                extractionResultGPU.tempResources.cleanup();
+                minMaxOutput.cleanup(context.getDevice());
+                filteringResult.cleanup(context.getDevice());
+                
+                std::cout << "GPU pipeline complete. Active block count remains on GPU for indirect dispatch." << std::endl;
+                
+                profiler.setExtractionStats(
+                    0, // Active block count stays on GPU
+                    extractionResultGPU.vertexCount,
+                    extractionResultGPU.indexCount / 3,
+                    extractionResultGPU.meshletCount
+                );
+                
+                // writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");
+                
+                if (extractionResultGPU.meshletCount > 0) {
+                    std::cout << "\n--- Starting Renderer ---" << std::endl;
+                    RenderingManager renderingManager(context);
+                    renderingManager.render(extractionResultGPU);
+                } else {
+                    std::cout << "\nSkipping rendering as no meshlets were generated." << std::endl;
+                }
+                
+                profiler.endFrame();
+                profiler.printSummary();
+                profiler.exportCSV("meshtrex_profile.csv");
+            } catch (const std::exception& e) {
+                std::cerr << "Profiling error: " << e.what() << std::endl;
+                // Fall back to non-profiled execution
+                if (minMaxOutput.minMaxImage.image == VK_NULL_HANDLE) {
+                    minMaxOutput = computeMinMaxMip(context, volume, pushConstants);
+                }
+                if (filteringResult.activeBlockCount == 0) {
+                    filteringResult = filterActiveBlocks(context, minMaxOutput, pushConstants);
+                }
+            }
+            
         } else {
-            std::cout << "\nSkipping rendering as no meshlets were generated." << std::endl;
+            // Original code without profiling
+            minMaxOutput = computeMinMaxMip(context, volume, pushConstants);
+            filteringResult = filterActiveBlocks(context, minMaxOutput, pushConstants);
+            
+            std::cout << "Filtering complete. Active block count remains on GPU." << std::endl;
+            
+            try {
+                ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants);
+                writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");
+                if (extractionResultGPU.meshletCount > 0) {
+                    std::cout << "\n--- Starting Renderer ---" << std::endl;
+                    RenderingManager renderingManager(context);
+                    renderingManager.render(extractionResultGPU);
+                } else {
+                    std::cout << "\nSkipping rendering as no meshlets were generated." << std::endl;
+                }
+            } catch (std::exception& e) {
+                std::cout << e.what() << std::endl;
+            }
         }
-        } catch (std::exception& e) {
-            std::cout << e.what() << std::endl;
-        }
-
-
-        // CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
-        try {
-            // CPUExtractionOutput extractionResultCPU = extractMeshletsCPU(context, volume, filteringResult, isovalue);
-        } catch (std::exception& e) {
-            std::cout << e.what() << std::endl;
-        }
-
-        // Perform the comparison
-        // bool match = compareExtractionOutputs(context, extractionResultGPU, {});
-
-        // if (match) {
-        //     std::cout << "Verification Passed!" << std::endl;
-        // } else {
-        //     std::cout << "Verification Failed!" << std::endl;
-        // }
-        // --- Now use the results in the next stage ---
-        // Example: Setting up descriptors for a task/mesh shader
-        // VkDescriptorBufferInfo activeBlockCountInfo = { filteringResult.activeBlockCountBuffer.buffer, 0, VK_WHOLE_SIZE };
-        // VkDescriptorBufferInfo compactedBlockIdInfo = { filteringResult.compactedBlockIdBuffer.buffer, 0, VK_WHOLE_SIZE };
-        // VkDescriptorImageInfo volumeTextureInfo = { VK_NULL_HANDLE, filteringResult.volumeImage.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL }; // Assuming layout is transitioned
-
-        // ... bind these descriptors ...
-        // ... record task/mesh shader dispatch ...
-
-        // --- EVENTUALLY, when these resources are no longer needed ---
-        // (e.g., end of frame, shutdown)
-        // The caller MUST clean up the resources contained in filteringResult.
-        // It needs access to the VkDevice (and VmaAllocator if used).
-        // Get the device handle (e.g., from a global context or stored separately)
-        // VkDevice device = get_my_vulkan_device();
-
-        std::cout << "Cleaning up filtering resources..." << std::endl;
-        filteringResult.cleanup(context.getDevice());
-        minMaxOutput.cleanup(context.getDevice());
-        // Assuming destroyImage/destroyBuffer take VkDevice:
-        // destroyImage(filteringResult.volumeImage, device);
-        // destroyImage(filteringResult.minMaxImage, device); // Destroy if created/returned
-        // destroyBuffer(filteringResult.compactedBlockIdBuffer, device);
-        // destroyBuffer(filteringResult.activeBlockCountBuffer, device);
-        // Or, if FilteringOutput has a cleanup method:
-        // filteringResult.cleanup(device);
-
-
+        
+        // Note: filteringResult and minMaxOutput cleanup happens automatically
+        // when they go out of scope at the end of main()
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;

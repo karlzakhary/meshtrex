@@ -6,22 +6,26 @@
 #extension GL_KHR_shader_subgroup_arithmetic: require
 #extension GL_KHR_shader_subgroup_ballot: require
 
+// --- Specialization Constants for Dynamic Block Dimensions ---
+layout(constant_id = 0) const uint BX = 3u;
+layout(constant_id = 1) const uint BY = 3u;
+layout(constant_id = 2) const uint BZ = 3u;
+
 // --- Configurable Parameters ---
 #define WORKGROUP_SIZE 128u
-/* core-cell grid ---------------------------------------------------- */
-#define BX 4u
-#define BY 4u
-#define BZ 4u
 
 /* voxel region you must read (core + 1-voxel halo) ----------------- */
-#define BLOCK_DIM_X 5u
-#define BLOCK_DIM_Y 5u
-#define BLOCK_DIM_Z 5u
-#define STRIDE      4u           /* overlap = 1 voxel */
+const uint BLOCK_DIM_X = BX + 1u;
+const uint BLOCK_DIM_Y = BY + 1u;
+const uint BLOCK_DIM_Z = BZ + 1u;
+const uint STRIDE = BX;  /* overlap = 1 voxel */
 #define MAX_PRIMS_PER_CELL 5u
+// MAX_CELLS_IN_BLOCK must be a compile-time constant for array sizing
+// Use the maximum expected block size (e.g., 4x4x4 = 64)
 #define MAX_CELLS_IN_BLOCK 64u
-#define MAX_CELLS_PER_THREAD (MAX_CELLS_IN_BLOCK + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE
-#define MAX_PRIMS_PER_THREAD (MAX_CELLS_PER_THREAD * MAX_PRIMS_PER_CELL)
+const uint ACTUAL_CELLS_IN_BLOCK = BX * BY * BZ;
+const uint MAX_CELLS_PER_THREAD = (MAX_CELLS_IN_BLOCK + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+const uint MAX_PRIMS_PER_THREAD = MAX_CELLS_PER_THREAD * MAX_PRIMS_PER_CELL;
 #define MAX_VERTS_PER_MESHLET 64u
 #define MAX_PRIMS_PER_MESHLET 126u
 
@@ -56,7 +60,7 @@ taskPayloadSharedEXT struct TaskPayload {
     uint meshletCount;
     uint firstCell[MAX_MESHLETS_PER_BLOCK];
     uint cellCount[MAX_MESHLETS_PER_BLOCK];
-    uint packedCellData[BX * BY * BZ];
+    uint packedCellData[MAX_CELLS_IN_BLOCK]; // Use max size, but only access ACTUAL_CELLS_IN_BLOCK
 } taskPayloadIn;
 
 // --- Descriptor Set Bindings ---

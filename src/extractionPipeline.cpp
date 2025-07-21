@@ -4,6 +4,8 @@
 #include <vector>
 #include <iostream>
 #include <utility> // For std::move, std::swap
+#include <array>
+#include <cstddef> // For offsetof
 
 // Move Constructor
 ExtractionPipeline::ExtractionPipeline(ExtractionPipeline&& other) noexcept :
@@ -218,7 +220,10 @@ void ExtractionPipeline::createPipelineLayout()
                                     &pipelineLayout_));
 }
 void ExtractionPipeline::createExtractionGraphicsPipeline(VkFormat colorFormat,
-                                                          VkFormat depthFormat)
+                                                          VkFormat depthFormat,
+                                                          uint32_t blockX,
+                                                          uint32_t blockY,
+                                                          uint32_t blockZ)
 {
     // --- Define Rendering Info (needed for validation even with rasterizer
     // discard) ---
@@ -230,11 +235,31 @@ void ExtractionPipeline::createExtractionGraphicsPipeline(VkFormat colorFormat,
     pipelineRenderingInfo.depthAttachmentFormat = depthFormat;
     pipelineRenderingInfo.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
 
+    // Setup specialization constants for block dimensions
+    struct SpecializationData {
+        uint32_t blockX;
+        uint32_t blockY;
+        uint32_t blockZ;
+    } specializationData = {blockX, blockY, blockZ};
+    
+    std::array<VkSpecializationMapEntry, 3> specializationMapEntries = {{
+        {0, offsetof(SpecializationData, blockX), sizeof(uint32_t)},
+        {1, offsetof(SpecializationData, blockY), sizeof(uint32_t)},
+        {2, offsetof(SpecializationData, blockZ), sizeof(uint32_t)}
+    }};
+    
+    VkSpecializationInfo specializationInfo = {
+        static_cast<uint32_t>(specializationMapEntries.size()),
+        specializationMapEntries.data(),
+        sizeof(SpecializationData),
+        &specializationData
+    };
+    
     std::vector<VkPipelineShaderStageCreateInfo> shaderStages = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-         VK_SHADER_STAGE_TASK_BIT_EXT, taskShader_.module, "main", nullptr},
+         VK_SHADER_STAGE_TASK_BIT_EXT, taskShader_.module, "main", &specializationInfo},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-         VK_SHADER_STAGE_MESH_BIT_EXT, meshShader_.module, "main", nullptr}};
+         VK_SHADER_STAGE_MESH_BIT_EXT, meshShader_.module, "main", &specializationInfo}};
     // Most states are irrelevant if rasterization is discarded, but must be
     // valid.
     VkPipelineVertexInputStateCreateInfo vertexInputInfo = {
@@ -316,8 +341,6 @@ void ExtractionPipeline::createExtractionGraphicsPipeline(VkFormat colorFormat,
 
     VK_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1,
                                        &pipelineInfo, nullptr, &pipeline_));
-    std::cout << "Extraction pipeline (Task/Mesh, Rasterizer Discard) created."
-              << std::endl;
 }
 
 void ExtractionPipeline::createDescriptorPool()
@@ -351,7 +374,10 @@ void ExtractionPipeline::allocateDescriptorSets()
 bool ExtractionPipeline::setup(
     VkDevice device,
     VkFormat colorFormat,
-    VkFormat depthFormat
+    VkFormat depthFormat,
+    uint32_t blockX,
+    uint32_t blockY,
+    uint32_t blockZ
 ) {
     // Prevent double setup without cleanup
     if (device_ != VK_NULL_HANDLE) {
@@ -366,14 +392,12 @@ bool ExtractionPipeline::setup(
 
     assert(loadShader(taskShader_, device_, taskShaderPath.c_str()));
     assert(loadShader(meshShader_, device_, meshShaderPath.c_str()));
-    std::cout << "Extraction shaders loaded." << std::endl;
 
     createPipelineLayout();
-    createExtractionGraphicsPipeline(colorFormat, depthFormat);
+    createExtractionGraphicsPipeline(colorFormat, depthFormat, blockX, blockY, blockZ);
     // --- Create Descriptor Pool & Allocate Set ---
     createDescriptorPool();
     allocateDescriptorSets();
-    std::cout << "Extraction descriptor set allocated." << std::endl;
 
     return true;
 }

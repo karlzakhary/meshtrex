@@ -25,7 +25,10 @@ public:
     bool setup(
         VkDevice device,
         VkFormat colorFormat,       // Target color attachment format
-        VkFormat depthFormat        // Target depth attachment format
+        VkFormat depthFormat,       // Target depth attachment format
+        uint32_t blockX,            // Block Dimension in X
+        uint32_t blockY,            // Block Dimension in Y
+        uint32_t blockZ             // Block Dimension in Z
     );
 
     // Explicit cleanup method (alternative or supplement to destructor)
@@ -38,6 +41,23 @@ public:
     VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE; // Assuming one set
+    
+    // Getters for resources
+    VkShaderModule getTaskShaderModule() const { return taskShader_.module; }
+    VkShaderModule getMeshShaderModule() const { return meshShader_.module; }
+    VkDescriptorPool getDescriptorPool() const { return descriptorPool_; }
+    
+    // Transfer ownership of resources to prevent destruction
+    void transferResourceOwnership() {
+        pipeline_ = VK_NULL_HANDLE;
+        pipelineLayout_ = VK_NULL_HANDLE;
+        descriptorSetLayout_ = VK_NULL_HANDLE;
+        descriptorPool_ = VK_NULL_HANDLE;
+        descriptorSet_ = VK_NULL_HANDLE;
+        taskShader_.module = VK_NULL_HANDLE;
+        meshShader_.module = VK_NULL_HANDLE;
+        device_ = VK_NULL_HANDLE;
+    }
 
 private:
     // Shader modules managed by Shader struct (RAII)
@@ -48,7 +68,10 @@ private:
     void releaseResources();
     void createPipelineLayout();
     void createExtractionGraphicsPipeline(VkFormat colorFormat,
-                                          VkFormat depthFormat);
+                                          VkFormat depthFormat,
+                                          uint32_t blockX,
+                                          uint32_t blockY,
+                                          uint32_t blockZ);
     void createDescriptorPool();
     void allocateDescriptorSets();
 };

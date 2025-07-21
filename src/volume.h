@@ -26,9 +26,8 @@ inline Volume loadVolume(const char *path)
     const glm::uvec3 volume_dims(
         std::stoi((*matches)[2]), std::stoi((*matches)[3]), std::stoi((*matches)[4]));
     const std::string volume_type = (*matches)[5];
-
     const size_t volume_bytes =
-        static_cast<size_t>(volume_dims.x) * static_cast<size_t>(volume_dims.y) * static_cast<size_t>(volume_dims.z);
+        static_cast<size_t>(volume_dims.x) * static_cast<size_t>(volume_dims.y) * static_cast<size_t>(volume_dims.z) * (volume_type == "uint8" ? 1 : 2);
     std::vector<uint8_t> volume_data(volume_bytes, 0);
     std::ifstream fin(file.c_str(), std::ios::binary);
     if (!fin) {

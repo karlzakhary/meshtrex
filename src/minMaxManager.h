@@ -17,4 +17,5 @@
 
 // --- Modified Main Orchestrating Function ---
 // Returns a struct containing handles to persistent resources
-MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstants& pushConstants);
+MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstants& pushConstants, 
+                              VkCommandBuffer externalCmd = VK_NULL_HANDLE, class GPUProfiler* profiler = nullptr);
