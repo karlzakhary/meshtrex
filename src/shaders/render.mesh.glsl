@@ -40,6 +40,7 @@ layout(push_constant) uniform PushConstants {
 
 layout(location = 0) out PerVertexData {
     vec3 normal;
+    flat uint meshletID;
 } outData[];
 
 
@@ -88,6 +89,8 @@ void main()
 
         gl_MeshVerticesEXT[i].gl_Position = pc.viewProj * v.position;
         outData[i].normal = v.normal.xyz;
+        // Use a combination of large meshlet ID and sub-meshlet ID for unique coloring
+        outData[i].meshletID = payload.largeMeshletID * 8u + subMeshletID;
     }
 
     // --- Step 2: Load and remap indices ---

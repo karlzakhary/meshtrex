@@ -12,7 +12,7 @@ layout(constant_id = 1) const uint BY = 3u;
 layout(constant_id = 2) const uint BZ = 3u;
 
 // --- Configurable Parameters ---
-#define WORKGROUP_SIZE 128u
+#define WORKGROUP_SIZE 64u
 
 /* voxel region you must read (core + 1-voxel halo) ----------------- */
 const uint BLOCK_DIM_X = BX + 1u;

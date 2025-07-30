@@ -1,5 +1,6 @@
 #include <fstream>
 #include <iostream>
+#include <cstring>
 
 #ifndef __APPLE__
 #include <cstdint>
@@ -17,6 +18,8 @@
 #include "vulkan_context.h"
 #include "renderingManager.h"
 #include "profilingManager.h"
+#include "densityUtils.h"
+#include "common.h"
 
 RENDERDOC_API_1_1_2 *rdoc_api = NULL;
 
@@ -53,12 +56,26 @@ std::vector<uint8_t> generateSphereVolume(int width, int height, int depth) {
 
 int main(int argc, char** argv) {
     try {
-        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/marmoset_neurons_1024x1024x314_uint8.raw");
+        bool pmb = true;
+        // Parse command line arguments
+        bool useDensityDispatch = false;
+        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/aneurism_256x256x256_uint8.raw");
         float isovalue = 80;
         bool requestMeshShading = false;
 #ifndef __APPLE__
         requestMeshShading = true;
 #endif
+        
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--density-dispatch") == 0) {
+                useDensityDispatch = false;
+                std::cout << "Density-based dispatch enabled" << std::endl;
+            } else if (strcmp(argv[i], "--volume") == 0 && i + 1 < argc) {
+                volumePath = argv[++i];
+            } else if (strcmp(argv[i], "--isovalue") == 0 && i + 1 < argc) {
+                isovalue = std::stof(argv[++i]);
+            }
+        }
         // For Linux, use dlopen() and dlsym()
         void *mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
         if (mod) {
@@ -123,10 +140,39 @@ int main(int argc, char** argv) {
                 cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
                 
                 // Run extraction with GPU profiling
-                ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants, cmd, &profiler.gpu());
+                ExtractionOutput extractionResultGPU;
+                if (useDensityDispatch) {
+                    // Read volume data for density analysis
+                    std::vector<uint8_t> volumeData = DensityUtils::readVolumeData(volumePath);
+                    extractionResultGPU = extractMeshletDescriptorsWithDensity(
+                        context, minMaxOutput, filteringResult, pushConstants, 
+                        volume, true, cmd, &profiler.gpu(), pmb);
+                } else {
+                    extractionResultGPU = extractMeshletDescriptors(
+                        context, minMaxOutput, filteringResult, pushConstants, 
+                        cmd, &profiler.gpu(), pmb);
+                }
                 
                 // Submit the extraction command buffer
                 endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
+                
+                // Debug validation for density-based extraction
+                if (useDensityDispatch) {
+                    uint32_t actualVertices = readCounterFromBuffer(context, extractionResultGPU.vertexCountBuffer);
+                    uint32_t actualIndices = readCounterFromBuffer(context, extractionResultGPU.indexCountBuffer);
+                    uint32_t actualMeshlets = readCounterFromBuffer(context, extractionResultGPU.meshletDescriptorCountBuffer);
+                    
+                    std::cout << "Density-based extraction results: " << actualVertices << " vertices, " 
+                              << actualIndices << " indices (" << actualIndices/3 << " triangles), "
+                              << actualMeshlets << " meshlets" << std::endl;
+                    
+                    // Warning if output seems too low
+                    if (actualIndices < 100 && filteringResult.activeBlockCount > 10) {
+                        std::cout << "WARNING: Suspiciously low triangle count (" << actualIndices/3 
+                                  << " triangles) for " << filteringResult.activeBlockCount 
+                                  << " active blocks!" << std::endl;
+                    }
+                }
                 
                 // Clean up extraction temporary resources
                 extractionResultGPU.tempResources.cleanup();
@@ -139,8 +185,12 @@ int main(int argc, char** argv) {
                     extractionResultGPU.indexCount / 3,
                     extractionResultGPU.meshletCount
                 );
-                
+                profiler.endFrame();
+                profiler.printSummary();
+                profiler.exportCSV("meshtrex_profile.csv");
+                                
                 // writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");
+
                 
                 if (extractionResultGPU.meshletCount > 0) {
                     std::cout << "\n--- Starting Renderer ---" << std::endl;
@@ -150,9 +200,7 @@ int main(int argc, char** argv) {
                     std::cout << "\nSkipping rendering as no meshlets were generated." << std::endl;
                 }
                 
-                profiler.endFrame();
-                profiler.printSummary();
-                profiler.exportCSV("meshtrex_profile.csv");
+                
             } catch (const std::exception& e) {
                 std::cerr << "Profiling error: " << e.what() << std::endl;
                 // Fall back to non-profiled execution
@@ -172,7 +220,35 @@ int main(int argc, char** argv) {
             std::cout << "Filtering complete. Active block count remains on GPU." << std::endl;
             
             try {
-                ExtractionOutput extractionResultGPU = extractMeshletDescriptors(context, minMaxOutput, filteringResult, pushConstants);
+                ExtractionOutput extractionResultGPU;
+                if (useDensityDispatch) {
+                    std::vector<uint8_t> volumeData = DensityUtils::readVolumeData(volumePath);
+                    extractionResultGPU = extractMeshletDescriptorsWithDensity(
+                        context, minMaxOutput, filteringResult, pushConstants, 
+                        volume, useDensityDispatch, nullptr, nullptr, pmb);
+                } else {
+                    extractionResultGPU = extractMeshletDescriptors(
+                        context, minMaxOutput, filteringResult, pushConstants, nullptr, nullptr, pmb);
+                }
+                
+                // Debug validation for density-based extraction
+                if (useDensityDispatch) {
+                    uint32_t actualVertices = readCounterFromBuffer(context, extractionResultGPU.vertexCountBuffer);
+                    uint32_t actualIndices = readCounterFromBuffer(context, extractionResultGPU.indexCountBuffer);
+                    uint32_t actualMeshlets = readCounterFromBuffer(context, extractionResultGPU.meshletDescriptorCountBuffer);
+                    
+                    std::cout << "Density-based extraction results: " << actualVertices << " vertices, " 
+                              << actualIndices << " indices (" << actualIndices/3 << " triangles), "
+                              << actualMeshlets << " meshlets" << std::endl;
+                    
+                    // Warning if output seems too low
+                    if (actualIndices < 100 && filteringResult.activeBlockCount > 10) {
+                        std::cout << "WARNING: Suspiciously low triangle count (" << actualIndices/3 
+                                  << " triangles) for " << filteringResult.activeBlockCount 
+                                  << " active blocks!" << std::endl;
+                    }
+                }
+                
                 writeGPUExtractionToOBJ(context, extractionResultGPU, "/home/ge26mot/Projects/meshtrex/build/aikalam.obj");
                 if (extractionResultGPU.meshletCount > 0) {
                     std::cout << "\n--- Starting Renderer ---" << std::endl;

@@ -338,27 +338,27 @@ void writeGPUExtractionToOBJ(
     
     // Write unique vertices
     objFile << "# Vertex positions\n";
-    for (uint32_t i = 0; i < vertexCount; ++i) {
-        const glm::vec4& pos = vertices[i].position;
+    for (uint32_t i = 0; i < finalVertexCount; ++i) {
+        const glm::vec4& pos = uniqueVertices[i].position;
         objFile << "v " << pos.x << " " << pos.y << " " << pos.z << "\n";
     }
     objFile << "\n";
     
     // Write vertex normals
     objFile << "# Vertex normals\n";
-    for (uint32_t i = 0; i < vertexCount; ++i) {
-        const glm::vec4& normal = vertices[i].normal;
+    for (uint32_t i = 0; i < finalVertexCount; ++i) {
+        const glm::vec4& normal = uniqueVertices[i].normal;
         objFile << "vn " << normal.x << " " << normal.y << " " << normal.z << "\n";
     }
     objFile << "\n";
     
     // Write faces (triangles)
     objFile << "# Faces\n";
-    for (uint32_t i = 0; i < indices.size(); i += 3) {
+    for (uint32_t i = 0; i < validIndices.size(); i += 3) {
         // OBJ uses 1-based indexing, so add 1 to each index
-        uint32_t v1 = indices[i] + 1;
-        uint32_t v2 = indices[i + 1] + 1;
-        uint32_t v3 = indices[i + 2] + 1;
+        uint32_t v1 = validIndices[i] + 1;
+        uint32_t v2 = validIndices[i + 1] + 1;
+        uint32_t v3 = validIndices[i + 2] + 1;
         
         objFile << "f " << v1 << "//" << v1 << " " << v2 << "//" << v2 << " " << v3 << "//" << v3 << "\n";
     }

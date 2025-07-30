@@ -33,6 +33,23 @@ struct alignas(16) PushConstants {
     float isovalue;           // Offset 48, Size 4.
 };
 
+struct alignas(16) DensityPushConstants {
+    glm::uvec4 volumeDim;     // Offset 0, Size 16. Shader uses .xyz
+    glm::uvec4 blockDim;      // Offset 16, Size 16. Shader uses .xyz
+    glm::uvec4 blockGridDim;  // Offset 32, Size 16. Shader uses .xyz
+    glm::vec4 voxelSize;      // Offset 48, Size 16. For proper alignment
+    glm::vec4 origin;         // Offset 64, Size 16. Volume origin
+    float isovalue;           // Offset 80, Size 4.
+    int activeBlockCount;     // Offset 84, Size 4.
+    // Density-specific offsets
+    uint32_t globalVertexOffset;   // Offset 88, Size 4.
+    uint32_t globalIndexOffset;    // Offset 92, Size 4.
+    uint32_t globalMeshletOffset;  // Offset 96, Size 4.
+    uint32_t densityClass;         // Offset 100, Size 4. 0=sparse, 1=medium, 2=dense
+    uint32_t blockOffset;          // Offset 104, Size 4. Offset into activeBlockIDs
+    uint32_t _padding;             // Offset 108, Size 4. Total size = 112 (multiple of 16)
+};
+
 struct SceneUniforms { // Data changing per frame (usually)
     glm::mat4 viewProjectionMatrix;
     glm::mat4 modelMatrix; // Or pass via push constants if it changes per object
