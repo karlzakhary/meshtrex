@@ -16,6 +16,14 @@ void writeGPUExtractionToOBJ(
     ExtractionOutput& extractionResult,
     const char* filePath);
 
+void writeGPUMeshletExtractionToOBJ(
+    VulkanContext& context,
+    ExtractionOutput& extractionResult,
+    const char* filePath);
+
 bool validateMeshletDescriptors(
     VulkanContext& context,
     const ExtractionOutput& extractionOutput);
+
+// Helper function to read a single uint32_t counter from a buffer
+uint32_t readCounterFromBuffer(VulkanContext& context, const Buffer& counterBuffer);

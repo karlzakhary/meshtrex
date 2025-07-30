@@ -28,7 +28,21 @@ public:
         VkFormat depthFormat,       // Target depth attachment format
         uint32_t blockX,            // Block Dimension in X
         uint32_t blockY,            // Block Dimension in Y
-        uint32_t blockZ             // Block Dimension in Z
+        uint32_t blockZ,             // Block Dimension in Z
+        bool pmb
+    );
+    
+    // Setup method with custom shader paths
+    bool setupWithShaders(
+        VkDevice device,
+        VkFormat colorFormat,       // Target color attachment format
+        VkFormat depthFormat,       // Target depth attachment format
+        uint32_t blockX,            // Block Dimension in X
+        uint32_t blockY,            // Block Dimension in Y
+        uint32_t blockZ,            // Block Dimension in Z
+        bool pmb,
+        const char* taskShaderPath, // Custom task shader path
+        const char* meshShaderPath  // Custom mesh shader path
     );
 
     // Explicit cleanup method (alternative or supplement to destructor)
@@ -71,7 +85,8 @@ private:
                                           VkFormat depthFormat,
                                           uint32_t blockX,
                                           uint32_t blockY,
-                                          uint32_t blockZ);
+                                          uint32_t blockZ,
+                                          bool pmb);
     void createDescriptorPool();
     void allocateDescriptorSets();
 };

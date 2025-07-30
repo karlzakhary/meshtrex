@@ -210,10 +210,19 @@ void ExtractionPipeline::createPipelineLayout()
                                          &descriptorSetLayout_));
 
     // --- Create Pipeline Layout ---
+    // Add push constant support for density-based dispatch
+    VkPushConstantRange pushConstantRange = {
+        .stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
+        .offset = 0,
+        .size = sizeof(DensityPushConstants)
+    };
+    
     VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1,
         .pSetLayouts = &descriptorSetLayout_,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushConstantRange
     };
 
     VK_CHECK(vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr,
@@ -223,7 +232,8 @@ void ExtractionPipeline::createExtractionGraphicsPipeline(VkFormat colorFormat,
                                                           VkFormat depthFormat,
                                                           uint32_t blockX,
                                                           uint32_t blockY,
-                                                          uint32_t blockZ)
+                                                          uint32_t blockZ,
+                                                          bool pmb)
 {
     // --- Define Rendering Info (needed for validation even with rasterizer
     // discard) ---
@@ -377,7 +387,27 @@ bool ExtractionPipeline::setup(
     VkFormat depthFormat,
     uint32_t blockX,
     uint32_t blockY,
-    uint32_t blockZ
+    uint32_t blockZ,
+    bool pmb
+) {
+    std::string ts = pmb ? "/spirv/marching_cubes_pmb.task.spv" : "/spirv/marching_cubes.task.spv";
+    std::string ms = pmb ? "/spirv/marching_cubes_pmb.mesh.spv" : "/spirv/marching_cubes.mesh.spv";
+    // Use default shader paths
+    return setupWithShaders(device, colorFormat, depthFormat, blockX, blockY, blockZ, pmb,
+                          ts.c_str(),
+                          ms.c_str());
+}
+
+bool ExtractionPipeline::setupWithShaders(
+    VkDevice device,
+    VkFormat colorFormat,
+    VkFormat depthFormat,
+    uint32_t blockX,
+    uint32_t blockY,
+    uint32_t blockZ,
+    bool pmb,
+    const char* taskShaderPath,
+    const char* meshShaderPath
 ) {
     // Prevent double setup without cleanup
     if (device_ != VK_NULL_HANDLE) {
@@ -387,14 +417,11 @@ bool ExtractionPipeline::setup(
     device_ = device;
 
     // --- Load Shaders ---
-    std::string taskShaderPath = "/spirv/marching_cubes_pmb.task.spv";
-    std::string meshShaderPath = "/spirv/marching_cubes_pmb.mesh.spv";
-
-    assert(loadShader(taskShader_, device_, taskShaderPath.c_str()));
-    assert(loadShader(meshShader_, device_, meshShaderPath.c_str()));
+    assert(loadShader(taskShader_, device_, taskShaderPath));
+    assert(loadShader(meshShader_, device_, meshShaderPath));
 
     createPipelineLayout();
-    createExtractionGraphicsPipeline(colorFormat, depthFormat, blockX, blockY, blockZ);
+    createExtractionGraphicsPipeline(colorFormat, depthFormat, blockX, blockY, blockZ, pmb);
     // --- Create Descriptor Pool & Allocate Set ---
     createDescriptorPool();
     allocateDescriptorSets();
