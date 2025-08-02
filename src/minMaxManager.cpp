@@ -86,6 +86,7 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
     uint32_t maxDim = std::max({ leafExtent.width, leafExtent.height, leafExtent.depth });
     uint32_t fullMipCount = 1u + static_cast<uint32_t>(std::floor(std::log2(maxDim)));
     output.minMaxMipViews.reserve(fullMipCount);
+    
     createImage(output.minMaxImage, context.getDevice(), context.getMemoryProperties(), VK_IMAGE_TYPE_3D,
                 leafExtent.width, leafExtent.height, leafExtent.depth, fullMipCount,
                 VK_FORMAT_R32G32_UINT,
