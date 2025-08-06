@@ -269,6 +269,7 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
 #endif
 
     features12.scalarBlockLayout = true;
+    features12.shaderSubgroupExtendedTypes = true;
 
     features12.descriptorIndexing = true;
     features12.shaderSampledImageArrayNonUniformIndexing = true;
