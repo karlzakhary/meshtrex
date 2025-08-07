@@ -540,7 +540,8 @@ void TransientExtractionPass::renderTransientPasses(
         printf("  [Frame %d] Pass 1: prevCount = %u, Pass 2: diffCount = %u, currCount = %u\n", 
                currentFrame, localPrevCount, localDiffCount, occlusionOutput.pvsCurrentCount);
     }
-    if (localDiffCount > 0) {
+    // Pass 2 is disabled when bypassing PVS
+    if (!bypassPVS_ && localDiffCount > 0) {
         // printf("  Rendering Pass 2: %u blocks, %u workgroups\n", occlusionOutput.pvsDifferenceCount, occlusionOutput.pvsDifferenceCount * 2);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass2Pipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass2PipelineLayout_,
@@ -776,10 +777,20 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
     vkCmdPushConstants(cmd, pass1PipelineLayout_, VK_SHADER_STAGE_MESH_BIT_EXT,
                       0, sizeof(uint32_t), &renderPass);
     
-    // Dispatch task shaders - 2 workgroups per block
-    uint32_t pass1Workgroups = occlusionOutput.pvsPreviousCount * 2;
-    printf("  Pass1: Dispatching %u workgroups for %u blocks\n", 
-           pass1Workgroups, occlusionOutput.pvsPreviousCount);
+    // Parameterized PVS bypass for testing
+    uint32_t pass1Workgroups;
+    if (bypassPVS_) {
+        // BYPASS PVS - Dispatch ALL blocks for testing
+        uint32_t totalBlocks = pushConstants.blockGridDim.x * pushConstants.blockGridDim.y * pushConstants.blockGridDim.z;
+        pass1Workgroups = totalBlocks * 2; // 2 workgroups per block
+        printf("  Pass1 (BYPASS PVS): Dispatching %u workgroups for ALL %u blocks\n", 
+               pass1Workgroups, totalBlocks);
+    } else {
+        // Use PVS from occlusion culling
+        pass1Workgroups = occlusionOutput.pvsPreviousCount * 2;
+        printf("  Pass1: Dispatching %u workgroups for %u blocks from PVS\n", 
+               pass1Workgroups, occlusionOutput.pvsPreviousCount);
+    }
     vkCmdDrawMeshTasksEXT(cmd, pass1Workgroups, 1, 1);
     
     // End rendering
@@ -834,7 +845,7 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
     
     // Skip if no new blocks to render
     if (occlusionOutput.pvsDifferenceCount == 0) {
-        printf("  Pass2: No new blocks to render\n");
+        // printf("  Pass2: No new blocks to render\n");
         return;
     }
     
@@ -998,11 +1009,23 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
     vkCmdPushConstants(cmd, pass2PipelineLayout_, VK_SHADER_STAGE_MESH_BIT_EXT,
                       0, sizeof(uint32_t), &renderPass);
     
-    // Dispatch task shaders - 2 workgroups per block
-    uint32_t pass2Workgroups = occlusionOutput.pvsDifferenceCount * 2;
-    printf("  Pass2: Dispatching %u workgroups for %u blocks\n", 
-           pass2Workgroups, occlusionOutput.pvsDifferenceCount);
-    vkCmdDrawMeshTasksEXT(cmd, pass2Workgroups, 1, 1);
+    // Parameterized PVS bypass for testing
+    uint32_t pass2Workgroups;
+    if (bypassPVS_) {
+        // When bypassing PVS, Pass 2 shouldn't run (handled in outer condition)
+        // This code shouldn't be reached when bypassPVS is true
+        pass2Workgroups = 0;
+        printf("  Pass2: SKIPPED (PVS bypass mode)\n");
+    } else {
+        // Use PVS difference from occlusion culling
+        pass2Workgroups = occlusionOutput.pvsDifferenceCount * 2;
+        printf("  Pass2: Dispatching %u workgroups for %u blocks from PVS difference\n", 
+               pass2Workgroups, occlusionOutput.pvsDifferenceCount);
+    }
+    
+    if (pass2Workgroups > 0) {
+        vkCmdDrawMeshTasksEXT(cmd, pass2Workgroups, 1, 1);
+    }
     
     // End rendering
     vkCmdEndRendering(cmd);

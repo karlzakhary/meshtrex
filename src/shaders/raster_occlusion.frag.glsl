@@ -20,7 +20,4 @@ void main() {
     // This fragment shader only executes for fragments that pass the depth test
     // Write 1 to indicate this block is visible
     visibility.visibles[inPrimitive.blockID] = 1;
-    
-    // No color output - we can discard the fragment
-    // The framebuffer attachment can be VK_ATTACHMENT_UNUSED
 }

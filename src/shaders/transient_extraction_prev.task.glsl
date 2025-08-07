@@ -10,9 +10,8 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32: require
 #extension GL_EXT_shader_subgroup_extended_types_int8: require
 
-
-// Task shader for transient extraction pass 1
-// Processes blocks from PVS_prev (previous frame's visible blocks)
+// Task shader for transient extraction pass 2
+// Processes blocks from PVS_curr-prev (newly visible blocks)
 // Implements Kreskowski-style compact cell list generation
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
@@ -25,6 +24,9 @@ layout(binding = 0, std140) uniform ViewParameters {
     uvec4 blockGridDim;   // Grid dimensions in blocks (x, y, z, _)
     float isovalue;
 } viewParams;
+
+// Define this to bypass PVS and process all blocks
+#define BYPASS_PVS 0
 
 // Volume data image
 layout(binding = 1, r8ui) uniform readonly uimage3D volumeImage;
@@ -84,57 +86,48 @@ void main() {
     uint workgroupIndex = gl_WorkGroupID.x;
     uint threadID = gl_LocalInvocationID.x;
     
-    // Check if we're within the PVS_prev count
-    if (workgroupIndex >= pvsPrev.count * 2) {
-        return;
-    }
-    
-    // Get the block ID from PVS_prev buffer
+    // --- 1. Determine which block this workgroup is processing ---
+    uint blockID;
+    uint halfIndex;
+    uint maxBlockID = viewParams.blockGridDim.x * viewParams.blockGridDim.y * viewParams.blockGridDim.z;
+
+#if BYPASS_PVS
+    if (workgroupIndex >= maxBlockID * 2) { return; }
+    blockID = workgroupIndex / 2;
+    halfIndex = workgroupIndex % 2;
+#else
+    if (workgroupIndex >= pvsPrev.count * 2) { return; }
     uint blockListIndex = workgroupIndex / 2;
-    uint halfIndex = workgroupIndex % 2;
-    uint blockID = pvsPrev.blockIds[blockListIndex];
+    halfIndex = workgroupIndex % 2;
+    blockID = pvsPrev.blockIds[blockListIndex];
+#endif
+
+    if (blockID >= maxBlockID) { return; } // Skip invalid block
     
     // Decode block coordinates
     uint blocksPerRow = viewParams.blockGridDim.x;
-    uint blocksPerSlice = viewParams.blockGridDim.x * viewParams.blockGridDim.y;
-    
-    uint blockZ = blockID / blocksPerSlice;
-    uint remaining = blockID % blocksPerSlice;
-    uint blockY = remaining / blocksPerRow;
-    uint blockX = remaining % blocksPerRow;
-    
-    uvec3 blockCoord = uvec3(blockX, blockY, blockZ);
+    uint blocksPerSlice = blocksPerRow * viewParams.blockGridDim.y;
+    uvec3 blockCoord = uvec3(blockID % blocksPerRow, (blockID / blocksPerRow) % viewParams.blockGridDim.y, blockID / blocksPerSlice);
     uvec3 blockBasePos = blockCoord * viewParams.blockDim.xyz;
     
-    // Process 8 voxels per thread (256 voxels / 32 threads)
-    // Plus additional boundary cells for overlap
-    uint8_t numVertsToExtractForThread[16]; // Increased for potential boundary cells
+    // --- 2. Partial Marching Cubes Analysis ---
+    uint8_t numVertsToExtractForThread[8];
     uint8_t numVoxelsChecked = uint8_t(0);
     
-    for (int voxelConfigToCheck = int(threadID); 
-         voxelConfigToCheck < 256; 
-         voxelConfigToCheck += int(gl_WorkGroupSize.x)) {
+    for (int cell_idx = int(threadID); cell_idx < 256; cell_idx += 32) {
+        ivec3 localOffset;
+        localOffset.z = cell_idx / 64;
+        int rem = cell_idx % 64;
+        localOffset.y = rem / 8;
+        localOffset.x = rem % 8;
         
-        // Unflatten voxel index to 3D position in 8x8x4 half-block
-        ivec3 unflattenedLocal3DIndex;
-        unflattenedLocal3DIndex.z = voxelConfigToCheck / 64;
-        int temp = voxelConfigToCheck % 64;
-        unflattenedLocal3DIndex.y = temp / 8;
-        unflattenedLocal3DIndex.x = temp % 8;
+        if (halfIndex == 1) { localOffset.z += 4; }
         
-        // Add half-block offset
-        if (halfIndex == 1) {
-            unflattenedLocal3DIndex.z += 4;
-        }
+        ivec3 cellSamplingIndex = ivec3(blockBasePos) + localOffset;
         
-        ivec3 cellSamplingIndex = ivec3(blockBasePos) + unflattenedLocal3DIndex;
-        
-        // Check if cell is within valid bounds (need room for 8 corners)
-        int32_t numVerts = 0;
-        if (all(lessThan(cellSamplingIndex + ivec3(1), ivec3(viewParams.volumeDim.xyz)))) {
-            // Sample 8 corners
-            float sampledValues[8];
-        sampledValues[0] = sampleVolume(vec3(cellSamplingIndex));
+        // Sample 8 corners
+        float sampledValues[8];
+        sampledValues[0] = sampleVolume(vec3(cellSamplingIndex) + vec3(0, 0, 0));
         sampledValues[1] = sampleVolume(vec3(cellSamplingIndex) + vec3(1, 0, 0));
         sampledValues[2] = sampleVolume(vec3(cellSamplingIndex) + vec3(1, 1, 0));
         sampledValues[3] = sampleVolume(vec3(cellSamplingIndex) + vec3(0, 1, 0));
@@ -143,91 +136,77 @@ void main() {
         sampledValues[6] = sampleVolume(vec3(cellSamplingIndex) + vec3(1, 1, 1));
         sampledValues[7] = sampleVolume(vec3(cellSamplingIndex) + vec3(0, 1, 1));
         
-            // Compute cube index
-            uint32_t cubeIndex = 0;
-            float scaledIsovalue = viewParams.isovalue * 255.0;
-            for (uint8_t cornerIdx = uint8_t(0); cornerIdx < uint8_t(8); ++cornerIdx) {
-                cubeIndex += (uint32_t(sampledValues[cornerIdx] < scaledIsovalue) << cornerIdx);
+        uint32_t cubeIndex = 0;
+        float scaledIsovalue = viewParams.isovalue * 255.0;
+        for (uint8_t i = uint8_t(0); i < 8; ++i) {
+            if (sampledValues[i] < scaledIsovalue) {
+                cubeIndex |= (1u << i);
             }
-            
-            numVerts = int(numUniqueVerticesPerCell[cubeIndex]);
         }
         
+        int32_t numVerts = int(numUniqueVerticesPerCell[cubeIndex]);
         numVertsToExtractForThread[numVoxelsChecked++] = uint8_t(numVerts);
-        macroBlockSharedVertices[voxelConfigToCheck] = numVerts;
+        macroBlockSharedVertices[cell_idx] = numVerts;
     }
     
-    // Perform ballot voting to find occupied voxels
-    uvec4 occupationVotesForAllVoxels[8];
-    uint8_t numOccupiedVoxelsInGroup[8];
-    uint8_t occupiedVoxelOffsetInCurrentGroup[8];
-    
-    for (int voxelGroupOccupancyCheckIdx = 0; voxelGroupOccupancyCheckIdx < 8; ++voxelGroupOccupancyCheckIdx) {
-        uvec4 occupationVotes = subgroupBallot(uint8_t(0) != numVertsToExtractForThread[voxelGroupOccupancyCheckIdx]);
-        numOccupiedVoxelsInGroup[voxelGroupOccupancyCheckIdx] = uint8_t(subgroupBallotBitCount(occupationVotes));
-        occupiedVoxelOffsetInCurrentGroup[voxelGroupOccupancyCheckIdx] = uint8_t(subgroupBallotExclusiveBitCount(occupationVotes));
+    // --- 3. Robust Stream Compaction (Kreskowski's method) ---
+    uint8_t numOccupiedInGroup[8], offsetInCurrentGroup[8], offsetPerWarp[8];
+    for (int i = 0; i < 8; ++i) {
+        uvec4 votes = subgroupBallot(numVertsToExtractForThread[i] > 0);
+        numOccupiedInGroup[i] = uint8_t(subgroupBallotBitCount(votes));
+        offsetInCurrentGroup[i] = uint8_t(subgroupBallotExclusiveBitCount(votes));
     }
-    
-    // Calculate offsets for occupied voxel storage
-    uint8_t occupiedVoxelOffsetPerWarp[8];
-    occupiedVoxelOffsetPerWarp[0] = uint8_t(0);
-    
-    for (uint32_t groupIdxToBroadcast = 0; groupIdxToBroadcast < 8; ++groupIdxToBroadcast) {
-        if (0 != groupIdxToBroadcast) {
-            occupiedVoxelOffsetPerWarp[groupIdxToBroadcast] = 
-                uint8_t(occupiedVoxelOffsetPerWarp[groupIdxToBroadcast - 1] + 
-                       subgroupBroadcast(numOccupiedVoxelsInGroup[groupIdxToBroadcast - 1], 31));
+    offsetPerWarp[0] = uint8_t(0);
+    for (int i = 0; i < 8; ++i) {
+        if (i > 0) {
+            offsetPerWarp[i] = uint8_t(offsetPerWarp[i-1] + subgroupBroadcast(numOccupiedInGroup[i-1], 31));
         }
-        
-        if (uint8_t(0) != numVertsToExtractForThread[groupIdxToBroadcast]) {
-            uint writeOffset = uint32_t(occupiedVoxelOffsetPerWarp[groupIdxToBroadcast]) + 
-                               uint32_t(occupiedVoxelOffsetInCurrentGroup[groupIdxToBroadcast]);
-            OUT.denseOccupancyIndex[writeOffset] = uint8_t(gl_WorkGroupSize.x * groupIdxToBroadcast + threadID);
+        if (numVertsToExtractForThread[i] > 0) {
+            uint writeOffset = uint(offsetPerWarp[i]) + uint(offsetInCurrentGroup[i]);
+            OUT.denseOccupancyIndex[writeOffset] = uint8_t(threadID + i * 32);
         }
     }
     
-    uint32_t totalNumOccupiedVoxels = uint32_t(occupiedVoxelOffsetPerWarp[7] + numOccupiedVoxelsInGroup[7]);
-    totalNumOccupiedVoxels = subgroupBroadcast(totalNumOccupiedVoxels, 31);
-    
-    // Thread 0 compiles dense voxel lists for mesh shader workgroups
+    // --- 4. Batch Creation and Emission (Thread 0 only) ---
     if (threadID == 0) {
+        uint32_t totalNumOccupiedVoxels = uint32_t(offsetPerWarp[7] + subgroupBroadcast(numOccupiedInGroup[7], 31));
+        
         uint vertexCount = 0;
         uint cellCount = 0;
-        
         uint32_t extractionGroupStartIndex = 0;
-        uint32_t extractionGroupLength = 0;
-        
         uint8_t numSubgroupsCreated = uint8_t(0);
         
-        // Create maximally occupied warps (up to 64 vertices or 32 cells)
-        for (int32_t cellIdx = 0; cellIdx < totalNumOccupiedVoxels; ++cellIdx) {
-            uint32_t currOccupiedVoxelIdx = uint16_t(OUT.denseOccupancyIndex[cellIdx]);
-            uint32_t currNumVertices = macroBlockSharedVertices[currOccupiedVoxelIdx];
+        for (int32_t i = 0; i < totalNumOccupiedVoxels; ++i) {
+            uint32_t occupiedIndex = uint32_t(OUT.denseOccupancyIndex[i]);
+            uint32_t numVerts = macroBlockSharedVertices[occupiedIndex];
             
-            if (cellCount == 32 || (vertexCount + currNumVertices > 96)) {
-                int writeBaseOffset = int(numSubgroupsCreated) * 2;
-                OUT.offsetAndLength[writeBaseOffset + 0] = uint8_t(extractionGroupStartIndex);
-                OUT.offsetAndLength[writeBaseOffset + 1] = uint8_t(cellCount);
+            if (cellCount == 32 || (vertexCount + numVerts > 64)) { // Use 96 to match original
+                int writeOffset = int(numSubgroupsCreated) * 2;
+                OUT.offsetAndLength[writeOffset + 0] = uint8_t(extractionGroupStartIndex);
+                OUT.offsetAndLength[writeOffset + 1] = uint8_t(cellCount);
                 
                 extractionGroupStartIndex += cellCount;
                 vertexCount = 0;
                 cellCount = 0;
-                ++numSubgroupsCreated;
+                numSubgroupsCreated++;
             }
-            
-            ++cellCount;
-            vertexCount += currNumVertices;
+            cellCount++;
+            vertexCount += numVerts;
         }
         
-        // Write final group
-        int writeBaseOffset = int(numSubgroupsCreated) * 2;
-        OUT.offsetAndLength[writeBaseOffset + 0] = uint8_t(extractionGroupStartIndex);
-        OUT.offsetAndLength[writeBaseOffset + 1] = uint8_t(cellCount);
-        ++numSubgroupsCreated;
+        // Unconditionally write the final batch
+        int writeOffset = int(numSubgroupsCreated) * 2;
+        OUT.offsetAndLength[writeOffset + 0] = uint8_t(extractionGroupStartIndex);
+        OUT.offsetAndLength[writeOffset + 1] = uint8_t(cellCount);
+        if (cellCount > 0) {
+            numSubgroupsCreated++;
+        }
         
         OUT.blockID = blockID;
         OUT.halfIndex = halfIndex;
         
-        EmitMeshTasksEXT(numSubgroupsCreated, 1, 1);
+        if (numSubgroupsCreated > 0) {
+            EmitMeshTasksEXT(numSubgroupsCreated, 1, 1);
+        }
     }
 }

@@ -404,11 +404,6 @@ void main() {
     uint blockID = IN.blockID;
     uint halfIndex = IN.halfIndex;
     
-    // Debug problematic blocks
-    if (blockID >= 288 && blockID <= 296 && threadID == 0) {
-        debugPrintfEXT("Processing block %d, half %d, numActive %d", 
-                      blockID, halfIndex, numActiveThreads);
-    }
     
     // Decode block coordinates
     uint blocksPerRow = viewParams.blockGridDim.x;
@@ -454,14 +449,6 @@ void main() {
         
         uvec3 cellSamplingIndex = blockBasePos + unflattenedLocalIndex;
         
-        // Skip cells at the volume boundary (need room for 8 corners)
-        // Marching cubes samples from cell position to cell position + 1 in each direction
-        if (any(greaterThanEqual(cellSamplingIndex + uvec3(1), viewParams.volumeDim.xyz))) {
-            // Cell would sample outside volume bounds, skip it
-            numVerticesFromCell = 0;
-            cubeIndex = 0;
-        } else {
-        
         // Sample 8 corners
         values[0] = sampleVolume(vec3(cellSamplingIndex));
         values[1] = sampleVolume(vec3(cellSamplingIndex) + vec3(1, 0, 0));
@@ -474,15 +461,7 @@ void main() {
         
         // Compute cube index
         float scaledIsovalue = viewParams.isovalue * 255.0;
-        
-        // Debug values for first cell
-        // if (threadID == 0 && workgroupID < 2) {
-        //     debugPrintfEXT("Cell values: block %d, pos (%d,%d,%d), vals: %f,%f,%f,%f,%f,%f,%f,%f, iso: %f",
-        //                   blockID, cellSamplingIndex.x, cellSamplingIndex.y, cellSamplingIndex.z,
-        //                   values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7],
-        //                   scaledIsovalue);
-        // }
-        
+
         for (uint i = 0; i < 8; i++) {
             if (values[i] < scaledIsovalue) {
                 cubeIndex |= (1u << i);
@@ -532,7 +511,6 @@ void main() {
         vertexPosList[10] = vertexInterp(scaledIsovalue, cellVertexPositions[2], cellVertexPositions[6], values[2], values[6]);
         // Edge 11: vertices 3-7
         vertexPosList[11] = vertexInterp(scaledIsovalue, cellVertexPositions[3], cellVertexPositions[7], values[3], values[7]);
-        } // End of boundary check
     }
     
     // Perform subgroup prefix sum to get vertex write offsets
@@ -583,18 +561,8 @@ void main() {
                     uint8_t attributeWriteOffset = uint8_t(vertexWriteOffset) + numUniqueVerticesWritten;
                     vec3 vertPos = vertexPosList[edgeIdx];
                     
-                    // Keep vertices in world/voxel space - the view-projection matrix handles transformation
-                    // No need to normalize to [-1, 1] as that's done by the projection
-                    
-                    // Debug first vertex position and transformation
                     vec4 clipPos = viewParams.viewProj * vec4(vertPos, 1.0);
-                    // if (threadID == 0 && numUniqueVerticesWritten == 0 && workgroupID < 5) {
-                    //     debugPrintfEXT("Vertex: block %d, world (%f,%f,%f) -> clip (%f,%f,%f,%f)",
-                    //                   blockID, 
-                    //                   vertPos.x, vertPos.y, vertPos.z,
-                    //                   clipPos.x, clipPos.y, clipPos.z, clipPos.w);
-                    // }
-                    
+
                     gl_MeshVerticesEXT[attributeWriteOffset].gl_Position = clipPos;
                     outNormal[attributeWriteOffset] = computeGradient(vertPos);
                     outWorldPos[attributeWriteOffset] = vertPos;
@@ -615,27 +583,20 @@ void main() {
         // Now write complete triangles
         uint triangleWriteOffset = (intraWarpCellIndicesPrefixSum - totalIndicesPerCell) / 3;
         for (uint t = 0; t < triangleCount; t += 3) {
-            gl_PrimitiveTriangleIndicesEXT[triangleWriteOffset + (t / 3)] = 
-                uvec3(triangleIndices[t], triangleIndices[t + 1], triangleIndices[t + 2]);
+            uvec3 indices = uvec3(triangleIndices[t], triangleIndices[t + 1], triangleIndices[t + 2]);
+            
+            gl_PrimitiveTriangleIndicesEXT[triangleWriteOffset + (t / 3)] = indices;
         }
     }
     
     // Get total indices from thread 31's prefix sum
     uint totalIndices = subgroupBroadcast(intraWarpCellIndicesPrefixSum, 31);
     
-    // CRITICAL: Ensure all threads complete their vertex and primitive writes
-    // before any thread calls SetMeshOutputsEXT
     barrier();
     
     // Thread 0 sets the mesh outputs (using thread 0 for consistency)
     if (threadID == 0) {
         uint totalPrimitives = totalIndices / 3;
-        
-        // Debug output
-        // if (blockID == 292 || workgroupID == 0) {
-        //     debugPrintfEXT("Mesh shader: block %d, half %d, active threads %d, vertices %d, primitives %d",
-        //                   blockID, halfIndex, numActiveThreads, totalNumVertices, totalPrimitives);
-        // }
         
         SetMeshOutputsEXT(uint8_t(totalNumVertices), uint8_t(totalPrimitives));
     }

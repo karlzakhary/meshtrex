@@ -152,6 +152,9 @@ private:
     // Swapchain format
     VkFormat swapchainFormat_;
     
+    // PVS bypass control for testing
+    bool bypassPVS_ = false;  // Set to true to bypass occlusion culling
+    
     void createPipelineLayouts();
     void createPipelines();
     void loadShaders();
