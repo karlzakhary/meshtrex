@@ -107,7 +107,8 @@ void main() {
     uvec3 blockBasePos = blockCoord * viewParams.blockDim.xyz;
     
     // Process 8 voxels per thread (256 voxels / 32 threads)
-    uint8_t numVertsToExtractForThread[8];
+    // Plus additional boundary cells for overlap
+    uint8_t numVertsToExtractForThread[16]; // Increased for potential boundary cells
     uint8_t numVoxelsChecked = uint8_t(0);
     
     for (int voxelConfigToCheck = int(threadID); 
@@ -226,12 +227,6 @@ void main() {
         
         OUT.blockID = blockID;
         OUT.halfIndex = halfIndex;
-        
-        // Debug output
-        if (workgroupIndex == 0 || blockID == 292) {
-            debugPrintfEXT("Task shader: block %d, half %d, occupied cells: %d, meshlets: %d", 
-                          blockID, halfIndex, totalNumOccupiedVoxels, numSubgroupsCreated);
-        }
         
         EmitMeshTasksEXT(numSubgroupsCreated, 1, 1);
     }

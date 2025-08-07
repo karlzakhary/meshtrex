@@ -218,6 +218,11 @@ void RasterOcclusionPass::createOcclusionPipeline() {
     rasterizationState.cullMode = VK_CULL_MODE_NONE; // No culling for proxy geometry
     rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizationState.lineWidth = 1.0f;
+    // Conservative depth bias like Kreskowski's glPolygonOffset(-1, -60)
+    // This pulls proxy geometry forward to prevent incorrect culling at boundaries
+    rasterizationState.depthBiasEnable = VK_TRUE;
+    rasterizationState.depthBiasConstantFactor = -60.0f; // Pull forward aggressively
+    rasterizationState.depthBiasSlopeFactor = -1.0f;
     
     // Multisample state
     VkPipelineMultisampleStateCreateInfo multisampleState{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};

@@ -21,11 +21,6 @@ void main() {
     // Write 1 to indicate this block is visible
     visibility.visibles[inPrimitive.blockID] = 1;
     
-    // Debug output for first few visible blocks
-    if (inPrimitive.blockID < 10) {
-        debugPrintfEXT("OcclusionFrag: Block %d passed depth test", inPrimitive.blockID);
-    }
-    
     // No color output - we can discard the fragment
     // The framebuffer attachment can be VK_ATTACHMENT_UNUSED
 }

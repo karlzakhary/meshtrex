@@ -3,11 +3,13 @@
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_int8: require
 #extension GL_EXT_debug_printf : enable
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_basic : require
 
 // Maximum vertices and primitives per mesh shader
 #define WORKGROUP_SIZE 32
-#define MAX_VERTICES 128  // 32 blocks * 4 vertices per quad
-#define MAX_PRIMITIVES 64 // 32 blocks * 2 triangles per quad
+#define MAX_VERTICES 96  // 32 blocks * 4 vertices per quad
+#define MAX_PRIMITIVES 126 // 32 blocks * 2 triangles per quad
 
 layout(local_size_x = WORKGROUP_SIZE) in;
 layout(triangles, max_vertices = MAX_VERTICES, max_primitives = MAX_PRIMITIVES) out;
@@ -32,8 +34,8 @@ layout(push_constant) uniform PushConstants {
 // Input from task shader - matches memory interface
 taskPayloadSharedEXT struct Task {
     uint baseID;              // Workgroup ID from task shader
-    uint numOccupiedBlocks;   // Number of occupied blocks in this 8x8x4 group
-    uint8_t denseOccupancyIndex[256]; // Dense array of local block indices
+    uint numOccupiedBlocks;   // Number of occupied blocks in this group (up to 256 for 8x8x4)
+    uint8_t denseOccupancyIndex[256]; // Dense array of local block indices for 8x8x4 blocks
 } taskInput;
 
 // Per-primitive output - block ID for fragment shader
@@ -53,26 +55,55 @@ uvec3 unflattenIndex(uint index, uvec2 extents) {
 
 // Convert group-local block to global block ID
 uint getGlobalBlockID(uint workgroupID, uint localBlockIndex) {
-    // Reconstruct which 8x8x4 group this is
+    //    58 -      // Reconstruct which block group this is (processing 8x8x4 groups)
+    //    58 +      // Reconstruct which 8x8x4 half this workgroup processes
+    //    59 +      // We dispatch 2 workgroups per 8x8x8 region
+    //    60        uint groupsPerRow = (params.blockGridDim.x + 7) / 8;
+    //    61        uint groupsPerSlice = groupsPerRow * ((params.blockGridDim.y + 7) / 8);
+    //    62        
+    //    63 -      uint groupID = workgroupID;
+    //    63 +      // Each 8x8x8 region gets 2 workgroups (lower and upper half)
+    //    64 +      uint regionID = workgroupID / 2;
+    //    65 +      uint halfIndex = workgroupID % 2; // 0 = lower half, 1 = upper half
+    //    66        
+    //    67 -      // Unpack group coordinates
+    //    68 -      uvec3 groupCoord;
+    //    69 -      groupCoord.z = groupID / groupsPerSlice;
+    //    70 -      uint temp = groupID % groupsPerSlice;
+    //    71 -      groupCoord.y = temp / groupsPerRow;
+    //    72 -      groupCoord.x = temp % groupsPerRow;
+    //    67 +      // Unpack region coordinates
+    //    68 +      uvec3 regionCoord;
+    //    69 +      regionCoord.z = regionID / groupsPerSlice;
+    //    70 +      uint temp = regionID % groupsPerSlice;
+    //    71 +      regionCoord.y = temp / groupsPerRow;
+    //    72 +      regionCoord.x = temp % groupsPerRow;
+    //    73        
+    //    74 -      // Starting block for this group (8x8x4)
+    //    75 -      uvec3 groupStartBlock = groupCoord * uvec3(8, 8, 4);
+    //    74 +      // Starting block for this 8x8x4 half
+    //    75 +      uvec3 groupStartBlock = regionCoord * uvec3(8, 8, 8) + uvec3(0, 0, halfIndex * 4);
+    // Reconstruct which 8x8x4 half this workgroup processes
+    // We dispatch 2 workgroups per 8x8x8 region
     uint groupsPerRow = (params.blockGridDim.x + 7) / 8;
     uint groupsPerSlice = groupsPerRow * ((params.blockGridDim.y + 7) / 8);
     
-    uint group888ID = workgroupID / 2;
-    uint halfIndex = workgroupID % 2;
+    // Each 8x8x8 region gets 2 workgroups (lower and upper half)
+    uint regionID = workgroupID / 2;
+    uint halfIndex = workgroupID % 2; // 0 = lower half, 1 = upper half
     
-    // Unpack 8x8x8 group coordinates
-    uvec3 group888Coord;
-    group888Coord.z = group888ID / groupsPerSlice;
-    uint temp = group888ID % groupsPerSlice;
-    group888Coord.y = temp / groupsPerRow;
-    group888Coord.x = temp % groupsPerRow;
+    // Unpack region coordinates
+    uvec3 regionCoord;
+    regionCoord.z = regionID / groupsPerSlice;
+    uint temp = regionID % groupsPerSlice;
+    regionCoord.y = temp / groupsPerRow;
+    regionCoord.x = temp % groupsPerRow;
     
     // Starting block for this 8x8x4 half
-    uvec3 groupStartBlock = group888Coord * 8;
-    groupStartBlock.z += halfIndex * 4;
+    uvec3 groupStartBlock = regionCoord * uvec3(8, 8, 8) + uvec3(0, 0, halfIndex * 4);
     
-    // Convert local index to 3D offset
-    uvec3 localBlockOffset = unflattenIndex(localBlockIndex, uvec2(8, 64));
+    // Convert local index to 3D offset within the 8x8x4 group
+    uvec3 localBlockOffset = unflattenIndex(localBlockIndex, uvec2(8, 64)); // 8x8 = 64
     
     // Global block coordinates
     uvec3 globalBlockCoord = groupStartBlock + localBlockOffset;
@@ -87,32 +118,16 @@ uint getGlobalBlockID(uint workgroupID, uint localBlockIndex) {
 vec3 projectToScreen(vec3 worldPos) {
     vec4 clipPos = pushConstants.viewProj * vec4(worldPos, 1.0);
     
-    // Debug projection for center of volume (should be visible)
-    if (worldPos.x > 31.0 && worldPos.x < 33.0 && 
-        worldPos.y > 31.0 && worldPos.y < 33.0 && 
-        worldPos.z > 31.0 && worldPos.z < 33.0) {
-        debugPrintfEXT("Projecting center: (%.1f,%.1f,%.1f) -> clip(%.2f,%.2f,%.2f,%.2f)",
-                      worldPos.x, worldPos.y, worldPos.z,
-                      clipPos.x, clipPos.y, clipPos.z, clipPos.w);
-    }
-    
     if (clipPos.w > 0.0) {
         vec3 ndc = clipPos.xyz / clipPos.w;
         return ndc;
     }
     return vec3(0.0);
 }
-shared uint validBlockCount;
 
 void main() {
     uint threadID = gl_LocalInvocationID.x;
     uint meshWorkgroupID = gl_WorkGroupID.x;
-    
-    // Shared counter for valid blocks
-    if (threadID == 0) {
-        validBlockCount = 0;
-    }
-    barrier();
     
     // Calculate which block this thread processes
     uint blockOffset = meshWorkgroupID * 32 + threadID;
@@ -153,6 +168,7 @@ void main() {
         vec2 screenMin = vec2(1.0);
         vec2 screenMax = vec2(-1.0);
         float minZ = 1.0;
+        float maxZ = 0.0;
         bool anyValidProjection = false;
         
         for (uint i = 0; i < 8; i++) {
@@ -162,6 +178,7 @@ void main() {
                 screenMin = min(screenMin, projectedCorners[i].xy);
                 screenMax = max(screenMax, projectedCorners[i].xy);
                 minZ = min(minZ, projectedCorners[i].z);
+                maxZ = max(maxZ, projectedCorners[i].z);
                 anyValidProjection = true;
             }
         }
@@ -172,21 +189,26 @@ void main() {
             hasValidBlock = false;
         } else {
             hasValidBlock = true;
-            atomicAdd(validBlockCount, 1);
             
             // Generate a screen-space quad with conservative depth
             uint vertexBase = threadID * 4;
             uint primitiveBase = threadID * 2;
             
-            // Use conservative depth - slightly in front of the nearest corner
-            // This ensures the quad will be tested against existing geometry
-            float conservativeZ = max(0.0, minZ - 0.001);
+            // Use MORE conservative depth and expanded bounds (like Kreskowski)
+            // This ensures blocks at boundaries aren't incorrectly culled
+            float conservativeZ = max(0.0, minZ - 0.01); // More aggressive depth offset
             
-            // Output 4 vertices for the quad
-            gl_MeshVerticesEXT[vertexBase + 0].gl_Position = vec4(screenMin.x, screenMin.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 1].gl_Position = vec4(screenMax.x, screenMin.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 2].gl_Position = vec4(screenMin.x, screenMax.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 3].gl_Position = vec4(screenMax.x, screenMax.y, conservativeZ, 1.0);
+            // Expand screen-space bounds slightly to be more conservative
+            // This helps prevent missing blocks at exact boundaries
+            vec2 expansion = vec2(0.002); // Small expansion in NDC space
+            vec2 expandedMin = screenMin - expansion;
+            vec2 expandedMax = screenMax + expansion;
+            
+            // Output 4 vertices for the expanded quad
+            gl_MeshVerticesEXT[vertexBase + 0].gl_Position = vec4(expandedMin.x, expandedMin.y, conservativeZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 1].gl_Position = vec4(expandedMax.x, expandedMin.y, conservativeZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 2].gl_Position = vec4(expandedMin.x, expandedMax.y, conservativeZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 3].gl_Position = vec4(expandedMax.x, expandedMax.y, conservativeZ, 1.0);
             
             // Output 2 triangles (6 indices)
             gl_PrimitiveTriangleIndicesEXT[primitiveBase + 0] = uvec3(vertexBase + 0, vertexBase + 1, vertexBase + 2);
@@ -204,10 +226,12 @@ void main() {
         }
     }
     
-    // Synchronize threads
-    barrier();
+    // Simply count how many valid blocks we have
+    // In Kreskowski's approach, the task shader already provides a compacted list
+    // so ALL threads that receive a block will generate geometry
+    uint validBlockCount = min(taskInput.numOccupiedBlocks - meshWorkgroupID * 32, 32u);
     
-    // Last thread sets the output counts based on valid blocks
+    // Only thread 0 sets the output counts (like Kreskowski)
     if (threadID == 0) {
         uint vertexCount = validBlockCount * 4;
         uint primitiveCount = validBlockCount * 2;
