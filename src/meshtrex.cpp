@@ -186,12 +186,15 @@ void renderTemporalCoherence(
         VK_CHECK(vkWaitForFences(device, 1, &frameFence, VK_TRUE, UINT64_MAX));
         VK_CHECK(vkResetFences(device, 1, &frameFence));
         
+        // Clean up temporary resources from previous frame (after fence wait)
+        occlusionPass.cleanupIndirectTempResources();
+        transientPass.cleanupTempResources();
+        
         // Read back PVS counts from GPU before cleaning up resources
         occlusionOutput.readbackPVSCounts(device);
         
         // Clean up temporary resources from previous frame now that GPU is done
         occlusionOutput.cleanupTempResources(device);
-        transientPass.cleanupTempResources();
         
         // Acquire swapchain image
         uint32_t imageIndex;
@@ -629,6 +632,9 @@ void renderTransientExtraction(
         submitInfo.pSignalSemaphores = &releaseSemaphore;
         
         VK_CHECK(vkQueueSubmit(context.getQueue(), 1, &submitInfo, frameFence));
+        
+        // Clean up temporary resources after submission
+        // Note: Temp resources from extractAndRenderTransient are cleaned up internally
         
         // Present
         VkPresentInfoKHR presentInfo = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};

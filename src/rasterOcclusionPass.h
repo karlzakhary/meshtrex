@@ -119,6 +119,11 @@ public:
         VkImageView depthImageView,
         VkExtent2D renderExtent
     );
+    
+    // Clean up temporary resources for indirect draw (call after command buffer submission)
+    void cleanupIndirectTempResources() {
+        indirectTempResources_.destroy(device_);
+    }
 
 private:
     const VulkanContext& context_;
@@ -146,6 +151,27 @@ private:
     VkShaderModule visibilityCompactionShader_ = VK_NULL_HANDLE;
     VkShaderModule buildOutputShader_ = VK_NULL_HANDLE;
     
+    // Indirect draw support
+    VkBuffer indirectDrawBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory indirectDrawMemory_ = VK_NULL_HANDLE;
+    VkPipeline indirectUpdatePipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout indirectUpdatePipelineLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout indirectUpdateDescriptorSetLayout_ = VK_NULL_HANDLE;
+    VkShaderModule indirectUpdateComputeShader_ = VK_NULL_HANDLE;
+    bool useIndirectDraw_ = true;
+    
+    // Temporary descriptor pool for indirect update (cleaned up after command submission)
+    struct IndirectTempResources {
+        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+        
+        void destroy(VkDevice device) {
+            if (descriptorPool) {
+                vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+                descriptorPool = VK_NULL_HANDLE;
+            }
+        }
+    } indirectTempResources_;
+    
     void createPipelineLayout();
     void createOcclusionPipeline();
     void createVisibilityCompactionPipeline();
@@ -159,4 +185,9 @@ private:
     
     // Initialize output for first frame
     void initializeOutput(Output& output, uint32_t numBlocks);
+    
+    // Indirect draw helpers
+    void createIndirectDrawBuffer();
+    void createIndirectUpdatePipeline();
+    void updateIndirectDrawBufferGPU(VkCommandBuffer cmd, uint32_t totalBlocks);
 };

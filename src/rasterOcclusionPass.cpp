@@ -20,6 +20,9 @@ RasterOcclusionPass::RasterOcclusionPass(const VulkanContext& context)
     createOcclusionPipeline();
     createVisibilityCompactionPipeline();
     createBuildOutputPipeline();
+    createIndirectDrawBuffer();
+    createIndirectUpdatePipeline();
+    useIndirectDraw_ = true;  // Enable indirect drawing by default
 }
 
 RasterOcclusionPass::~RasterOcclusionPass() {
@@ -67,6 +70,26 @@ RasterOcclusionPass::~RasterOcclusionPass() {
     }
     if (buildOutputShader_ != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device_, buildOutputShader_, nullptr);
+    }
+    
+    // Cleanup indirect draw resources
+    if (indirectDrawBuffer_ != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, indirectDrawBuffer_, nullptr);
+    }
+    if (indirectDrawMemory_ != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, indirectDrawMemory_, nullptr);
+    }
+    if (indirectUpdatePipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, indirectUpdatePipeline_, nullptr);
+    }
+    if (indirectUpdatePipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, indirectUpdatePipelineLayout_, nullptr);
+    }
+    if (indirectUpdateDescriptorSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, indirectUpdateDescriptorSetLayout_, nullptr);
+    }
+    if (indirectUpdateComputeShader_ != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device_, indirectUpdateComputeShader_, nullptr);
     }
 }
 
@@ -589,6 +612,11 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
     renderingInfo.layerCount = 1;
     renderingInfo.pDepthAttachment = &depthAttachment;
     
+    // If using indirect draw, update the indirect buffer BEFORE beginning rendering
+    if (useIndirectDraw_) {
+        updateIndirectDrawBufferGPU(cmd, totalBlocks);
+    }
+    
     vkCmdBeginRendering(cmd, &renderingInfo);
     
     // Bind occlusion pipeline
@@ -601,16 +629,21 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
                       VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
                       0, sizeof(glm::mat4), &viewProjMatrix);
     
-    // Dispatch task shaders - blocks are processed in 8x8x8 groups, split into two 8x8x4 halves
-    // So we need 2 workgroups per 8x8x8 = 512 blocks
-    uint32_t blocksPerGroup = 8 * 8 * 8; // 512
-    uint32_t numGroups = (totalBlocks + blocksPerGroup - 1) / blocksPerGroup;
-    uint32_t numWorkgroups = numGroups * 2; // 2 workgroups per 8x8x8 group
-    
-    // Debug output for first few frames
-    static int occlusionFrame = 0;
-    
-    vkCmdDrawMeshTasksEXT(cmd, numWorkgroups, 1, 1);
+    if (useIndirectDraw_) {
+        // Use indirect draw - GPU calculates workgroup count
+        vkCmdDrawMeshTasksIndirectEXT(cmd, indirectDrawBuffer_, 0, 1, 0);
+    } else {
+        // Dispatch task shaders - blocks are processed in 8x8x8 groups, split into two 8x8x4 halves
+        // So we need 2 workgroups per 8x8x8 = 512 blocks
+        uint32_t blocksPerGroup = 8 * 8 * 8; // 512
+        uint32_t numGroups = (totalBlocks + blocksPerGroup - 1) / blocksPerGroup;
+        uint32_t numWorkgroups = numGroups * 2; // 2 workgroups per 8x8x8 group
+        
+        // Debug output for first few frames
+        static int occlusionFrame = 0;
+        
+        vkCmdDrawMeshTasksEXT(cmd, numWorkgroups, 1, 1);
+    }
     
     // End rendering
     vkCmdEndRendering(cmd);
@@ -1097,6 +1130,11 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
     renderingInfo.layerCount = 1;
     renderingInfo.pDepthAttachment = &depthAttachment;
     
+    // If using indirect draw, update the indirect buffer BEFORE beginning rendering
+    if (useIndirectDraw_) {
+        updateIndirectDrawBufferGPU(cmd, totalBlocks);
+    }
+    
     vkCmdBeginRendering(cmd, &renderingInfo);
     
     // Bind occlusion pipeline
@@ -1109,11 +1147,16 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
                       VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
                       0, sizeof(glm::mat4), &viewProjMatrix);
     
-    // Dispatch task shaders
-    uint32_t blocksPerGroup = 8 * 8 * 8; // 512
-    uint32_t numGroups = (totalBlocks + blocksPerGroup - 1) / blocksPerGroup;
-    uint32_t numWorkgroups = numGroups * 2; // 2 workgroups per 8x8x8 group
-    vkCmdDrawMeshTasksEXT(cmd, numWorkgroups, 1, 1);
+    if (useIndirectDraw_) {
+        // Use indirect draw - GPU calculates workgroup count
+        vkCmdDrawMeshTasksIndirectEXT(cmd, indirectDrawBuffer_, 0, 1, 0);
+    } else {
+        // Dispatch task shaders
+        uint32_t blocksPerGroup = 8 * 8 * 8; // 512
+        uint32_t numGroups = (totalBlocks + blocksPerGroup - 1) / blocksPerGroup;
+        uint32_t numWorkgroups = numGroups * 2; // 2 workgroups per 8x8x8 group
+        vkCmdDrawMeshTasksEXT(cmd, numWorkgroups, 1, 1);
+    }
     
     // End rendering
     vkCmdEndRendering(cmd);
@@ -1561,4 +1604,125 @@ void RasterOcclusionPass::Output::readbackPVSCounts(VkDevice device) {
                    readbackFrame-1, pvsPreviousCount, pvsCurrentCount, pvsDifferenceCount);
         }
     }
+}
+
+void RasterOcclusionPass::createIndirectDrawBuffer() {
+    // Create buffer for indirect draw command
+    // One command with 3 uint32_t values (groupCountX, Y, Z)
+    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufferInfo.size = sizeof(uint32_t) * 3;
+    bufferInfo.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
+                       VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    
+    VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &indirectDrawBuffer_));
+    
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(device_, indirectDrawBuffer_, &memRequirements);
+    
+    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
+                                                 memRequirements.memoryTypeBits,
+                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    
+    VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &indirectDrawMemory_));
+    VK_CHECK(vkBindBufferMemory(device_, indirectDrawBuffer_, indirectDrawMemory_, 0));
+}
+
+void RasterOcclusionPass::createIndirectUpdatePipeline() {
+    // Load compute shader
+    Shader computeShaderData{};
+    assert(loadShader(computeShaderData, device_, "/spirv/update_occlusion_indirect.comp.spv"));
+    indirectUpdateComputeShader_ = computeShaderData.module;
+    
+    // Create descriptor set layout
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = 1;
+    layoutInfo.pBindings = &binding;
+    VK_CHECK(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &indirectUpdateDescriptorSetLayout_));
+    
+    // Create pipeline layout with push constants
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = sizeof(uint32_t);  // Just totalBlockCount
+    
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &indirectUpdateDescriptorSetLayout_;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+    VK_CHECK(vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &indirectUpdatePipelineLayout_));
+    
+    // Create compute pipeline
+    VkPipelineShaderStageCreateInfo shaderStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    shaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    shaderStage.module = indirectUpdateComputeShader_;
+    shaderStage.pName = "main";
+    
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = shaderStage;
+    pipelineInfo.layout = indirectUpdatePipelineLayout_;
+    
+    VK_CHECK(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &indirectUpdatePipeline_));
+}
+
+void RasterOcclusionPass::updateIndirectDrawBufferGPU(VkCommandBuffer cmd, uint32_t totalBlocks) {
+    // Clean up any previous descriptor pool
+    indirectTempResources_.destroy(device_);
+    
+    // Create descriptor pool for compute shader
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+    
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    
+    VK_CHECK(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &indirectTempResources_.descriptorPool));
+    
+    // Allocate descriptor set
+    VkDescriptorSet descriptorSet;
+    VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocInfo.descriptorPool = indirectTempResources_.descriptorPool;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &indirectUpdateDescriptorSetLayout_;
+    VK_CHECK(vkAllocateDescriptorSets(device_, &allocInfo, &descriptorSet));
+    
+    // Update descriptor set
+    VkDescriptorBufferInfo bufferInfo{indirectDrawBuffer_, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = descriptorSet;
+    write.dstBinding = 0;
+    write.dstArrayElement = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &bufferInfo;
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    
+    // Dispatch compute shader
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, indirectUpdatePipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, indirectUpdatePipelineLayout_,
+                           0, 1, &descriptorSet, 0, nullptr);
+    vkCmdPushConstants(cmd, indirectUpdatePipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(uint32_t), &totalBlocks);
+    vkCmdDispatch(cmd, 1, 1, 1);
+    
+    // Memory barrier to ensure compute writes are visible to indirect draw
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                        0, 1, &barrier, 0, nullptr, 0, nullptr);
+    
+    // Descriptor pool is stored in indirectTempResources_ and will be cleaned up later
 }
