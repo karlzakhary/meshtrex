@@ -31,8 +31,11 @@ layout(binding = 0, std140) uniform ViewParameters {
 // Volume data image
 layout(binding = 1, r8ui) uniform readonly uimage3D volumeImage;
 
+// Marching cubes lookup tables as TBOs (shared with mesh shader)
+layout(binding = 2) uniform usamplerBuffer numVerticesTable;  // 256 entries of uint8
+
 // Min-max hierarchy for early rejection
-layout(binding = 2) uniform sampler3D minMaxTexture;
+layout(binding = 5) uniform sampler3D minMaxTexture;
 
 // PVS_prev buffer - contains visible block IDs from previous frame
 layout(binding = 14, std430) readonly buffer PrevPVSBuffer {
@@ -53,25 +56,10 @@ taskPayloadSharedEXT TaskPayload OUT;
 // Shared memory for stream compaction and vertex counting
 shared int macroBlockSharedVertices[256];
 
-// Number of unique vertices per cell configuration
-const uint numUniqueVerticesPerCell[256] = uint[256](
-    0, 3, 3, 6, 3, 6, 6, 9, 3, 6, 6, 9, 6, 9, 9, 6,
-    3, 6, 6, 9, 6, 9, 9, 12, 6, 9, 9, 12, 9, 12, 12, 9,
-    3, 6, 6, 9, 6, 9, 9, 12, 6, 9, 9, 12, 9, 12, 12, 9,
-    6, 9, 9, 6, 9, 12, 12, 9, 9, 12, 12, 9, 12, 9, 9, 6,
-    3, 6, 6, 9, 6, 9, 9, 12, 6, 9, 9, 12, 9, 12, 12, 9,
-    6, 9, 9, 12, 9, 12, 12, 12, 9, 12, 12, 12, 12, 12, 12, 9,
-    6, 9, 9, 12, 9, 12, 12, 12, 9, 12, 12, 12, 12, 12, 12, 9,
-    9, 12, 12, 9, 12, 12, 12, 9, 12, 12, 12, 9, 12, 9, 9, 6,
-    3, 6, 6, 9, 6, 9, 9, 12, 6, 9, 9, 12, 9, 12, 12, 9,
-    6, 9, 9, 12, 9, 12, 12, 12, 9, 6, 12, 9, 12, 9, 12, 6,
-    6, 9, 9, 12, 9, 12, 12, 12, 9, 12, 12, 12, 12, 12, 12, 9,
-    9, 12, 12, 9, 12, 12, 12, 9, 12, 9, 12, 6, 12, 9, 6, 3,
-    6, 9, 9, 12, 9, 12, 12, 12, 9, 12, 12, 12, 12, 12, 12, 9,
-    9, 12, 12, 12, 12, 12, 12, 6, 12, 9, 12, 9, 12, 9, 6, 3,
-    9, 12, 12, 12, 12, 12, 12, 6, 12, 12, 12, 6, 12, 6, 6, 3,
-    6, 9, 9, 6, 9, 6, 6, 3, 9, 6, 6, 3, 6, 3, 3, 0
-);
+// Helper function to get number of unique vertices for a cube configuration
+uint getNumUniqueVertices(uint cubeIndex) {
+    return texelFetch(numVerticesTable, int(cubeIndex)).r;
+}
 
 // Sample volume data at a given position
 float sampleVolume(vec3 pos) {
@@ -144,8 +132,8 @@ void main() {
             }
         }
         
-        int32_t numVerts = int(numUniqueVerticesPerCell[cubeIndex]);
-        numVertsToExtractForThread[numVoxelsChecked++] = uint8_t(numVerts);
+        uint8_t numVerts = uint8_t(getNumUniqueVertices(cubeIndex));
+        numVertsToExtractForThread[numVoxelsChecked++] = numVerts;
         macroBlockSharedVertices[cell_idx] = numVerts;
     }
     

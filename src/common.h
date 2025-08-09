@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include "glmMath.h"
+#include "mc_tables.h"
 
 #define VK_CHECK(call) \
 	do \

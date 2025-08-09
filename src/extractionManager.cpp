@@ -10,7 +10,6 @@
 #include "resources.h"
 #include "gpuProfiler.h"
 #include "vulkan_utils.h"
-#include "mc_tables.h"
 
 #include <glm/glm.hpp>
 #include <iostream>
@@ -34,9 +33,9 @@ struct MCTableUploadResult {
 
 MCTableUploadResult createTriTableBuffer(VulkanContext& context, VkCommandBuffer externalCmd = VK_NULL_HANDLE) {
     MCTableUploadResult result = {};
-    const int* triTableData = &MarchingCubes::triTable[0][0];
+    const uint8_t* triTableData = &MarchingCubes::triTable[0][0];
 
-    VkDeviceSize triTableSize = 256 * 16 * sizeof(int);
+    VkDeviceSize triTableSize = 256 * 16 * sizeof(uint8_t);
 
     createBuffer(result.stagingBuffer, context.getDevice(), context.getMemoryProperties(),
                  triTableSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -162,9 +161,9 @@ MCTableUploadResult createEdgeTableBuffer(VulkanContext& context, VkCommandBuffe
 
 MCTableUploadResult createNumVerticesBuffer(VulkanContext& context, VkCommandBuffer externalCmd = VK_NULL_HANDLE) {
     MCTableUploadResult result = {};
-    const int* numVerticesData = &MarchingCubes::numVerticesTable[0];
+    const uint8_t* numVerticesData = &MarchingCubes::numVerticesTable[0];
 
-    VkDeviceSize numVerticesSize = 256 * sizeof(int);
+    VkDeviceSize numVerticesSize = 256 * sizeof(uint8_t);
 
     createBuffer(result.stagingBuffer, context.getDevice(), context.getMemoryProperties(),
                  numVerticesSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,

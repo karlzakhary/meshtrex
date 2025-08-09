@@ -7,7 +7,6 @@
 #include "resources.h"
 #include "gpuProfiler.h"
 #include "vulkan_utils.h"
-#include "mc_tables.h"
 #include <glm/glm.hpp>
 #include <iostream>
 #include <vector>
@@ -112,8 +111,8 @@ struct MCTableUploadResult {
 
 static MCTableUploadResult createTriTableBuffer(VulkanContext& context, VkCommandBuffer cmd) {
     MCTableUploadResult result = {};
-    const int* triTableData = &MarchingCubes::triTable[0][0];
-    VkDeviceSize triTableSize = 256 * 16 * sizeof(int);
+    const uint8_t* triTableData = &MarchingCubes::triTable[0][0];
+    VkDeviceSize triTableSize = 256 * 16 * sizeof(uint8_t);
 
     createBuffer(result.stagingBuffer, context.getDevice(), context.getMemoryProperties(),
                  triTableSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,

@@ -1,6 +1,5 @@
 #include "extractionTestUtils.h"
 #include "blockFilteringTestUtils.h" // For mapUintBuffer
-#include "mc_tables.h"               // For MarchingCubes::triTable
 #include "meshoptimizer.h"
 #include "vulkan_utils.h"
 
@@ -38,7 +37,7 @@ inline glm::vec3 calculateVertexNormalCPU(const Volume& volume, const glm::vec3&
      glm::ivec3 ipos = glm::ivec3(glm::round(pos)); float dx = (static_cast<float>(sampleVolume(volume, ipos + glm::ivec3(1, 0, 0))) - static_cast<float>(sampleVolume(volume, ipos - glm::ivec3(1, 0, 0)))); float dy = (static_cast<float>(sampleVolume(volume, ipos + glm::ivec3(0, 1, 0))) - static_cast<float>(sampleVolume(volume, ipos - glm::ivec3(0, 1, 0)))); float dz = (static_cast<float>(sampleVolume(volume, ipos + glm::ivec3(0, 0, 1))) - static_cast<float>(sampleVolume(volume, ipos - glm::ivec3(0, 0, 1)))); glm::vec3 grad(dx, dy, dz); if (glm::length(grad) < 1e-5f) return glm::vec3(0.0f, 1.0f, 0.0f); return -glm::normalize(grad);
  }
 inline uint32_t estimateGeometryCPU(uint32_t mc_case) { /* ... Same ... */
-    uint32_t primCount = 0; uint32_t vertCount = 0; int idx = 0; const int* table_entry = MarchingCubes::triTable[mc_case]; while (idx < 15 && table_entry[idx] != -1) { primCount++; idx += 3; } primCount /= 3; if (primCount > 0) { vertCount = primCount + 2; } return (primCount << 16) | vertCount;
+    uint32_t primCount = 0; uint32_t vertCount = 0; int idx = 0; const uint8_t* table_entry = MarchingCubes::triTable[mc_case]; while (idx < 15 && table_entry[idx] != 255) { primCount++; idx += 3; } primCount /= 3; if (primCount > 0) { vertCount = primCount + 2; } return (primCount << 16) | vertCount;
  }
 
 // Helper function to read a single uint32_t counter from a buffer

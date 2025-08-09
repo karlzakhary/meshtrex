@@ -5,6 +5,7 @@
 #include "shaders.h"
 #include "minMaxOutput.h"
 #include "rasterOcclusionPass.h"
+#include "buffer.h"
 #include <iostream>
 #include <cassert>
 #include <cstring>
@@ -18,6 +19,7 @@ TransientExtractionPass::TransientExtractionPass(const VulkanContext& context, V
     createPipelineLayouts();
     createPipelines();
     createShadingParametersBuffer();
+    createMarchingCubesTables(true);  // Use unique tables by default
 }
 
 TransientExtractionPass::~TransientExtractionPass() {
@@ -60,6 +62,9 @@ TransientExtractionPass::~TransientExtractionPass() {
     if (shadingParamsMemory_ != VK_NULL_HANDLE) {
         vkFreeMemory(device_, shadingParamsMemory_, nullptr);
     }
+    
+    // Clean up marching cubes tables
+    destroyMarchingCubesTables();
 }
 
 void TransientExtractionPass::loadShaders() {
@@ -93,11 +98,17 @@ void TransientExtractionPass::createPipelineLayouts() {
         // Binding 1: Volume texture
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, 
          VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, nullptr},
-        // Binding 2: Min-max hierarchy texture
-        {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, 
+        // Binding 2: Marching cubes numVertices TBO (shared by task and mesh shaders)
+        {2, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1,
+         VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, nullptr},
+        // Binding 3: Marching cubes triTable TBO (mesh shader only)
+        {3, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1,
+         VK_SHADER_STAGE_MESH_BIT_EXT, nullptr},
+        // Binding 5: Min-max hierarchy texture
+        {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, 
          VK_SHADER_STAGE_TASK_BIT_EXT, nullptr},
-        // Binding 3: Shading parameters UBO
-        {3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 
+        // Binding 10: Shading parameters UBO
+        {10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 
          VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}
     };
     
@@ -123,11 +134,11 @@ void TransientExtractionPass::createPipelineLayouts() {
     pass2LayoutInfo.pBindings = pass2Bindings.data();
     VK_CHECK(vkCreateDescriptorSetLayout(device_, &pass2LayoutInfo, nullptr, &pass2DescriptorSetLayout_));
     
-    // Push constants for render pass index
+    // Push constants for render pass index and table type
     VkPushConstantRange pushConstantRange{};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT;
     pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(uint32_t); // renderPass index
+    pushConstantRange.size = 2 * sizeof(uint32_t); // renderPass index + useUniqueTables flag
     
     // Create pass 1 pipeline layout
     VkPipelineLayoutCreateInfo pass1PipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -298,15 +309,23 @@ VkDescriptorSet TransientExtractionPass::createPassDescriptorSet(
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
                      1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &volumeInfo, nullptr, nullptr});
     
-    // Binding 2: Min-max texture
+    // Binding 2: Marching cubes numVertices TBO (shared by task and mesh shaders)
+    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
+                     2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, nullptr, nullptr, &mcTables_.numVerticesView});
+    
+    // Binding 3: Marching cubes triTable TBO (mesh shader only)
+    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
+                     3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, nullptr, nullptr, &mcTables_.triTableView});
+    
+    // Binding 5: Min-max texture
     VkDescriptorImageInfo minMaxInfo{minMaxSampler, minMaxImageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
-                     2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &minMaxInfo, nullptr, nullptr});
+                     5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &minMaxInfo, nullptr, nullptr});
     
-    // Binding 3: Shading parameters
+    // Binding 10: Shading parameters
     VkDescriptorBufferInfo shadingInfo{shadingParamsBuffer_, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
-                     3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &shadingInfo, nullptr});
+                     10, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &shadingInfo, nullptr});
     
     // Binding 14/15: PVS buffer
     VkDescriptorBufferInfo pvsInfo{pvsBuffer, 0, VK_WHOLE_SIZE};
@@ -417,7 +436,8 @@ void TransientExtractionPass::renderTransientPasses(
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 4}  // TBOs for marching cubes tables (2 per set, 2 sets)
     };
     
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -521,9 +541,11 @@ void TransientExtractionPass::renderTransientPasses(
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass1PipelineLayout_,
                                0, 1, &pass1DescriptorSet, 0, nullptr);
         
-        uint32_t renderPass = 0; // Pass 1
+        struct { uint32_t renderPass; uint32_t useUniqueTables; } pushConstants;
+        pushConstants.renderPass = 0; // Pass 1
+        pushConstants.useUniqueTables = mcTables_.isUnique ? 1 : 0;
         vkCmdPushConstants(cmd, pass1PipelineLayout_, VK_SHADER_STAGE_MESH_BIT_EXT,
-                          0, sizeof(uint32_t), &renderPass);
+                          0, sizeof(pushConstants), &pushConstants);
         
         // Dispatch task shaders - 2 workgroups per block (for split processing)
         uint32_t pass1Workgroups = localPrevCount * 2;
@@ -547,9 +569,11 @@ void TransientExtractionPass::renderTransientPasses(
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass2PipelineLayout_,
                                0, 1, &pass2DescriptorSet, 0, nullptr);
         
-        uint32_t renderPass = 1; // Pass 2
+        struct { uint32_t renderPass; uint32_t useUniqueTables; } pushConstants;
+        pushConstants.renderPass = 1; // Pass 2
+        pushConstants.useUniqueTables = mcTables_.isUnique ? 1 : 0;
         vkCmdPushConstants(cmd, pass2PipelineLayout_, VK_SHADER_STAGE_MESH_BIT_EXT,
-                          0, sizeof(uint32_t), &renderPass);
+                          0, sizeof(pushConstants), &pushConstants);
         
         // Dispatch task shaders - 2 workgroups per block (for split processing)
         uint32_t pass2Workgroups = localDiffCount * 2;
@@ -695,7 +719,8 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2}  // TBOs for marching cubes tables
     };
     
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -773,9 +798,11 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass1PipelineLayout_,
                            0, 1, &pass1DescriptorSet, 0, nullptr);
     
-    uint32_t renderPass = 0; // Pass 1
+    struct { uint32_t renderPass; uint32_t useUniqueTables; } pc;
+    pc.renderPass = 0; // Pass 1
+    pc.useUniqueTables = mcTables_.isUnique ? 1 : 0;
     vkCmdPushConstants(cmd, pass1PipelineLayout_, VK_SHADER_STAGE_MESH_BIT_EXT,
-                      0, sizeof(uint32_t), &renderPass);
+                      0, sizeof(pc), &pc);
     
     // Parameterized PVS bypass for testing
     uint32_t pass1Workgroups;
@@ -929,7 +956,8 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2}  // TBOs for marching cubes tables
     };
     
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1005,9 +1033,11 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass2PipelineLayout_,
                            0, 1, &pass2DescriptorSet, 0, nullptr);
     
-    uint32_t renderPass = 1; // Pass 2
+    struct { uint32_t renderPass; uint32_t useUniqueTables; } pc;
+    pc.renderPass = 1; // Pass 2
+    pc.useUniqueTables = mcTables_.isUnique ? 1 : 0;
     vkCmdPushConstants(cmd, pass2PipelineLayout_, VK_SHADER_STAGE_MESH_BIT_EXT,
-                      0, sizeof(uint32_t), &renderPass);
+                      0, sizeof(pc), &pc);
     
     // Parameterized PVS bypass for testing
     uint32_t pass2Workgroups;
@@ -1058,4 +1088,96 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
     tempResources_.descriptorPool_pass2 = descriptorPool;
     tempResources_.viewUniformBuffer_pass2 = viewUniformBuffer;
     tempResources_.viewUniformMemory_pass2 = viewUniformMemory;
+}
+
+void TransientExtractionPass::createMarchingCubesTables(bool useUniqueTables) {
+    mcTables_.isUnique = useUniqueTables;
+    
+    // Create buffer for numVertices table (256 entries of uint8)
+    size_t numVerticesSize = 256 * sizeof(uint8_t);
+    createBuffer(mcTables_.numVerticesBuffer, device_, context_.getMemoryProperties(),
+                 numVerticesSize, 
+                 VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    
+    // Create buffer for triangle table
+    size_t triTableSize;
+    const void* triTableData;
+    const void* numVerticesData;
+    
+    if (useUniqueTables) {
+        // Unique tables: 256 x 16 uint8 values (changed from int32)
+        triTableSize = 256 * 16 * sizeof(uint8_t);
+        triTableData = &MarchingCubes::uniqueTriTable[0][0];  // Flatten 2D array
+        numVerticesData = &MarchingCubes::numUniqueVertsTable[0];
+    } else {
+        // Standard tables: 256 x 16 uint8 values  
+        triTableSize = 256 * 16 * sizeof(uint8_t);
+        triTableData = &MarchingCubes::triTable[0][0];  // Flatten 2D array
+        numVerticesData = &MarchingCubes::numVerticesTable[0];
+    }
+    
+    createBuffer(mcTables_.triTableBuffer, device_, context_.getMemoryProperties(),
+                 triTableSize,
+                 VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    
+    // Upload data to buffers using staging
+    Buffer stagingBuffer;
+    
+    // Upload numVertices table
+    createBuffer(stagingBuffer, device_, context_.getMemoryProperties(),
+                 numVerticesSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    memcpy(stagingBuffer.data, numVerticesData, numVerticesSize);
+    
+    VkCommandBuffer cmd = beginSingleTimeCommands(device_, context_.getCommandPool());
+    VkBufferCopy copyRegion{};
+    copyRegion.size = numVerticesSize;
+    vkCmdCopyBuffer(cmd, stagingBuffer.buffer, mcTables_.numVerticesBuffer.buffer, 1, &copyRegion);
+    endSingleTimeCommands(device_, context_.getCommandPool(), context_.getQueue(), cmd);
+    destroyBuffer(stagingBuffer, device_);
+    
+    // Upload triangle table
+    createBuffer(stagingBuffer, device_, context_.getMemoryProperties(),
+                 triTableSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    memcpy(stagingBuffer.data, triTableData, triTableSize);
+    
+    cmd = beginSingleTimeCommands(device_, context_.getCommandPool());
+    copyRegion.size = triTableSize;
+    vkCmdCopyBuffer(cmd, stagingBuffer.buffer, mcTables_.triTableBuffer.buffer, 1, &copyRegion);
+    endSingleTimeCommands(device_, context_.getCommandPool(), context_.getQueue(), cmd);
+    destroyBuffer(stagingBuffer, device_);
+    
+    // Create buffer views for shader access
+    VkBufferViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
+    
+    // NumVertices view (R8_UINT format for uint8 data)
+    viewInfo.buffer = mcTables_.numVerticesBuffer.buffer;
+    viewInfo.format = VK_FORMAT_R8_UINT;
+    viewInfo.offset = 0;
+    viewInfo.range = numVerticesSize;
+    VK_CHECK(vkCreateBufferView(device_, &viewInfo, nullptr, &mcTables_.numVerticesView));
+    
+    // Triangle table view (R8_UINT format for uint8 data)
+    viewInfo.buffer = mcTables_.triTableBuffer.buffer;
+    viewInfo.format = VK_FORMAT_R8_UINT;  // Changed from R32_SINT to R8_UINT
+    viewInfo.offset = 0;
+    viewInfo.range = triTableSize;
+    VK_CHECK(vkCreateBufferView(device_, &viewInfo, nullptr, &mcTables_.triTableView));
+}
+
+void TransientExtractionPass::destroyMarchingCubesTables() {
+    if (mcTables_.numVerticesView != VK_NULL_HANDLE) {
+        vkDestroyBufferView(device_, mcTables_.numVerticesView, nullptr);
+        mcTables_.numVerticesView = VK_NULL_HANDLE;
+    }
+    if (mcTables_.triTableView != VK_NULL_HANDLE) {
+        vkDestroyBufferView(device_, mcTables_.triTableView, nullptr);
+        mcTables_.triTableView = VK_NULL_HANDLE;
+    }
+    
+    destroyBuffer(mcTables_.numVerticesBuffer, device_);
+    destroyBuffer(mcTables_.triTableBuffer, device_);
 }

@@ -9,8 +9,6 @@
 #include "vulkan_utils.h"
 #include "minMaxPass.h"
 #include "minMaxOutput.h"
-#include "blockFilteringTestUtils.h"
-#include "activeBlockFilteringPass.h"
 #include <cstring>
 #include <iostream>
 #include <string>

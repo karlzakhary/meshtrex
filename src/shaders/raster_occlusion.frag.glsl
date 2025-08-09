@@ -1,7 +1,6 @@
 #version 460 core
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_EXT_mesh_shader : require
-#extension GL_EXT_debug_printf : enable
 
 // Enable early fragment tests for depth testing
 layout(early_fragment_tests) in;

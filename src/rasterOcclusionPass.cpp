@@ -609,10 +609,6 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
     
     // Debug output for first few frames
     static int occlusionFrame = 0;
-    if (occlusionFrame++ < 5) {
-        printf("Occlusion culling dispatch: totalBlocks=%u, numGroups=%u, numWorkgroups=%u\n", 
-               totalBlocks, numGroups, numWorkgroups);
-    }
     
     vkCmdDrawMeshTasksEXT(cmd, numWorkgroups, 1, 1);
     

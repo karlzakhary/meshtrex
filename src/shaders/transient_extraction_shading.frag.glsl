@@ -13,7 +13,7 @@ layout(location = 2) flat in uint inRenderPass;
 layout(location = 0) out vec4 outColor;
 
 // Uniforms
-layout(binding = 3, std140) uniform ShadingParameters {
+layout(binding = 10, std140) uniform ShadingParameters {
     vec3 lightDir;        // Light direction (normalized)
     vec3 viewPos;         // Camera position
     vec3 baseColor;       // Base material color

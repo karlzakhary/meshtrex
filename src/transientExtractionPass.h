@@ -5,6 +5,7 @@
 #include <vector>
 #include <memory>
 #include <glm/glm.hpp>
+#include "buffer.h"
 
 class VulkanContext;
 struct MinMaxOutput;
@@ -155,10 +156,22 @@ private:
     // PVS bypass control for testing
     bool bypassPVS_ = false;  // Set to true to bypass occlusion culling
     
+    // Marching cubes lookup tables as TBOs
+    struct MarchingCubesTables {
+        Buffer numVerticesBuffer;     // Buffer for numUniqueVerticesTable or numVerticesTable
+        Buffer triTableBuffer;         // Buffer for uniqueTriTable or triTable
+        VkBufferView numVerticesView = VK_NULL_HANDLE;  // Buffer view for shader access
+        VkBufferView triTableView = VK_NULL_HANDLE;     // Buffer view for shader access
+        bool isUnique = false;  // Whether using unique or standard tables
+    };
+    MarchingCubesTables mcTables_;
+    
     void createPipelineLayouts();
     void createPipelines();
     void loadShaders();
     void createShadingParametersBuffer();
+    void createMarchingCubesTables(bool useUniqueTables = false);
+    void destroyMarchingCubesTables();
     
     // Helper to create a descriptor set for a pass
     VkDescriptorSet createPassDescriptorSet(

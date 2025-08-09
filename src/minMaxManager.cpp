@@ -9,7 +9,6 @@
 #include "minMaxPass.h"
 #include "minMaxOutput.h"
 #include "blockFilteringTestUtils.h"
-#include "activeBlockFilteringPass.h"
 #include "gpuProfiler.h"
 #include <cstring>
 #include <iostream>
