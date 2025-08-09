@@ -557,13 +557,16 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
     visibilityCompactionDescriptorSet = sets[1];
     buildOutputDescriptorSet = sets[2];
     
-    // Create sampler for min-max texture
+    // Create sampler for min-max texture (store in temp resources to avoid leak)
     VkSampler minMaxSampler;
     VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     samplerInfo.magFilter = samplerInfo.minFilter = VK_FILTER_NEAREST;
     samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VK_CHECK(vkCreateSampler(device_, &samplerInfo, nullptr, &minMaxSampler));
+    
+    // Store in temp resources for cleanup (critical to avoid sampler leak!)
+    output.tempResources.minMaxSampler = minMaxSampler;
     
     // Update occlusion descriptor set
     std::vector<VkWriteDescriptorSet> writes;
@@ -758,7 +761,7 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
     vkCmdPipelineBarrier2(cmd, &finalDepInfo);
     
     // Store temporary resources in output (to be cleaned up after command buffer submission)
-    output.tempResources.minMaxSampler = minMaxSampler;
+    // Note: minMaxSampler already stored above to prevent leak
     output.tempResources.descriptorPool = descriptorPool;
     output.tempResources.uniformBuffer = uniformBuffer;
     output.tempResources.uniformMemory = uniformMemory;
@@ -1075,13 +1078,16 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
     visibilityCompactionDescriptorSet = sets[1];
     buildOutputDescriptorSet = sets[2];
     
-    // Create sampler for min-max texture
+    // Create sampler for min-max texture (store in temp resources to avoid leak)
     VkSampler minMaxSampler;
     VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     samplerInfo.magFilter = samplerInfo.minFilter = VK_FILTER_NEAREST;
     samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VK_CHECK(vkCreateSampler(device_, &samplerInfo, nullptr, &minMaxSampler));
+    
+    // Store in temp resources for cleanup (critical to avoid sampler leak!)
+    output.tempResources.minMaxSampler = minMaxSampler;
     
     // Update occlusion descriptor set
     std::vector<VkWriteDescriptorSet> writes;

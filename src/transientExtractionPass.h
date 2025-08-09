@@ -108,21 +108,54 @@ public:
         
         void destroy(VkDevice device) {
             // Clean up Pass 1 resources
-            if (volumeSampler_pass1) vkDestroySampler(device, volumeSampler_pass1, nullptr);
-            if (minMaxSampler_pass1) vkDestroySampler(device, minMaxSampler_pass1, nullptr);
-            if (descriptorPool_pass1) vkDestroyDescriptorPool(device, descriptorPool_pass1, nullptr);
-            if (viewUniformBuffer_pass1) vkDestroyBuffer(device, viewUniformBuffer_pass1, nullptr);
-            if (viewUniformMemory_pass1) vkFreeMemory(device, viewUniformMemory_pass1, nullptr);
+            if (volumeSampler_pass1) {
+                vkDestroySampler(device, volumeSampler_pass1, nullptr);
+                volumeSampler_pass1 = VK_NULL_HANDLE;
+            }
+            if (minMaxSampler_pass1) {
+                vkDestroySampler(device, minMaxSampler_pass1, nullptr);
+                minMaxSampler_pass1 = VK_NULL_HANDLE;
+            }
+            if (descriptorPool_pass1) {
+                vkDestroyDescriptorPool(device, descriptorPool_pass1, nullptr);
+                descriptorPool_pass1 = VK_NULL_HANDLE;
+            }
+            if (viewUniformBuffer_pass1) {
+                vkDestroyBuffer(device, viewUniformBuffer_pass1, nullptr);
+                viewUniformBuffer_pass1 = VK_NULL_HANDLE;
+            }
+            if (viewUniformMemory_pass1) {
+                vkFreeMemory(device, viewUniformMemory_pass1, nullptr);
+                viewUniformMemory_pass1 = VK_NULL_HANDLE;
+            }
             
             // Clean up Pass 2 resources
-            if (volumeSampler_pass2) vkDestroySampler(device, volumeSampler_pass2, nullptr);
-            if (minMaxSampler_pass2) vkDestroySampler(device, minMaxSampler_pass2, nullptr);
-            if (descriptorPool_pass2) vkDestroyDescriptorPool(device, descriptorPool_pass2, nullptr);
-            if (viewUniformBuffer_pass2) vkDestroyBuffer(device, viewUniformBuffer_pass2, nullptr);
-            if (viewUniformMemory_pass2) vkFreeMemory(device, viewUniformMemory_pass2, nullptr);
+            if (volumeSampler_pass2) {
+                vkDestroySampler(device, volumeSampler_pass2, nullptr);
+                volumeSampler_pass2 = VK_NULL_HANDLE;
+            }
+            if (minMaxSampler_pass2) {
+                vkDestroySampler(device, minMaxSampler_pass2, nullptr);
+                minMaxSampler_pass2 = VK_NULL_HANDLE;
+            }
+            if (descriptorPool_pass2) {
+                vkDestroyDescriptorPool(device, descriptorPool_pass2, nullptr);
+                descriptorPool_pass2 = VK_NULL_HANDLE;
+            }
+            if (viewUniformBuffer_pass2) {
+                vkDestroyBuffer(device, viewUniformBuffer_pass2, nullptr);
+                viewUniformBuffer_pass2 = VK_NULL_HANDLE;
+            }
+            if (viewUniformMemory_pass2) {
+                vkFreeMemory(device, viewUniformMemory_pass2, nullptr);
+                viewUniformMemory_pass2 = VK_NULL_HANDLE;
+            }
             
             // Clean up indirect update resources
-            if (descriptorPool_indirectUpdate) vkDestroyDescriptorPool(device, descriptorPool_indirectUpdate, nullptr);
+            if (descriptorPool_indirectUpdate) {
+                vkDestroyDescriptorPool(device, descriptorPool_indirectUpdate, nullptr);
+                descriptorPool_indirectUpdate = VK_NULL_HANDLE;
+            }
         }
     } tempResources_;
     

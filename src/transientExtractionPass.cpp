@@ -924,14 +924,8 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
     VkExtent2D renderExtent,
     const ShadingParameters& shadingParams) {
     
-    // Debug tracking
-    static int pass2CallCount = 0;
-    printf("renderPass2_NewlyVisible called: %d, pvsDifferenceCount=%u\n", 
-           pass2CallCount++, occlusionOutput.pvsDifferenceCount);
-    
     // Skip if no new blocks to render
     if (occlusionOutput.pvsDifferenceCount == 0) {
-        // printf("  Pass2: No new blocks to render\n");
         return;
     }
     
