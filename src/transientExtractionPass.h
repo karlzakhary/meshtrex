@@ -103,6 +103,9 @@ public:
         VkBuffer viewUniformBuffer_pass2 = VK_NULL_HANDLE;
         VkDeviceMemory viewUniformMemory_pass2 = VK_NULL_HANDLE;
         
+        // Resources from indirect update compute
+        VkDescriptorPool descriptorPool_indirectUpdate = VK_NULL_HANDLE;
+        
         void destroy(VkDevice device) {
             // Clean up Pass 1 resources
             if (volumeSampler_pass1) vkDestroySampler(device, volumeSampler_pass1, nullptr);
@@ -117,6 +120,9 @@ public:
             if (descriptorPool_pass2) vkDestroyDescriptorPool(device, descriptorPool_pass2, nullptr);
             if (viewUniformBuffer_pass2) vkDestroyBuffer(device, viewUniformBuffer_pass2, nullptr);
             if (viewUniformMemory_pass2) vkFreeMemory(device, viewUniformMemory_pass2, nullptr);
+            
+            // Clean up indirect update resources
+            if (descriptorPool_indirectUpdate) vkDestroyDescriptorPool(device, descriptorPool_indirectUpdate, nullptr);
         }
     } tempResources_;
     
@@ -140,11 +146,17 @@ private:
     VkPipelineLayout pass2PipelineLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout pass2DescriptorSetLayout_ = VK_NULL_HANDLE;
     
+    // Compute pipeline for indirect draw updates
+    VkPipeline indirectUpdatePipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout indirectUpdatePipelineLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout indirectUpdateDescriptorSetLayout_ = VK_NULL_HANDLE;
+    
     // Shader modules
     VkShaderModule pass1TaskShader_ = VK_NULL_HANDLE;
     VkShaderModule pass2TaskShader_ = VK_NULL_HANDLE;
     VkShaderModule meshShader_ = VK_NULL_HANDLE;      // Shared by both passes
     VkShaderModule fragmentShader_ = VK_NULL_HANDLE;  // Shared by both passes
+    VkShaderModule indirectUpdateComputeShader_ = VK_NULL_HANDLE;  // Compute shader for indirect draw updates
     
     // Shading parameters buffer
     VkBuffer shadingParamsBuffer_ = VK_NULL_HANDLE;
@@ -166,12 +178,24 @@ private:
     };
     MarchingCubesTables mcTables_;
     
+    // Indirect draw buffers for GPU-driven rendering
+    Buffer indirectDrawBuffer_ = {};  // Contains VkDrawMeshTasksIndirectCommandEXT structs
+    Buffer pvsCountBuffer_ = {};      // Contains PVS counts for compute shader (2 uint32_t)
+    bool useIndirectDraw_ = false;    // Whether to use indirect drawing
+    
     void createPipelineLayouts();
     void createPipelines();
     void loadShaders();
     void createShadingParametersBuffer();
     void createMarchingCubesTables(bool useUniqueTables = false);
     void destroyMarchingCubesTables();
+    void createIndirectDrawBuffer();
+    void createIndirectUpdatePipeline();
+    void updateIndirectDrawBuffer(VkCommandBuffer cmd, 
+                                 const RasterOcclusionPass::Output& occlusionOutput);
+    void updateIndirectDrawBufferGPU(VkCommandBuffer cmd,
+                                    const RasterOcclusionPass::Output& occlusionOutput,
+                                    const PushConstants& pushConstants);
     
     // Helper to create a descriptor set for a pass
     VkDescriptorSet createPassDescriptorSet(

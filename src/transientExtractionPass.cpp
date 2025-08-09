@@ -20,6 +20,9 @@ TransientExtractionPass::TransientExtractionPass(const VulkanContext& context, V
     createPipelines();
     createShadingParametersBuffer();
     createMarchingCubesTables(true);  // Use unique tables by default
+    createIndirectDrawBuffer();
+    createIndirectUpdatePipeline();
+    useIndirectDraw_ = true;  // Enable indirect drawing by default
 }
 
 TransientExtractionPass::~TransientExtractionPass() {
@@ -43,6 +46,16 @@ TransientExtractionPass::~TransientExtractionPass() {
         vkDestroyDescriptorSetLayout(device_, pass2DescriptorSetLayout_, nullptr);
     }
     
+    if (indirectUpdatePipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, indirectUpdatePipeline_, nullptr);
+    }
+    if (indirectUpdatePipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, indirectUpdatePipelineLayout_, nullptr);
+    }
+    if (indirectUpdateDescriptorSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, indirectUpdateDescriptorSetLayout_, nullptr);
+    }
+    
     if (pass1TaskShader_ != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device_, pass1TaskShader_, nullptr);
     }
@@ -55,6 +68,9 @@ TransientExtractionPass::~TransientExtractionPass() {
     if (fragmentShader_ != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device_, fragmentShader_, nullptr);
     }
+    if (indirectUpdateComputeShader_ != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device_, indirectUpdateComputeShader_, nullptr);
+    }
     
     if (shadingParamsBuffer_ != VK_NULL_HANDLE) {
         vkDestroyBuffer(device_, shadingParamsBuffer_, nullptr);
@@ -65,6 +81,14 @@ TransientExtractionPass::~TransientExtractionPass() {
     
     // Clean up marching cubes tables
     destroyMarchingCubesTables();
+    
+    // Clean up indirect draw buffer
+    if (indirectDrawBuffer_.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(indirectDrawBuffer_, device_);
+    }
+    if (pvsCountBuffer_.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(pvsCountBuffer_, device_);
+    }
 }
 
 void TransientExtractionPass::loadShaders() {
@@ -87,6 +111,11 @@ void TransientExtractionPass::loadShaders() {
     Shader fragmentShaderData{};
     assert(loadShader(fragmentShaderData, device_, "/spirv/transient_extraction_shading.frag.spv"));
     fragmentShader_ = fragmentShaderData.module;
+    
+    // Load compute shader for indirect draw updates
+    Shader indirectUpdateComputeData{};
+    assert(loadShader(indirectUpdateComputeData, device_, "/spirv/update_indirect_draw.comp.spv"));
+    indirectUpdateComputeShader_ = indirectUpdateComputeData.module;
 }
 
 void TransientExtractionPass::createPipelineLayouts() {
@@ -516,6 +545,16 @@ void TransientExtractionPass::renderTransientPasses(
     renderingInfo.pColorAttachments = &colorAttachment;
     renderingInfo.pDepthAttachment = &depthAttachment;
     
+    // Store counts locally to ensure they don't change during rendering
+    uint32_t localPrevCount = occlusionOutput.pvsPreviousCount;
+    uint32_t localDiffCount = occlusionOutput.pvsDifferenceCount;
+    
+    // If using indirect draw, update the indirect buffer BEFORE beginning rendering
+    if (useIndirectDraw_) {
+        // Update indirect buffer using GPU compute (only once for both passes)
+        updateIndirectDrawBufferGPU(cmd, occlusionOutput, pushConstants);
+    }
+    
     vkCmdBeginRendering(cmd, &renderingInfo);
     
     // Debug: Print PVS counts
@@ -530,10 +569,6 @@ void TransientExtractionPass::renderTransientPasses(
                occlusionOutput.pvsDifferenceCount * 2);
     }
     
-    // Store counts locally to ensure they don't change during rendering
-    uint32_t localPrevCount = occlusionOutput.pvsPreviousCount;
-    uint32_t localDiffCount = occlusionOutput.pvsDifferenceCount;
-    
     // Pass 1: Render previous frame's visible geometry (PVS_prev)
     if (localPrevCount > 0) {
         // printf("  Rendering Pass 1: %u blocks, %u workgroups\n", occlusionOutput.pvsPreviousCount, occlusionOutput.pvsPreviousCount * 2);
@@ -541,15 +576,21 @@ void TransientExtractionPass::renderTransientPasses(
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass1PipelineLayout_,
                                0, 1, &pass1DescriptorSet, 0, nullptr);
         
-        struct { uint32_t renderPass; uint32_t useUniqueTables; } pushConstants;
-        pushConstants.renderPass = 0; // Pass 1
-        pushConstants.useUniqueTables = mcTables_.isUnique ? 1 : 0;
+        struct { uint32_t renderPass; uint32_t useUniqueTables; } localPushConstants;
+        localPushConstants.renderPass = 0; // Pass 1
+        localPushConstants.useUniqueTables = mcTables_.isUnique ? 1 : 0;
         vkCmdPushConstants(cmd, pass1PipelineLayout_, VK_SHADER_STAGE_MESH_BIT_EXT,
-                          0, sizeof(pushConstants), &pushConstants);
+                          0, sizeof(localPushConstants), &localPushConstants);
         
         // Dispatch task shaders - 2 workgroups per block (for split processing)
-        uint32_t pass1Workgroups = localPrevCount * 2;
-        vkCmdDrawMeshTasksEXT(cmd, pass1Workgroups, 1, 1);
+        if (useIndirectDraw_) {
+            // Use indirect draw - GPU determines workgroup count
+            vkCmdDrawMeshTasksIndirectEXT(cmd, indirectDrawBuffer_.buffer, 0, 1, 0);
+        } else {
+            // Use direct draw with CPU-provided count
+            uint32_t pass1Workgroups = localPrevCount * 2;
+            vkCmdDrawMeshTasksEXT(cmd, pass1Workgroups, 1, 1);
+        }
     } else {
         // printf("  Skipping Pass 1: no previous blocks\n");
     }
@@ -569,15 +610,22 @@ void TransientExtractionPass::renderTransientPasses(
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pass2PipelineLayout_,
                                0, 1, &pass2DescriptorSet, 0, nullptr);
         
-        struct { uint32_t renderPass; uint32_t useUniqueTables; } pushConstants;
-        pushConstants.renderPass = 1; // Pass 2
-        pushConstants.useUniqueTables = mcTables_.isUnique ? 1 : 0;
+        struct { uint32_t renderPass; uint32_t useUniqueTables; } localPushConstants;
+        localPushConstants.renderPass = 1; // Pass 2
+        localPushConstants.useUniqueTables = mcTables_.isUnique ? 1 : 0;
         vkCmdPushConstants(cmd, pass2PipelineLayout_, VK_SHADER_STAGE_MESH_BIT_EXT,
-                          0, sizeof(pushConstants), &pushConstants);
+                          0, sizeof(localPushConstants), &localPushConstants);
         
         // Dispatch task shaders - 2 workgroups per block (for split processing)
-        uint32_t pass2Workgroups = localDiffCount * 2;
-        vkCmdDrawMeshTasksEXT(cmd, pass2Workgroups, 1, 1);
+        if (useIndirectDraw_) {
+            // Use indirect draw - GPU determines workgroup count (offset to second command)
+            // Note: Buffer was already updated in Pass 1 or before both passes
+            vkCmdDrawMeshTasksIndirectEXT(cmd, indirectDrawBuffer_.buffer, sizeof(uint32_t) * 3, 1, 0);
+        } else {
+            // Use direct draw with CPU-provided count
+            uint32_t pass2Workgroups = localDiffCount * 2;
+            vkCmdDrawMeshTasksEXT(cmd, pass2Workgroups, 1, 1);
+        }
     } else {
         // printf("  Skipping Pass 2: no difference blocks\n");
     }
@@ -791,6 +839,12 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
     renderingInfo.pColorAttachments = &colorAttachment;
     renderingInfo.pDepthAttachment = &depthAttachment;
     
+    // If using indirect draw, update the indirect buffer BEFORE beginning rendering
+    if (useIndirectDraw_) {
+        // Update indirect buffer using GPU compute shader
+        updateIndirectDrawBufferGPU(cmd, occlusionOutput, pushConstants);
+    }
+    
     vkCmdBeginRendering(cmd, &renderingInfo);
     
     // Render Pass 1: Previous frame's visible geometry
@@ -805,20 +859,25 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
                       0, sizeof(pc), &pc);
     
     // Parameterized PVS bypass for testing
-    uint32_t pass1Workgroups;
-    if (bypassPVS_) {
-        // BYPASS PVS - Dispatch ALL blocks for testing
-        uint32_t totalBlocks = pushConstants.blockGridDim.x * pushConstants.blockGridDim.y * pushConstants.blockGridDim.z;
-        pass1Workgroups = totalBlocks * 2; // 2 workgroups per block
-        printf("  Pass1 (BYPASS PVS): Dispatching %u workgroups for ALL %u blocks\n", 
-               pass1Workgroups, totalBlocks);
+    if (useIndirectDraw_) {
+        // Use indirect draw - GPU already updated buffer before render pass
+        vkCmdDrawMeshTasksIndirectEXT(cmd, indirectDrawBuffer_.buffer, 0, 1, 0);
     } else {
-        // Use PVS from occlusion culling
-        pass1Workgroups = occlusionOutput.pvsPreviousCount * 2;
-        printf("  Pass1: Dispatching %u workgroups for %u blocks from PVS\n", 
-               pass1Workgroups, occlusionOutput.pvsPreviousCount);
+        uint32_t pass1Workgroups;
+        if (bypassPVS_) {
+            // BYPASS PVS - Dispatch ALL blocks for testing
+            uint32_t totalBlocks = pushConstants.blockGridDim.x * pushConstants.blockGridDim.y * pushConstants.blockGridDim.z;
+            pass1Workgroups = totalBlocks * 2; // 2 workgroups per block
+            printf("  Pass1 (BYPASS PVS): Dispatching %u workgroups for ALL %u blocks\n", 
+                   pass1Workgroups, totalBlocks);
+        } else {
+            // Use PVS from occlusion culling
+            pass1Workgroups = occlusionOutput.pvsPreviousCount * 2;
+            printf("  Pass1: Dispatching %u workgroups for %u blocks from PVS\n", 
+                   pass1Workgroups, occlusionOutput.pvsPreviousCount);
+        }
+        vkCmdDrawMeshTasksEXT(cmd, pass1Workgroups, 1, 1);
     }
-    vkCmdDrawMeshTasksEXT(cmd, pass1Workgroups, 1, 1);
     
     // End rendering
     vkCmdEndRendering(cmd);
@@ -1040,21 +1099,26 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
                       0, sizeof(pc), &pc);
     
     // Parameterized PVS bypass for testing
-    uint32_t pass2Workgroups;
-    if (bypassPVS_) {
-        // When bypassing PVS, Pass 2 shouldn't run (handled in outer condition)
-        // This code shouldn't be reached when bypassPVS is true
-        pass2Workgroups = 0;
-        printf("  Pass2: SKIPPED (PVS bypass mode)\n");
+    if (useIndirectDraw_) {
+        // Use indirect draw (already updated in Pass 1, use offset for Pass 2)
+        vkCmdDrawMeshTasksIndirectEXT(cmd, indirectDrawBuffer_.buffer, sizeof(uint32_t) * 3, 1, 0);
     } else {
-        // Use PVS difference from occlusion culling
-        pass2Workgroups = occlusionOutput.pvsDifferenceCount * 2;
-        printf("  Pass2: Dispatching %u workgroups for %u blocks from PVS difference\n", 
-               pass2Workgroups, occlusionOutput.pvsDifferenceCount);
-    }
-    
-    if (pass2Workgroups > 0) {
-        vkCmdDrawMeshTasksEXT(cmd, pass2Workgroups, 1, 1);
+        uint32_t pass2Workgroups;
+        if (bypassPVS_) {
+            // When bypassing PVS, Pass 2 shouldn't run (handled in outer condition)
+            // This code shouldn't be reached when bypassPVS is true
+            pass2Workgroups = 0;
+            printf("  Pass2: SKIPPED (PVS bypass mode)\n");
+        } else {
+            // Use PVS difference from occlusion culling
+            pass2Workgroups = occlusionOutput.pvsDifferenceCount * 2;
+            printf("  Pass2: Dispatching %u workgroups for %u blocks from PVS difference\n", 
+                   pass2Workgroups, occlusionOutput.pvsDifferenceCount);
+        }
+        
+        if (pass2Workgroups > 0) {
+            vkCmdDrawMeshTasksEXT(cmd, pass2Workgroups, 1, 1);
+        }
     }
     
     // End rendering
@@ -1166,6 +1230,192 @@ void TransientExtractionPass::createMarchingCubesTables(bool useUniqueTables) {
     viewInfo.offset = 0;
     viewInfo.range = triTableSize;
     VK_CHECK(vkCreateBufferView(device_, &viewInfo, nullptr, &mcTables_.triTableView));
+}
+
+void TransientExtractionPass::createIndirectUpdatePipeline() {
+    // Create descriptor set layout for compute shader
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        // Binding 0: PVS previous count buffer
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        // Binding 1: PVS difference count buffer
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        // Binding 2: Indirect draw buffer (output)
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+    };
+    
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    VK_CHECK(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &indirectUpdateDescriptorSetLayout_));
+    
+    // Push constants for bypassPVS and totalBlockCount
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = 2 * sizeof(uint32_t); // bypassPVS + totalBlockCount
+    
+    // Create pipeline layout
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &indirectUpdateDescriptorSetLayout_;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+    VK_CHECK(vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &indirectUpdatePipelineLayout_));
+    
+    // Create compute pipeline
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = indirectUpdateComputeShader_;
+    pipelineInfo.stage.pName = "main";
+    pipelineInfo.layout = indirectUpdatePipelineLayout_;
+    
+    VK_CHECK(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &indirectUpdatePipeline_));
+}
+
+void TransientExtractionPass::createIndirectDrawBuffer() {
+    // Create buffer for 2 indirect draw commands (Pass 1 and Pass 2)
+    // Each command is 3 uint32_t values (groupCountX, Y, Z)
+    size_t bufferSize = 2 * sizeof(uint32_t) * 3;
+    
+    createBuffer(indirectDrawBuffer_, device_, context_.getMemoryProperties(),
+                 bufferSize,
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    
+    // Create buffer for PVS counts (2 uint32_t: previous count, difference count)
+    // Need to align second count to minStorageBufferOffsetAlignment (typically 16 bytes)
+    size_t countBufferSize = 16 + sizeof(uint32_t);  // First count at 0, second at 16
+    createBuffer(pvsCountBuffer_, device_, context_.getMemoryProperties(),
+                 countBufferSize,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
+
+void TransientExtractionPass::updateIndirectDrawBuffer(VkCommandBuffer cmd, 
+                                                       const RasterOcclusionPass::Output& occlusionOutput) {
+    // Create a compute shader or use vkCmdUpdateBuffer to set the indirect draw parameters
+    // based on the PVS buffer counts
+    
+    // For now, we'll use vkCmdUpdateBuffer for simplicity
+    // In a production system, you'd use a compute shader to read the count buffers directly
+    
+    struct IndirectCommand {
+        uint32_t groupCountX;
+        uint32_t groupCountY;
+        uint32_t groupCountZ;
+    };
+    
+    // Pass 1: Previous visible blocks
+    IndirectCommand pass1Cmd;
+    pass1Cmd.groupCountX = occlusionOutput.pvsPreviousCount * 2;  // 2 workgroups per block
+    pass1Cmd.groupCountY = 1;
+    pass1Cmd.groupCountZ = 1;
+    
+    // Pass 2: Newly visible blocks
+    IndirectCommand pass2Cmd;
+    pass2Cmd.groupCountX = occlusionOutput.pvsDifferenceCount * 2;  // 2 workgroups per block
+    pass2Cmd.groupCountY = 1;
+    pass2Cmd.groupCountZ = 1;
+    
+    // Update both commands in the buffer
+    vkCmdUpdateBuffer(cmd, indirectDrawBuffer_.buffer, 0, sizeof(IndirectCommand), &pass1Cmd);
+    vkCmdUpdateBuffer(cmd, indirectDrawBuffer_.buffer, sizeof(IndirectCommand), sizeof(IndirectCommand), &pass2Cmd);
+}
+
+void TransientExtractionPass::updateIndirectDrawBufferGPU(VkCommandBuffer cmd,
+                                                          const RasterOcclusionPass::Output& occlusionOutput,
+                                                          const PushConstants& pushConstants) {
+    // First, copy the PVS counts to our count buffer
+    // The pvsCountBuffer_ is laid out as: [pvsPreviousCount at 0, pvsDifferenceCount at 16]
+    // Update previous count at offset 0
+    vkCmdUpdateBuffer(cmd, pvsCountBuffer_.buffer, 0, sizeof(uint32_t), &occlusionOutput.pvsPreviousCount);
+    // Update difference count at offset 16 (aligned to minStorageBufferOffsetAlignment)
+    vkCmdUpdateBuffer(cmd, pvsCountBuffer_.buffer, 16, sizeof(uint32_t), &occlusionOutput.pvsDifferenceCount);
+    
+    // Memory barrier to ensure buffer update is complete before compute shader reads
+    VkMemoryBarrier updateBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    updateBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    updateBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0, 1, &updateBarrier, 0, nullptr, 0, nullptr);
+    
+    // Create descriptor pool for compute shader
+    std::vector<VkDescriptorPoolSize> poolSizes = {
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}
+    };
+    
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    
+    VkDescriptorPool descriptorPool;
+    VK_CHECK(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool));
+    
+    // Allocate descriptor set
+    VkDescriptorSet descriptorSet;
+    VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocInfo.descriptorPool = descriptorPool;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &indirectUpdateDescriptorSetLayout_;
+    VK_CHECK(vkAllocateDescriptorSets(device_, &allocInfo, &descriptorSet));
+    
+    // Update descriptor set
+    std::vector<VkWriteDescriptorSet> writes;
+    
+    // Binding 0: PVS previous count (first uint32_t in pvsCountBuffer_)
+    VkDescriptorBufferInfo prevCountInfo{pvsCountBuffer_.buffer, 0, sizeof(uint32_t)};
+    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
+                     0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &prevCountInfo, nullptr});
+    
+    // Binding 1: PVS difference count (at offset 16 in pvsCountBuffer_, aligned to minStorageBufferOffsetAlignment)
+    VkDescriptorBufferInfo diffCountInfo{pvsCountBuffer_.buffer, 16, sizeof(uint32_t)};
+    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
+                     1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &diffCountInfo, nullptr});
+    
+    // Binding 2: Indirect draw buffer (output)
+    VkDescriptorBufferInfo indirectInfo{indirectDrawBuffer_.buffer, 0, VK_WHOLE_SIZE};
+    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
+                     2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &indirectInfo, nullptr});
+    
+    vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    
+    // Set up push constants
+    struct ComputePushConstants {
+        uint32_t bypassPVS;
+        uint32_t totalBlockCount;
+    } computePushConstants;
+    
+    computePushConstants.bypassPVS = bypassPVS_ ? 1 : 0;
+    computePushConstants.totalBlockCount = pushConstants.blockGridDim.x * 
+                                          pushConstants.blockGridDim.y * 
+                                          pushConstants.blockGridDim.z;
+    
+    // Dispatch compute shader
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, indirectUpdatePipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, indirectUpdatePipelineLayout_,
+                           0, 1, &descriptorSet, 0, nullptr);
+    vkCmdPushConstants(cmd, indirectUpdatePipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(computePushConstants), &computePushConstants);
+    
+    // Dispatch single workgroup (only one thread needed)
+    vkCmdDispatch(cmd, 1, 1, 1);
+    
+    // Memory barrier to ensure compute writes are visible to indirect draw
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                        0, 1, &barrier, 0, nullptr, 0, nullptr);
+    
+    // Store descriptor pool for cleanup
+    tempResources_.descriptorPool_indirectUpdate = descriptorPool;
 }
 
 void TransientExtractionPass::destroyMarchingCubesTables() {
