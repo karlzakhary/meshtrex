@@ -31,8 +31,8 @@ layout(binding = 0, std140) uniform ViewParameters {
 // Volume data image
 layout(binding = 1, r8ui) uniform readonly uimage3D volumeImage;
 
-// Marching cubes lookup tables as TBOs (shared with mesh shader)
-layout(binding = 2) uniform usamplerBuffer numVerticesTable;  // 256 entries of uint8
+// Marching cubes lookup tables as storage buffers (shared with mesh shader)
+layout(binding = 2, std430) readonly buffer NumVerticesTable { uint8_t numVerticesTable[]; };
 
 // Min-max hierarchy for early rejection
 layout(binding = 5) uniform sampler3D minMaxTexture;
@@ -58,7 +58,7 @@ shared int macroBlockSharedVertices[256];
 
 // Helper function to get number of unique vertices for a cube configuration
 uint getNumUniqueVertices(uint cubeIndex) {
-    return texelFetch(numVerticesTable, int(cubeIndex)).r;
+    return uint(numVerticesTable[cubeIndex]);
 }
 
 // Sample volume data at a given position

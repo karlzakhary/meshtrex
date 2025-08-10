@@ -73,9 +73,20 @@ void renderTemporalCoherence(
         swapchainImageViews[i] = createImageView(device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
     }
     
-    // Camera state - adjusted for 64x64x64 test volume centered at (32,32,32)
-    glm::vec3 cameraPos = glm::vec3(100.f, 100.f, 150.f);
-    glm::vec3 cameraTarget = glm::vec3(32.f, 32.f, 32.f);
+    // Camera state - will be properly initialized based on actual volume dimensions
+    // For now, assume typical volume centered around 128,128,128 (common for 256^3 volumes)
+    glm::vec3 volumeCenter = glm::vec3(128.0f, 128.0f, 128.0f);
+    float cameraDistance = 400.0f;  // Distance from center
+    float cameraYaw = -45.0f * 3.14159f / 180.0f;    // Horizontal angle in radians
+    float cameraPitch = 30.0f * 3.14159f / 180.0f;   // Vertical angle in radians (looking down from above)
+    
+    // Calculate initial camera position from spherical coordinates
+    glm::vec3 cameraPos;
+    cameraPos.x = volumeCenter.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
+    cameraPos.y = volumeCenter.y + cameraDistance * sin(cameraPitch);
+    cameraPos.z = volumeCenter.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
+    
+    glm::vec3 cameraTarget = volumeCenter;
     glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
     double lastMouseX = 0, lastMouseY = 0;
     float lastFrameTime = 0.0f;
@@ -115,28 +126,43 @@ void renderTemporalCoherence(
         double mouseX, mouseY;
         glfwGetCursorPos(window, &mouseX, &mouseY);
         
-        // Camera controls
-        const float cameraSpeed = 50.0f * deltaTime;
-        const float mouseSensitivity = 0.5f;
+        // Camera controls - improved for better exploration
+        const float zoomSpeed = 300.0f * deltaTime;  // Increased from 100
+        const float panSpeed = 150.0f * deltaTime;   // Increased from 50
+        const float mouseSensitivity = 1.0f;         // Increased from 0.5
         
+        // W/S: Zoom in/out (move camera closer/farther from target)
         if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
-            glm::vec3 forward = glm::normalize(cameraTarget - cameraPos);
-            cameraPos += forward * cameraSpeed;
+            cameraDistance = glm::max(10.0f, cameraDistance - zoomSpeed);
         }
         if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
-            glm::vec3 forward = glm::normalize(cameraTarget - cameraPos);
-            cameraPos -= forward * cameraSpeed;
+            cameraDistance = glm::min(1000.0f, cameraDistance + zoomSpeed);
         }
+        
+        // A/D: Pan camera target left/right
         if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
-            glm::vec3 forward = glm::normalize(cameraTarget - cameraPos);
-            glm::vec3 right = glm::normalize(glm::cross(forward, cameraUp));
-            cameraPos -= right * cameraSpeed;
+            glm::vec3 forward = glm::normalize(cameraPos - cameraTarget);
+            glm::vec3 right = glm::normalize(glm::cross(cameraUp, forward));
+            cameraTarget -= right * panSpeed;
         }
         if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
-            glm::vec3 forward = glm::normalize(cameraTarget - cameraPos);
-            glm::vec3 right = glm::normalize(glm::cross(forward, cameraUp));
-            cameraPos += right * cameraSpeed;
+            glm::vec3 forward = glm::normalize(cameraPos - cameraTarget);
+            glm::vec3 right = glm::normalize(glm::cross(cameraUp, forward));
+            cameraTarget += right * panSpeed;
         }
+        
+        // Q/E: Pan camera target up/down
+        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
+            cameraTarget.y -= panSpeed;
+        }
+        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
+            cameraTarget.y += panSpeed;
+        }
+        
+        // Update camera position based on spherical coordinates
+        cameraPos.x = cameraTarget.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
+        cameraPos.y = cameraTarget.y + cameraDistance * sin(cameraPitch);
+        cameraPos.z = cameraTarget.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
         
         // Toggle debug colors with 'C' key
         static bool cKeyPressed = false;
@@ -154,23 +180,36 @@ void renderTemporalCoherence(
             std::cout << "Temporal state reset" << std::endl;
         }
         
+        // Mouse controls for camera rotation
         if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
             float deltaX = (float)(mouseX - lastMouseX) * mouseSensitivity;
             float deltaY = (float)(mouseY - lastMouseY) * mouseSensitivity;
             
-            // Rotate camera around target
-            glm::vec3 toCamera = cameraPos - cameraTarget;
-            float radius = glm::length(toCamera);
-            float theta = atan2(toCamera.z, toCamera.x);
-            float phi = acos(toCamera.y / radius);
+            // Update yaw and pitch based on mouse movement (increased sensitivity)
+            cameraYaw -= deltaX * 0.02f;   // Doubled from 0.01
+            cameraPitch -= deltaY * 0.02f; // Doubled from 0.01
             
-            theta -= deltaX * 0.01f;
-            phi += deltaY * 0.01f;
-            phi = glm::clamp(phi, 0.1f, 3.14f - 0.1f);
+            // Clamp pitch to avoid flipping
+            cameraPitch = glm::clamp(cameraPitch, -89.0f * 3.14159f / 180.0f, 89.0f * 3.14159f / 180.0f);
             
-            cameraPos.x = cameraTarget.x + radius * sin(phi) * cos(theta);
-            cameraPos.y = cameraTarget.y + radius * cos(phi);
-            cameraPos.z = cameraTarget.z + radius * sin(phi) * sin(theta);
+            // Update camera position
+            cameraPos.x = cameraTarget.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
+            cameraPos.y = cameraTarget.y + cameraDistance * sin(cameraPitch);
+            cameraPos.z = cameraTarget.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
+        }
+        
+        // Mouse scroll for zoom
+        static double lastScrollY = 0.0;
+        double scrollX, scrollY;
+        scrollY = 0; // This would need to be handled via callback
+        if (scrollY != lastScrollY) {
+            cameraDistance = glm::clamp(cameraDistance - (float)(scrollY - lastScrollY) * 20.0f, 10.0f, 1000.0f);
+            lastScrollY = scrollY;
+            
+            // Update camera position with new distance
+            cameraPos.x = cameraTarget.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
+            cameraPos.y = cameraTarget.y + cameraDistance * sin(cameraPitch);
+            cameraPos.z = cameraTarget.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
         }
         
         lastMouseX = mouseX;
@@ -397,9 +436,18 @@ void renderTransientExtraction(
         swapchainImageViews[i] = createImageView(device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
     }
     
-    // Camera state
-    glm::vec3 cameraPos = glm::vec3(100.f, 100.f, 100.f);
-    glm::vec3 cameraTarget = glm::vec3(0.f, 0.f, 0.f);
+    // Camera state - properly initialized for better viewing
+    glm::vec3 volumeCenter = glm::vec3(128.0f, 128.0f, 128.0f);  // Typical center for 256^3 volumes
+    float cameraDistance = 400.0f;
+    float cameraYaw = -45.0f * 3.14159f / 180.0f;
+    float cameraPitch = 30.0f * 3.14159f / 180.0f;
+    
+    glm::vec3 cameraPos;
+    cameraPos.x = volumeCenter.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
+    cameraPos.y = volumeCenter.y + cameraDistance * sin(cameraPitch);
+    cameraPos.z = volumeCenter.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
+    
+    glm::vec3 cameraTarget = volumeCenter;
     glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
     double lastMouseX = 0, lastMouseY = 0;
     float lastFrameTime = 0.0f;
@@ -427,31 +475,59 @@ void renderTransientExtraction(
         lastFrameTime = currentTime;
         glfwPollEvents();
         
-        // Simple camera controls
+        // Camera controls - improved for better exploration
+        const float zoomSpeed = 300.0f * deltaTime;  // Increased from 100
+        const float panSpeed = 150.0f * deltaTime;   // Increased from 50
+        
+        // W/S: Zoom in/out
         if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
-            glm::vec3 forward = glm::normalize(cameraTarget - cameraPos);
-            cameraPos += forward * deltaTime * 50.0f;
-            cameraTarget += forward * deltaTime * 50.0f;
+            cameraDistance = glm::max(10.0f, cameraDistance - zoomSpeed);
         }
         if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
-            glm::vec3 forward = glm::normalize(cameraTarget - cameraPos);
-            cameraPos -= forward * deltaTime * 50.0f;
-            cameraTarget -= forward * deltaTime * 50.0f;
+            cameraDistance = glm::min(1000.0f, cameraDistance + zoomSpeed);
         }
         
-        // Update camera based on mouse
+        // A/D: Pan camera target left/right
+        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
+            glm::vec3 forward = glm::normalize(cameraPos - cameraTarget);
+            glm::vec3 right = glm::normalize(glm::cross(cameraUp, forward));
+            cameraTarget -= right * panSpeed;
+        }
+        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
+            glm::vec3 forward = glm::normalize(cameraPos - cameraTarget);
+            glm::vec3 right = glm::normalize(glm::cross(cameraUp, forward));
+            cameraTarget += right * panSpeed;
+        }
+        
+        // Q/E: Pan camera target up/down  
+        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
+            cameraTarget.y -= panSpeed;
+        }
+        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
+            cameraTarget.y += panSpeed;
+        }
+        
+        // Update camera position based on spherical coordinates
+        cameraPos.x = cameraTarget.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
+        cameraPos.y = cameraTarget.y + cameraDistance * sin(cameraPitch);
+        cameraPos.z = cameraTarget.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
+        
+        // Mouse controls for rotation
         double mouseX, mouseY;
         glfwGetCursorPos(window, &mouseX, &mouseY);
         if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
-            float dx = (float)(mouseX - lastMouseX);
-            float dy = (float)(mouseY - lastMouseY);
+            float deltaX = (float)(mouseX - lastMouseX) * 1.0f;  // Doubled from 0.5
+            float deltaY = (float)(mouseY - lastMouseY) * 1.0f;  // Doubled from 0.5
             
-            glm::mat4 rotationY = glm::rotate(glm::mat4(1.0f), -dx * 0.005f, glm::vec3(0,1,0));
-            cameraPos = glm::vec3(rotationY * glm::vec4(cameraPos - cameraTarget, 1.0f)) + cameraTarget;
+            // Update yaw and pitch (increased sensitivity)
+            cameraYaw -= deltaX * 0.02f;   // Doubled from 0.01
+            cameraPitch -= deltaY * 0.02f; // Doubled from 0.01
+            cameraPitch = glm::clamp(cameraPitch, -89.0f * 3.14159f / 180.0f, 89.0f * 3.14159f / 180.0f);
             
-            glm::vec3 right = glm::normalize(glm::cross(cameraTarget - cameraPos, glm::vec3(0,1,0)));
-            glm::mat4 rotationX = glm::rotate(glm::mat4(1.0f), -dy * 0.005f, right);
-            cameraPos = glm::vec3(rotationX * glm::vec4(cameraPos - cameraTarget, 1.0f)) + cameraTarget;
+            // Update camera position
+            cameraPos.x = cameraTarget.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
+            cameraPos.y = cameraTarget.y + cameraDistance * sin(cameraPitch);
+            cameraPos.z = cameraTarget.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
         }
         lastMouseX = mouseX;
         lastMouseY = mouseY;

@@ -1,9 +1,28 @@
 #version 460 core
 
+// Define this to enable block-based color debugging (must match mesh shader)
+#define DEBUG_BLOCK_COLORS 0
+
 layout(location = 0) in vec3 fragNormal;
 layout(location = 1) in vec3 fragPos;
+#if DEBUG_BLOCK_COLORS
+layout(location = 2) in flat uint blockID;
+#endif
 
 layout(location = 0) out vec4 outColor;
+
+#if DEBUG_BLOCK_COLORS
+// Generate a distinct color from block ID
+vec3 blockIDToColor(uint id) {
+    // Use a hash function to generate distinct colors per block
+    float seed = float(id + 1u);  // Add 1 to avoid pure black for ID 0
+    float r = fract(sin(seed * 12.9898) * 43758.5453);
+    float g = fract(sin(seed * 78.233) * 43758.5453);
+    float b = fract(sin(seed * 93.989) * 43758.5453);
+    // Ensure minimum brightness for visibility
+    return vec3(0.3 + 0.7 * r, 0.3 + 0.7 * g, 0.3 + 0.7 * b);
+}
+#endif
 
 void main() {
     // Simple lighting calculation
@@ -17,11 +36,16 @@ void main() {
     // Ambient light
     vec3 ambient = vec3(0.2, 0.2, 0.2);
     
-    // Debug: Color based on position to visualize geometry
-    vec3 posColor = fragPos / 64.0; // Normalize to [0,1] for 64^3 volume
+#if DEBUG_BLOCK_COLORS
+    // Debug mode: Color based on block ID
+    vec3 blockColor = blockIDToColor(blockID);
+    // Apply lighting to the block color
+    float lightIntensity = 0.4 + 0.6 * NdotL;  // Keep minimum brightness
+    vec3 finalColor = blockColor * lightIntensity;
+#else
+    // Normal rendering: standard lighting
+    vec3 finalColor = ambient + diffuse;
+#endif
     
-    // Final color - mix lighting with position color for debugging
-    vec3 color = ambient + diffuse;
-    color = mix(color, posColor, 0.5);
-    outColor = vec4(color, 1.0);
+    outColor = vec4(finalColor, 1.0);
 }

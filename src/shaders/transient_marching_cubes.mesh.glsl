@@ -4,8 +4,12 @@
 #extension GL_KHR_shader_subgroup_basic: require
 #extension GL_KHR_shader_subgroup_arithmetic: require
 #extension GL_EXT_debug_printf: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8: require
 
 // --- Shader Configuration ---
+
+// Define this to enable block-based color debugging
+#define DEBUG_BLOCK_COLORS 0
 
 // Workgroup size should match the task shader
 #define WORKGROUP_SIZE 32
@@ -34,6 +38,9 @@ layout(triangles, max_vertices = MAX_VERTS, max_primitives = MAX_PRIMS) out;
 layout(location = 0) out PerVertexData {
     vec3 fragNormal;
     vec3 fragPos;
+#if DEBUG_BLOCK_COLORS
+    flat uint blockID;
+#endif
 } outVertices[];
 
 // --- Payload from Task Shader ---
@@ -53,8 +60,44 @@ layout(set = 0, binding = 1, r8ui) uniform readonly uimage3D volumeImage;
 // binding 2 (minMaxImage) is not used in the mesh shader
 layout(set = 0, binding = 3, std430) readonly buffer ActiveBlockCount { uint count; } activeBlockCount;
 layout(set = 0, binding = 4, std430) readonly buffer ActiveBlockIDs { uint ids[]; } activeBlockIDs;
-layout(set = 0, binding = 5, std430) readonly buffer MarchingCubesTriangleTable { int triTable[]; } mcTriangleTable;
-layout(set = 0, binding = 6, std430) readonly buffer MarchingCubesEdgeTable { int edgeTable[]; } mcEdgeTable;
+layout(set = 0, binding = 5, std430) readonly buffer MarchingCubesTriangleTable { uint8_t triTable[]; } mcTriangleTable;
+layout(set = 0, binding = 6, std430) readonly buffer MarchingCubesNumVerticesTable { uint8_t numVerticesTable[]; } mcNumVerticesTable;
+
+// Hardcoded edge table for better performance
+const uint edgeTable[256] = uint[256](
+    0x0  , 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c,
+    0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
+    0x190, 0x99 , 0x393, 0x29a, 0x596, 0x49f, 0x795, 0x69c,
+    0x99c, 0x895, 0xb9f, 0xa96, 0xd9a, 0xc93, 0xf99, 0xe90,
+    0x230, 0x339, 0x33 , 0x13a, 0x636, 0x73f, 0x435, 0x53c,
+    0xa3c, 0xb35, 0x83f, 0x936, 0xe3a, 0xf33, 0xc39, 0xd30,
+    0x3a0, 0x2a9, 0x1a3, 0xaa , 0x7a6, 0x6af, 0x5a5, 0x4ac,
+    0xbac, 0xaa5, 0x9af, 0x8a6, 0xfaa, 0xea3, 0xda9, 0xca0,
+    0x460, 0x569, 0x663, 0x76a, 0x66 , 0x16f, 0x265, 0x36c,
+    0xc6c, 0xd65, 0xe6f, 0xf66, 0x86a, 0x963, 0xa69, 0xb60,
+    0x5f0, 0x4f9, 0x7f3, 0x6fa, 0x1f6, 0xff , 0x3f5, 0x2fc,
+    0xdfc, 0xcf5, 0xfff, 0xef6, 0x9fa, 0x8f3, 0xbf9, 0xaf0,
+    0x650, 0x759, 0x453, 0x55a, 0x256, 0x35f, 0x55 , 0x15c,
+    0xe5c, 0xf55, 0xc5f, 0xd56, 0xa5a, 0xb53, 0x859, 0x950,
+    0x7c0, 0x6c9, 0x5c3, 0x4ca, 0x3c6, 0x2cf, 0x1c5, 0xcc ,
+    0xfcc, 0xec5, 0xdcf, 0xcc6, 0xbca, 0xac3, 0x9c9, 0x8c0,
+    0x8c0, 0x9c9, 0xac3, 0xbca, 0xcc6, 0xdcf, 0xec5, 0xfcc,
+    0xcc , 0x1c5, 0x2cf, 0x3c6, 0x4ca, 0x5c3, 0x6c9, 0x7c0,
+    0x950, 0x859, 0xb53, 0xa5a, 0xd56, 0xc5f, 0xf55, 0xe5c,
+    0x15c, 0x55 , 0x35f, 0x256, 0x55a, 0x453, 0x759, 0x650,
+    0xaf0, 0xbf9, 0x8f3, 0x9fa, 0xef6, 0xfff, 0xcf5, 0xdfc,
+    0x2fc, 0x3f5, 0xff , 0x1f6, 0x6fa, 0x7f3, 0x4f9, 0x5f0,
+    0xb60, 0xa69, 0x963, 0x86a, 0xf66, 0xe6f, 0xd65, 0xc6c,
+    0x36c, 0x265, 0x16f, 0x66 , 0x76a, 0x663, 0x569, 0x460,
+    0xca0, 0xda9, 0xea3, 0xfaa, 0x8a6, 0x9af, 0xaa5, 0xbac,
+    0x4ac, 0x5a5, 0x6af, 0x7a6, 0xaa , 0x1a3, 0x2a9, 0x3a0,
+    0xd30, 0xc39, 0xf33, 0xe3a, 0x936, 0x83f, 0xb35, 0xa3c,
+    0x53c, 0x435, 0x73f, 0x636, 0x13a, 0x33 , 0x339, 0x230,
+    0xe90, 0xf99, 0xc93, 0xd9a, 0xa96, 0xb9f, 0x895, 0x99c,
+    0x69c, 0x795, 0x49f, 0x596, 0x29a, 0x393, 0x99 , 0x190,
+    0xf00, 0xe09, 0xd03, 0xc0a, 0xb06, 0xa0f, 0x905, 0x80c,
+    0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x0
+);
 
 // Push constants for transformations
 layout(push_constant) uniform RenderPushConstants {
@@ -160,7 +203,7 @@ void main() {
         }
 
         // 2. Generate Vertices and Create Index Map
-        uint edgeMask = uint(mcEdgeTable.edgeTable[configuration]);
+        uint edgeMask = edgeTable[configuration];
         uint numCellVerts = bitCount(edgeMask);
         
         uint vertexBaseIndex = atomicAdd(s_vertexCount, numCellVerts);
@@ -191,7 +234,7 @@ void main() {
         uint numCellPrims = 0;
         int tri_table_start = int(configuration * 16);
         for (int i = 0; i < 5; ++i) {
-             if (mcTriangleTable.triTable[tri_table_start + i*3] == -1) break;
+             if (mcTriangleTable.triTable[tri_table_start + i*3] == 255u) break;
              numCellPrims++;
         }
 
@@ -199,9 +242,9 @@ void main() {
 
         for (int i = 0; i < numCellPrims; ++i) {
             // Read the three EDGE indices for this triangle from the table.
-            int e0 = mcTriangleTable.triTable[tri_table_start + i*3 + 0];
-            int e1 = mcTriangleTable.triTable[tri_table_start + i*3 + 1];
-            int e2 = mcTriangleTable.triTable[tri_table_start + i*3 + 2];
+            uint e0 = uint(mcTriangleTable.triTable[tri_table_start + i*3 + 0]);
+            uint e1 = uint(mcTriangleTable.triTable[tri_table_start + i*3 + 1]);
+            uint e2 = uint(mcTriangleTable.triTable[tri_table_start + i*3 + 2]);
             
             // Use the map to find the local rank, then add the base offset.
             uint global_v1 = vertexBaseIndex + uint(localIndex[e0]);
@@ -235,6 +278,9 @@ void main() {
             // Custom outputs for the fragment shader
             outVertices[i].fragNormal = s_vertexNormals[i];
             outVertices[i].fragPos = worldPos;
+#if DEBUG_BLOCK_COLORS
+            outVertices[i].blockID = taskPayloadIn.blockID;  // Use block ID from task shader
+#endif
         }
 
         for (uint i = 0; i < s_primitiveCount; i++) {

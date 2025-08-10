@@ -1,5 +1,6 @@
 #include "extractionManager.h"
 #include "common.h"
+#include "marchingCubesUtils.h"
 
 #include "vulkan_context.h"
 #include "filteringOutput.h"
@@ -25,204 +26,7 @@
 #include <utility> // For std::move if needed later
 #include "volume.h"
 
-// --- Helper Function to Create Marching Cubes Table Buffer (Revised) ---
-struct MCTableUploadResult {
-    Buffer deviceBuffer;
-    Buffer stagingBuffer;  // Needs cleanup after command buffer submission
-};
-
-MCTableUploadResult createTriTableBuffer(VulkanContext& context, VkCommandBuffer externalCmd = VK_NULL_HANDLE) {
-    MCTableUploadResult result = {};
-    const uint8_t* triTableData = &MarchingCubes::triTable[0][0];
-
-    VkDeviceSize triTableSize = 256 * 16 * sizeof(uint8_t);
-
-    createBuffer(result.stagingBuffer, context.getDevice(), context.getMemoryProperties(),
-                 triTableSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-     // Check if staging buffer creation succeeded
-     if (result.stagingBuffer.buffer == VK_NULL_HANDLE) {
-         throw std::runtime_error("Failed to create staging buffer for MC TriTable.");
-     }
-     if (result.stagingBuffer.data == nullptr) {
-          destroyBuffer(result.stagingBuffer, context.getDevice()); // Clean up before throwing
-          throw std::runtime_error("Failed to map staging buffer for MC TriTable.");
-     }
-
-    // Copy table data to staging buffer
-    memcpy(result.stagingBuffer.data, triTableData, triTableSize); // Use correct pointer
-
-    // Create device-local buffer for the table
-    createBuffer(result.deviceBuffer, context.getDevice(), context.getMemoryProperties(),
-                 triTableSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-     // Check if device buffer creation succeeded
-      if (result.deviceBuffer.buffer == VK_NULL_HANDLE) {
-          destroyBuffer(result.stagingBuffer, context.getDevice()); // Clean up staging buffer
-          throw std::runtime_error("Failed to create device buffer for MC TriTable.");
-      }
-
-    // Use external command buffer if provided, otherwise create our own
-    VkCommandBuffer cmd;
-    bool ownCommandBuffer = (externalCmd == VK_NULL_HANDLE);
-    
-    if (ownCommandBuffer) {
-        cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
-    } else {
-        cmd = externalCmd;
-    }
-    
-    VkBufferCopy copyRegion = {0, 0, triTableSize};
-    vkCmdCopyBuffer(cmd, result.stagingBuffer.buffer, result.deviceBuffer.buffer, 1, &copyRegion);
-
-    // Barrier to ensure transfer completes before shader access
-    VkBufferMemoryBarrier2 transferCompleteBarrier = bufferBarrier(
-        result.deviceBuffer.buffer,
-        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, // Task & Mesh read
-        VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-        0, VK_WHOLE_SIZE);
-    pipelineBarrier(cmd, {}, 1, &transferCompleteBarrier, 0, {});
-
-    if (ownCommandBuffer) {
-        endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
-        // Cleanup staging buffer immediately since we submitted the command
-        destroyBuffer(result.stagingBuffer, context.getDevice());
-        result.stagingBuffer = {}; // Clear to indicate it's been cleaned up
-    }
-    // If using external command buffer, staging buffer cleanup is caller's responsibility
-
-    return result;
-}
-
-MCTableUploadResult createEdgeTableBuffer(VulkanContext& context, VkCommandBuffer externalCmd = VK_NULL_HANDLE) {
-    MCTableUploadResult result = {};
-    const int* edgeTableData = &MarchingCubes::edgeTable[0];
-
-    VkDeviceSize edgeTableSize = 256 * sizeof(int);
-
-    createBuffer(result.stagingBuffer, context.getDevice(), context.getMemoryProperties(),
-                 edgeTableSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-     // Check if staging buffer creation succeeded
-     if (result.stagingBuffer.buffer == VK_NULL_HANDLE) {
-         throw std::runtime_error("Failed to create staging buffer for MC EdgeTable.");
-     }
-     if (result.stagingBuffer.data == nullptr) {
-          destroyBuffer(result.stagingBuffer, context.getDevice()); // Clean up before throwing
-          throw std::runtime_error("Failed to map staging buffer for MC EdgeTable.");
-     }
-
-    // Copy table data to staging buffer
-    memcpy(result.stagingBuffer.data, edgeTableData, edgeTableSize); // Use correct pointer
-
-    // Create device-local buffer for the table
-    createBuffer(result.deviceBuffer, context.getDevice(), context.getMemoryProperties(),
-                 edgeTableSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-     // Check if device buffer creation succeeded
-      if (result.deviceBuffer.buffer == VK_NULL_HANDLE) {
-          destroyBuffer(result.stagingBuffer, context.getDevice()); // Clean up staging buffer
-          throw std::runtime_error("Failed to create device buffer for MC EdgeTable.");
-      }
-
-    // Use external command buffer if provided, otherwise create our own
-    VkCommandBuffer cmd;
-    bool ownCommandBuffer = (externalCmd == VK_NULL_HANDLE);
-    
-    if (ownCommandBuffer) {
-        cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
-    } else {
-        cmd = externalCmd;
-    }
-    
-    VkBufferCopy copyRegion = {0, 0, edgeTableSize};
-    vkCmdCopyBuffer(cmd, result.stagingBuffer.buffer, result.deviceBuffer.buffer, 1, &copyRegion);
-
-    // Barrier to ensure transfer completes before shader access
-    VkBufferMemoryBarrier2 transferCompleteBarrier = bufferBarrier(
-        result.deviceBuffer.buffer,
-        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, // Task & Mesh read
-        VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-        0, VK_WHOLE_SIZE);
-    pipelineBarrier(cmd, {}, 1, &transferCompleteBarrier, 0, {});
-
-    if (ownCommandBuffer) {
-        endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
-        // Cleanup staging buffer immediately since we submitted the command
-        destroyBuffer(result.stagingBuffer, context.getDevice());
-        result.stagingBuffer = {}; // Clear to indicate it's been cleaned up
-    }
-    // If using external command buffer, staging buffer cleanup is caller's responsibility
-
-    return result;
-}
-
-MCTableUploadResult createNumVerticesBuffer(VulkanContext& context, VkCommandBuffer externalCmd = VK_NULL_HANDLE) {
-    MCTableUploadResult result = {};
-    const uint8_t* numVerticesData = &MarchingCubes::numVerticesTable[0];
-
-    VkDeviceSize numVerticesSize = 256 * sizeof(uint8_t);
-
-    createBuffer(result.stagingBuffer, context.getDevice(), context.getMemoryProperties(),
-                 numVerticesSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-     // Check if staging buffer creation succeeded
-     if (result.stagingBuffer.buffer == VK_NULL_HANDLE) {
-         throw std::runtime_error("Failed to create staging buffer for MC NumVertices.");
-     }
-     if (result.stagingBuffer.data == nullptr) {
-          destroyBuffer(result.stagingBuffer, context.getDevice()); // Clean up before throwing
-          throw std::runtime_error("Failed to map staging buffer for MC NumVertices.");
-     }
-
-    // Copy table data to staging buffer
-    memcpy(result.stagingBuffer.data, numVerticesData, numVerticesSize); // Use correct pointer
-
-    // Create device-local buffer for the table
-    createBuffer(result.deviceBuffer, context.getDevice(), context.getMemoryProperties(),
-                 numVerticesSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-     // Check if device buffer creation succeeded
-      if (result.deviceBuffer.buffer == VK_NULL_HANDLE) {
-          destroyBuffer(result.stagingBuffer, context.getDevice()); // Clean up staging buffer
-          throw std::runtime_error("Failed to create device buffer for MC NumVertices.");
-      }
-
-    // Use external command buffer if provided, otherwise create our own
-    VkCommandBuffer cmd;
-    bool ownCommandBuffer = (externalCmd == VK_NULL_HANDLE);
-    
-    if (ownCommandBuffer) {
-        cmd = beginSingleTimeCommands(context.getDevice(), context.getCommandPool());
-    } else {
-        cmd = externalCmd;
-    }
-    
-    VkBufferCopy copyRegion = {0, 0, numVerticesSize};
-    vkCmdCopyBuffer(cmd, result.stagingBuffer.buffer, result.deviceBuffer.buffer, 1, &copyRegion);
-
-    // Barrier to ensure transfer completes before shader access
-    VkBufferMemoryBarrier2 transferCompleteBarrier = bufferBarrier(
-        result.deviceBuffer.buffer,
-        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, // Task & Mesh read
-        VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-        0, VK_WHOLE_SIZE);
-    pipelineBarrier(cmd, {}, 1, &transferCompleteBarrier, 0, {});
-
-    if (ownCommandBuffer) {
-        endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
-        // Cleanup staging buffer immediately since we submitted the command
-        destroyBuffer(result.stagingBuffer, context.getDevice());
-        result.stagingBuffer = {}; // Clear to indicate it's been cleaned up
-    }
-    // If using external command buffer, staging buffer cleanup is caller's responsibility
-
-    std::cout << "Marching Cubes NumVertices buffer created and uploaded." << std::endl;
-    return result;
-}
+// Removed old MC table creation functions - now using MarchingCubesUtils
 
 // Helper to create UBO - revised to take necessary values directly
 Buffer createConstantsUBO(VulkanContext& context, PushConstants& pushConstants) {
@@ -267,10 +71,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
     extractionOutput.device = device; // Store device handle for RAII cleanup
 
     Buffer constantsUBO = {};
-    Buffer mcTriTableBuffer = {};
-    Buffer mcEdgeTableBuffer = {};
-    MCTableUploadResult triTableResult = {};
-    MCTableUploadResult edgeTableResult = {};
+    MarchingCubesTables mcTables = {};
     
     bool ownCommandBuffer = (externalCmd == VK_NULL_HANDLE);
 
@@ -349,14 +150,10 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
         constantsUBO = createConstantsUBO(vulkanContext, pushConstants);
         if (constantsUBO.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create constants UBO."); }
         
-        // Pass the external command buffer to avoid premature staging buffer cleanup
-        triTableResult = createTriTableBuffer(vulkanContext, externalCmd);
-        mcTriTableBuffer = triTableResult.deviceBuffer;
-        if (mcTriTableBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create MC triangle table buffer."); }
-        
-        edgeTableResult = createEdgeTableBuffer(vulkanContext, externalCmd);
-        mcEdgeTableBuffer = edgeTableResult.deviceBuffer;
-        if (mcEdgeTableBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create MC edge table buffer."); }
+        // Create marching cubes tables using the utility
+        MarchingCubesUtils::createMarchingCubesTables(mcTables, device, vulkanContext, false);
+        if (mcTables.triTableBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create MC triangle table buffer."); }
+        if (mcTables.numVerticesBuffer.buffer == VK_NULL_HANDLE) { throw std::runtime_error("Failed to create MC numVertices table buffer."); }
 
         // 4. Update Descriptors
         if (extractionPipeline.descriptorSet_ == VK_NULL_HANDLE) { throw std::runtime_error("Extraction pipeline descriptor set is null."); }
@@ -365,8 +162,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
         VkDescriptorImageInfo volInfo = {VK_NULL_HANDLE, minMaxOutput.volumeImage.imageView, VK_IMAGE_LAYOUT_GENERAL}; // Assuming GENERAL layout from filtering
         VkDescriptorBufferInfo blockCountInfo = {filterOutput.activeBlockCountBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo blockIdInfo = {filterOutput.compactedBlockIdBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo mcTriTableInfo = {mcTriTableBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo mcEdgeTableInfo = {mcEdgeTableBuffer.buffer, 0, VK_WHOLE_SIZE};
+        // MC tables will use buffer views for texel buffers
         VkDescriptorBufferInfo vbInfo = {extractionOutput.vertexBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo vertexCountInfo = {extractionOutput.vertexCountBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};
@@ -422,6 +218,11 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
             &blockIdInfo,
             nullptr
         }); // Binding 3: Active Block IDs
+        VkDescriptorBufferInfo triTableInfo{};
+        triTableInfo.buffer = mcTables.triTableBuffer.buffer;
+        triTableInfo.offset = 0;
+        triTableInfo.range = 256 * 16 * sizeof(uint8_t);
+        
         writes.push_back({
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             nullptr,
@@ -431,9 +232,14 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
             1,
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             nullptr,
-            &mcTriTableInfo,
+            &triTableInfo,
             nullptr
         }); // Binding 4: MC Triangle Table
+        VkDescriptorBufferInfo numVerticesInfo{};
+        numVerticesInfo.buffer = mcTables.numVerticesBuffer.buffer;
+        numVerticesInfo.offset = 0;
+        numVerticesInfo.range = 256 * sizeof(uint8_t);
+        
         writes.push_back({
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             nullptr,
@@ -443,9 +249,9 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
             1,
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             nullptr,
-            &mcEdgeTableInfo,
+            &numVerticesInfo,
             nullptr
-        }); // Binding 5: MC Edge Table
+        }); // Binding 5: MC NumVertices Table (edge table is now hardcoded in shader)
         writes.push_back({
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             nullptr,
@@ -579,8 +385,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
             VK_IMAGE_LAYOUT_GENERAL,
             VK_IMAGE_ASPECT_COLOR_BIT
         ));
-        preBufferBarriers.push_back(bufferBarrier(mcTriTableBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, 0, VK_WHOLE_SIZE));
-        preBufferBarriers.push_back(bufferBarrier(mcEdgeTableBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_SHADER_STORAGE_READ_BIT, 0, VK_WHOLE_SIZE));
+        // MC tables don't need barriers as they're created with proper access already
 
         // *** Added Barrier for UBO ***
         preBufferBarriers.push_back(bufferBarrier(constantsUBO.buffer, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT, EXTRACTION_SHADER_STAGES, VK_ACCESS_2_UNIFORM_READ_BIT, 0, VK_WHOLE_SIZE));
@@ -677,8 +482,7 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
         // Cleanup is handled by RAII destructors for pipeline/output
         // Need to manually clean up UBO/MC Table if created before throw
         destroyBuffer(constantsUBO, device); // Safe to call even if null
-        destroyBuffer(mcTriTableBuffer, device); // Safe to call even if null
-        destroyBuffer(mcEdgeTableBuffer, device);
+        MarchingCubesUtils::destroyMarchingCubesTables(mcTables, device);
         throw;
     }
 
@@ -687,23 +491,14 @@ ExtractionOutput extractMeshletDescriptors(VulkanContext& vulkanContext, MinMaxO
     if (ownCommandBuffer) {
         // Only destroy buffers if we own the command buffer (already submitted)
         destroyBuffer(constantsUBO, device);
-        destroyBuffer(mcTriTableBuffer, device);
-        destroyBuffer(mcEdgeTableBuffer, device);
+        MarchingCubesUtils::destroyMarchingCubesTables(mcTables, device);
     } else {
         
         // Store temporary buffers for later cleanup
         extractionOutput.tempResources.device = device;
         extractionOutput.tempResources.addBuffer(constantsUBO);
-        extractionOutput.tempResources.addBuffer(mcTriTableBuffer);
-        extractionOutput.tempResources.addBuffer(mcEdgeTableBuffer);
-        
-        // Also add the staging buffers from MC table uploads if they exist
-        if (triTableResult.stagingBuffer.buffer != VK_NULL_HANDLE) {
-            extractionOutput.tempResources.addBuffer(triTableResult.stagingBuffer);
-        }
-        if (edgeTableResult.stagingBuffer.buffer != VK_NULL_HANDLE) {
-            extractionOutput.tempResources.addBuffer(edgeTableResult.stagingBuffer);
-        }
+        extractionOutput.tempResources.addBuffer(mcTables.triTableBuffer);
+        extractionOutput.tempResources.addBuffer(mcTables.numVerticesBuffer);
         
         // Also store pipeline resources to prevent premature destruction
         extractionOutput.tempResources.addPipeline(extractionPipeline.pipeline_);
@@ -842,10 +637,7 @@ ExtractionOutput extractMeshletDescriptorsWithDensity(
     }
     
     Buffer constantsUBO = {};
-    Buffer mcTriTableBuffer = {};
-    Buffer mcEdgeTableBuffer = {};
-    MCTableUploadResult triTableResult = {};
-    MCTableUploadResult edgeTableResult = {};
+    MarchingCubesTables mcTables = {};
     
     bool ownCommandBuffer = (externalCmd == VK_NULL_HANDLE);
     
@@ -890,10 +682,7 @@ ExtractionOutput extractMeshletDescriptorsWithDensity(
         
         // Create UBO and MC tables
         constantsUBO = createConstantsUBO(vulkanContext, pushConstants);
-        triTableResult = createTriTableBuffer(vulkanContext, externalCmd);
-        mcTriTableBuffer = triTableResult.deviceBuffer;
-        edgeTableResult = createEdgeTableBuffer(vulkanContext, externalCmd);
-        mcEdgeTableBuffer = edgeTableResult.deviceBuffer;
+        MarchingCubesUtils::createMarchingCubesTables(mcTables, device, vulkanContext, false);
         
         // Record command buffer
         VkCommandBuffer cmd = ownCommandBuffer ? 
@@ -941,8 +730,7 @@ ExtractionOutput extractMeshletDescriptorsWithDensity(
         VkDescriptorImageInfo volInfo = {VK_NULL_HANDLE, minMaxOutput.volumeImage.imageView, VK_IMAGE_LAYOUT_GENERAL};
         VkDescriptorBufferInfo blockCountInfo = {filterOutput.activeBlockCountBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo consolidatedBufferInfo = {classified.consolidatedBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo mcTriTableInfo = {mcTriTableBuffer.buffer, 0, VK_WHOLE_SIZE};
-        VkDescriptorBufferInfo mcEdgeTableInfo = {mcEdgeTableBuffer.buffer, 0, VK_WHOLE_SIZE};
+        // MC tables will use buffer views for texel buffers
         VkDescriptorBufferInfo vbInfo = {extractionOutput.vertexBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo vertexCountInfo = {extractionOutput.vertexCountBuffer.buffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo ibInfo = {extractionOutput.indexBuffer.buffer, 0, VK_WHOLE_SIZE};
@@ -970,6 +758,9 @@ ExtractionOutput extractMeshletDescriptorsWithDensity(
             mediumPipeline.descriptorSet_, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             nullptr, &consolidatedBufferInfo, nullptr});
         
+        // TODO: Update density-based extraction to use new MC table utils
+        // For now, commented out as density-based approach is being ignored
+        /*
         // Binding 4: MC Triangle Table
         writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
             mediumPipeline.descriptorSet_, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -979,6 +770,7 @@ ExtractionOutput extractMeshletDescriptorsWithDensity(
         writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
             mediumPipeline.descriptorSet_, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             nullptr, &mcEdgeTableInfo, nullptr});
+        */
         
         // Binding 6: Output Vertex Buffer
         writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
@@ -1061,8 +853,7 @@ ExtractionOutput extractMeshletDescriptorsWithDensity(
         // Cleanup
         classified.cleanup(device);
         destroyBuffer(constantsUBO, device);
-        destroyBuffer(mcTriTableBuffer, device);
-        destroyBuffer(mcEdgeTableBuffer, device);
+        MarchingCubesUtils::destroyMarchingCubesTables(mcTables, device);
         throw;
     }
     
@@ -1071,23 +862,16 @@ ExtractionOutput extractMeshletDescriptorsWithDensity(
         // If we own the command buffer, it's already been submitted, so cleanup now
         classified.cleanup(device);
         destroyBuffer(constantsUBO, device);
-        destroyBuffer(mcTriTableBuffer, device);
-        destroyBuffer(mcEdgeTableBuffer, device);
+        MarchingCubesUtils::destroyMarchingCubesTables(mcTables, device);
     } else {
         // Store for later cleanup (same as original)
         extractionOutput.tempResources.device = device;
         // Add the consolidated buffer to temporary resources
         extractionOutput.tempResources.addBuffer(classified.consolidatedBuffer);
         extractionOutput.tempResources.addBuffer(constantsUBO);
-        extractionOutput.tempResources.addBuffer(mcTriTableBuffer);
-        extractionOutput.tempResources.addBuffer(mcEdgeTableBuffer);
-        
-        if (triTableResult.stagingBuffer.buffer != VK_NULL_HANDLE) {
-            extractionOutput.tempResources.addBuffer(triTableResult.stagingBuffer);
-        }
-        if (edgeTableResult.stagingBuffer.buffer != VK_NULL_HANDLE) {
-            extractionOutput.tempResources.addBuffer(edgeTableResult.stagingBuffer);
-        }
+        // TODO: Update to use new MC table utils
+        //extractionOutput.tempResources.addBuffer(mcTriTableBuffer);
+        //extractionOutput.tempResources.addBuffer(mcEdgeTableBuffer);
         
         // Store pipeline resources
         extractionOutput.tempResources.addPipeline(mediumPipeline.pipeline_);

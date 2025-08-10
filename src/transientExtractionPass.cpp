@@ -127,11 +127,11 @@ void TransientExtractionPass::createPipelineLayouts() {
         // Binding 1: Volume texture
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, 
          VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, nullptr},
-        // Binding 2: Marching cubes numVertices TBO (shared by task and mesh shaders)
-        {2, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1,
+        // Binding 2: Marching cubes numVertices storage buffer (shared by task and mesh shaders)
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
          VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, nullptr},
-        // Binding 3: Marching cubes triTable TBO (mesh shader only)
-        {3, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1,
+        // Binding 3: Marching cubes triTable storage buffer (mesh shader only)
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
          VK_SHADER_STAGE_MESH_BIT_EXT, nullptr},
         // Binding 5: Min-max hierarchy texture
         {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, 
@@ -338,13 +338,21 @@ VkDescriptorSet TransientExtractionPass::createPassDescriptorSet(
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
                      1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &volumeInfo, nullptr, nullptr});
     
-    // Binding 2: Marching cubes numVertices TBO (shared by task and mesh shaders)
+    // Binding 2: Marching cubes numVertices storage buffer (shared by task and mesh shaders)
+    VkDescriptorBufferInfo numVerticesInfo{};
+    numVerticesInfo.buffer = mcTables_.numVerticesBuffer.buffer;
+    numVerticesInfo.offset = 0;
+    numVerticesInfo.range = 256 * sizeof(uint8_t);
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
-                     2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, nullptr, nullptr, &mcTables_.numVerticesView});
+                     2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &numVerticesInfo, nullptr});
     
-    // Binding 3: Marching cubes triTable TBO (mesh shader only)
+    // Binding 3: Marching cubes triTable storage buffer (mesh shader only)
+    VkDescriptorBufferInfo triTableInfo{};
+    triTableInfo.buffer = mcTables_.triTableBuffer.buffer;
+    triTableInfo.offset = 0;
+    triTableInfo.range = 256 * 16 * sizeof(uint8_t);
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
-                     3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, nullptr, nullptr, &mcTables_.triTableView});
+                     3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triTableInfo, nullptr});
     
     // Binding 5: Min-max texture
     VkDescriptorImageInfo minMaxInfo{minMaxSampler, minMaxImageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -466,7 +474,7 @@ void TransientExtractionPass::renderTransientPasses(
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 4}  // TBOs for marching cubes tables (2 per set, 2 sets)
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}  // Storage buffers for marching cubes tables (2 per set, 2 sets)
     };
     
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -768,7 +776,7 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2}  // TBOs for marching cubes tables
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}  // Storage buffers for marching cubes tables
     };
     
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1010,7 +1018,7 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2}  // TBOs for marching cubes tables
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}  // Storage buffers for marching cubes tables
     };
     
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1155,7 +1163,7 @@ void TransientExtractionPass::createMarchingCubesTables(bool useUniqueTables) {
     size_t numVerticesSize = 256 * sizeof(uint8_t);
     createBuffer(mcTables_.numVerticesBuffer, device_, context_.getMemoryProperties(),
                  numVerticesSize, 
-                 VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     
     // Create buffer for triangle table
@@ -1177,7 +1185,7 @@ void TransientExtractionPass::createMarchingCubesTables(bool useUniqueTables) {
     
     createBuffer(mcTables_.triTableBuffer, device_, context_.getMemoryProperties(),
                  triTableSize,
-                 VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     
     // Upload data to buffers using staging
@@ -1208,22 +1216,7 @@ void TransientExtractionPass::createMarchingCubesTables(bool useUniqueTables) {
     endSingleTimeCommands(device_, context_.getCommandPool(), context_.getQueue(), cmd);
     destroyBuffer(stagingBuffer, device_);
     
-    // Create buffer views for shader access
-    VkBufferViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
-    
-    // NumVertices view (R8_UINT format for uint8 data)
-    viewInfo.buffer = mcTables_.numVerticesBuffer.buffer;
-    viewInfo.format = VK_FORMAT_R8_UINT;
-    viewInfo.offset = 0;
-    viewInfo.range = numVerticesSize;
-    VK_CHECK(vkCreateBufferView(device_, &viewInfo, nullptr, &mcTables_.numVerticesView));
-    
-    // Triangle table view (R8_UINT format for uint8 data)
-    viewInfo.buffer = mcTables_.triTableBuffer.buffer;
-    viewInfo.format = VK_FORMAT_R8_UINT;  // Changed from R32_SINT to R8_UINT
-    viewInfo.offset = 0;
-    viewInfo.range = triTableSize;
-    VK_CHECK(vkCreateBufferView(device_, &viewInfo, nullptr, &mcTables_.triTableView));
+    // Buffer views no longer needed when using storage buffers
 }
 
 void TransientExtractionPass::createIndirectUpdatePipeline() {
@@ -1413,14 +1406,7 @@ void TransientExtractionPass::updateIndirectDrawBufferGPU(VkCommandBuffer cmd,
 }
 
 void TransientExtractionPass::destroyMarchingCubesTables() {
-    if (mcTables_.numVerticesView != VK_NULL_HANDLE) {
-        vkDestroyBufferView(device_, mcTables_.numVerticesView, nullptr);
-        mcTables_.numVerticesView = VK_NULL_HANDLE;
-    }
-    if (mcTables_.triTableView != VK_NULL_HANDLE) {
-        vkDestroyBufferView(device_, mcTables_.triTableView, nullptr);
-        mcTables_.triTableView = VK_NULL_HANDLE;
-    }
+    // Buffer views no longer needed when using storage buffers
     
     destroyBuffer(mcTables_.numVerticesBuffer, device_);
     destroyBuffer(mcTables_.triTableBuffer, device_);

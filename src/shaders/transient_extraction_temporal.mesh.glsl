@@ -3,6 +3,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_debug_printf : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8: require
 
@@ -24,9 +25,9 @@ layout(binding = 0, std140) uniform ViewParameters {
 // Volume data image
 layout(binding = 1, r8ui) uniform readonly uimage3D volumeImage;
 
-// Marching cubes lookup tables as TBOs
-layout(binding = 2) uniform usamplerBuffer numVerticesTable;  // 256 entries of uint8
-layout(binding = 3) uniform usamplerBuffer triTable;          // 256x16 entries of uint8
+// Marching cubes lookup tables as storage buffers
+layout(binding = 2, std430) readonly buffer NumVerticesTable { uint8_t numVerticesTable[]; };
+layout(binding = 3, std430) readonly buffer TriTable { uint8_t triTable[]; };
 
 // Push constants for additional parameters
 layout(push_constant) uniform PushConstants {
@@ -87,14 +88,14 @@ const uint edgeTable[256] = uint[256](
 
 // Helper function to get number of unique vertices for a cube configuration
 uint getNumUniqueVertices(uint cubeIndex) {
-    return texelFetch(numVerticesTable, int(cubeIndex)).r;
+    return uint(numVerticesTable[cubeIndex]);
 }
 
 // Helper function to get triangle table entry
 int getTriTableEntry(uint cubeIndex, uint vertexIdx) {
     // Each cube has 16 entries, fetch the specific one
     uint offset = cubeIndex * 16u + vertexIdx;
-    uint value = texelFetch(triTable, int(offset)).r;
+    uint value = uint(triTable[offset]);
     // Convert 255 to -1 for termination
     return (value == 255u) ? -1 : int(value);
 }

@@ -205,8 +205,6 @@ private:
     struct MarchingCubesTables {
         Buffer numVerticesBuffer;     // Buffer for numUniqueVerticesTable or numVerticesTable
         Buffer triTableBuffer;         // Buffer for uniqueTriTable or triTable
-        VkBufferView numVerticesView = VK_NULL_HANDLE;  // Buffer view for shader access
-        VkBufferView triTableView = VK_NULL_HANDLE;     // Buffer view for shader access
         bool isUnique = false;  // Whether using unique or standard tables
     };
     MarchingCubesTables mcTables_;
