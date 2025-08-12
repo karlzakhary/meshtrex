@@ -1681,9 +1681,6 @@ void RasterOcclusionPass::createIndirectUpdatePipeline() {
 }
 
 void RasterOcclusionPass::updateIndirectDrawBufferGPU(VkCommandBuffer cmd, uint32_t totalBlocks) {
-    // Clean up any previous descriptor pool
-    indirectTempResources_.destroy(device_);
-    
     // Create descriptor pool for compute shader
     VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
     

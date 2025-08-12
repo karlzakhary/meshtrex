@@ -120,6 +120,25 @@ public:
         VkExtent2D renderExtent
     );
     
+    // Temporary descriptor pool for indirect update (cleaned up after command submission)
+    struct IndirectTempResources {
+        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+        
+        void destroy(VkDevice device) {
+            if (descriptorPool) {
+                vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+                descriptorPool = VK_NULL_HANDLE;
+            }
+        }
+    };
+    
+    // Get indirect temp resources for deferred destruction
+    IndirectTempResources getIndirectTempResources() {
+        IndirectTempResources resources = indirectTempResources_;
+        indirectTempResources_ = {}; // Clear the original
+        return resources;
+    }
+    
     // Clean up temporary resources for indirect draw (call after command buffer submission)
     void cleanupIndirectTempResources() {
         indirectTempResources_.destroy(device_);
@@ -128,6 +147,9 @@ public:
 private:
     const VulkanContext& context_;
     VkDevice device_;
+    
+    // Temporary descriptor pool for indirect update (cleaned up after command submission)
+    IndirectTempResources indirectTempResources_;
     
     // Pipeline for task/mesh shader occlusion culling
     VkPipeline occlusionPipeline_ = VK_NULL_HANDLE;
@@ -159,18 +181,6 @@ private:
     VkDescriptorSetLayout indirectUpdateDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkShaderModule indirectUpdateComputeShader_ = VK_NULL_HANDLE;
     bool useIndirectDraw_ = true;
-    
-    // Temporary descriptor pool for indirect update (cleaned up after command submission)
-    struct IndirectTempResources {
-        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-        
-        void destroy(VkDevice device) {
-            if (descriptorPool) {
-                vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-                descriptorPool = VK_NULL_HANDLE;
-            }
-        }
-    } indirectTempResources_;
     
     void createPipelineLayout();
     void createOcclusionPipeline();

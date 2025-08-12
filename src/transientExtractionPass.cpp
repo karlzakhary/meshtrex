@@ -686,12 +686,11 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
     
     // Debug tracking
     static int pass1CallCount = 0;
-    printf("renderPass1_PreviousVisible called: %d, pvsPreviousCount=%u\n", 
-           pass1CallCount++, occlusionOutput.pvsPreviousCount);
+    // printf("renderPass1_PreviousVisible called: %d, pvsPreviousCount=%u\n", 
+    //        pass1CallCount++, occlusionOutput.pvsPreviousCount);
     
     // Skip if no previous blocks to render
     if (occlusionOutput.pvsPreviousCount == 0) {
-        printf("  Pass1: No previous blocks to render\n");
         return;
     }
     

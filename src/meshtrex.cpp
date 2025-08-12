@@ -92,22 +92,50 @@ void renderTemporalCoherence(
     float lastFrameTime = 0.0f;
     
     // Create synchronization objects
-    VkSemaphore acquireSemaphore = createSemaphore(device);
-    VkSemaphore releaseSemaphore = createSemaphore(device);
-    VkFenceCreateInfo fenceCreateInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    VkFence frameFence = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFence));
+    // We need more acquire semaphores than swapchain images to avoid reuse conflicts
+    const uint32_t MAX_FRAMES_IN_FLIGHT = 3;
+    std::vector<VkSemaphore> acquireSemaphores(MAX_FRAMES_IN_FLIGHT);
+    // Release semaphores are per swapchain image
+    std::vector<VkSemaphore> releaseSemaphores(swapchain.imageCount);
     
-    // Allocate command buffer
-    VkCommandBuffer commandBuffer;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        acquireSemaphores[i] = createSemaphore(device);
+    }
+    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+        releaseSemaphores[i] = createSemaphore(device);
+    }
+    
+    // Fences are per swapchain image
+    std::vector<VkFence> frameFences(swapchain.imageCount);
+    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+        VkFenceCreateInfo fenceCreateInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFences[i]));
+    }
+    
+    uint32_t currentFrame = 0;  // Track which set of sync objects to use
+    
+    // Allocate command buffers - one per frame to avoid conflicts
+    std::vector<VkCommandBuffer> commandBuffers(swapchain.imageCount);
     VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = context.getCommandPool();
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer));
+    allocInfo.commandBufferCount = swapchain.imageCount;
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()));
+    
+    // Track per-frame temporary resources
+    struct FrameResources {
+        bool hasResources = false;
+        uint32_t frameNumber = 0;
+        uint32_t createdAtFrame = 0;  // Track when resources were created
+        // Store the actual temp resources to destroy later
+        RasterOcclusionPass::Output::TempResources occlusionTempResources;
+        RasterOcclusionPass::IndirectTempResources indirectTempResources;
+    };
+    std::vector<FrameResources> frameResources(swapchain.imageCount);
     
     // Initialize temporal coherence components
+    printf("DEBUG: Swapchain has %u images\n", swapchain.imageCount);
     RasterOcclusionPass occlusionPass(context);
     TransientExtractionPass transientPass(context, swapchainFormat);
     RasterOcclusionPass::Output occlusionOutput;
@@ -115,6 +143,7 @@ void renderTemporalCoherence(
     
     // Main render loop
     bool enableDebugColors = false;
+    int framesProcessed = 0;  // Track frames processed for first-frame handling
     while (!glfwWindowShouldClose(window)) {
         float currentTime = (float)glfwGetTime();
         float deltaTime = currentTime - lastFrameTime;
@@ -177,6 +206,7 @@ void renderTemporalCoherence(
         // Reset temporal state with 'R' key
         if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
             occlusionOutput.isFirstFrame = true;
+            framesProcessed = 0;  // Reset frame counter for first-frame handling
             std::cout << "Temporal state reset" << std::endl;
         }
         
@@ -221,23 +251,66 @@ void renderTemporalCoherence(
         projMatrix[1][1] *= -1; // Flip Y for Vulkan
         glm::mat4 viewProjMatrix = projMatrix * viewMatrix;
         
-        // Wait for previous frame
-        VK_CHECK(vkWaitForFences(device, 1, &frameFence, VK_TRUE, UINT64_MAX));
-        VK_CHECK(vkResetFences(device, 1, &frameFence));
+        // DEBUG: Print frame info
+        static int frameCount = 0;
+        if (frameCount++ < 20) {
+            printf("Frame %d: currentFrame=%u\n", frameCount-1, currentFrame);
+        }
         
-        // Clean up temporary resources from previous frame (after fence wait)
-        occlusionPass.cleanupIndirectTempResources();
-        transientPass.cleanupTempResources();
-        
-        // Read back PVS counts from GPU before cleaning up resources
-        occlusionOutput.readbackPVSCounts(device);
-        
-        // Clean up temporary resources from previous frame now that GPU is done
-        occlusionOutput.cleanupTempResources(device);
+        // NOTE: We don't call occlusionOutput.cleanupTempResources() here anymore 
+        // because we're managing the lifecycle ourselves to avoid destroying resources in use
         
         // Acquire swapchain image
         uint32_t imageIndex;
-        VK_CHECK(vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquireSemaphore, VK_NULL_HANDLE, &imageIndex));
+        // Use a simple round-robin for acquire semaphores since we just need one that's free
+        VK_CHECK(vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquireSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex));
+        
+        if (frameCount < 20) {
+            printf("Frame %d: Acquired image %u\n", frameCount-1, imageIndex);
+        }
+        
+        // Wait for this image's fence (from its previous use)
+        VK_CHECK(vkWaitForFences(device, 1, &frameFences[imageIndex], VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(device, 1, &frameFences[imageIndex]));
+        
+        // Read back and destroy resources associated with this image from its previous use
+        // Only destroy if resources are old enough (at least MAX_FRAMES_IN_FLIGHT frames old)
+        if (frameResources[imageIndex].hasResources) {
+            uint32_t framesSinceCreation = frameCount - frameResources[imageIndex].createdAtFrame;
+            if (frameCount < 20) {
+                printf("Frame %d: Image %u resources created at frame %u (age: %u frames)\n", 
+                       frameCount-1, imageIndex, frameResources[imageIndex].createdAtFrame, framesSinceCreation);
+            }
+            
+            // Only destroy if old enough (at least 3 frames old to ensure GPU is done)
+            if (framesSinceCreation >= 3) {
+                if (frameCount < 20) {
+                    printf("Frame %d: Destroying resources from image %u (old enough)\n", frameCount-1, imageIndex);
+                }
+                // Only read back if we have a readback buffer
+                if (frameResources[imageIndex].occlusionTempResources.readbackBuffer) {
+                    // Temporarily restore the readback buffer to occlusionOutput for reading
+                    occlusionOutput.tempResources.readbackBuffer = frameResources[imageIndex].occlusionTempResources.readbackBuffer;
+                    occlusionOutput.tempResources.readbackMemory = frameResources[imageIndex].occlusionTempResources.readbackMemory;
+                    occlusionOutput.readbackPVSCounts(device);
+                    occlusionOutput.tempResources.readbackBuffer = VK_NULL_HANDLE;
+                    occlusionOutput.tempResources.readbackMemory = VK_NULL_HANDLE;
+                }
+                
+                // Now destroy the saved temp resources
+                frameResources[imageIndex].occlusionTempResources.destroy(device);
+                frameResources[imageIndex].indirectTempResources.destroy(device);
+                // transientPass.cleanupTempResources();
+                frameResources[imageIndex].hasResources = false;
+            } else {
+                if (frameCount < 20) {
+                    printf("Frame %d: Skipping destruction of image %u resources (too new)\n", frameCount-1, imageIndex);
+                }
+            }
+        }
+        
+        // Use the command buffer associated with this swapchain image
+        VkCommandBuffer commandBuffer = commandBuffers[imageIndex];
         
         // Begin command buffer
         VK_CHECK(vkResetCommandBuffer(commandBuffer, 0));
@@ -310,6 +383,11 @@ void renderTemporalCoherence(
         );
         
         // Step 2: Perform temporal occlusion culling against Pass 1's depth buffer
+        static int occlusionCallCount = 0;
+        if (occlusionCallCount++ < 10) {
+            printf("Main loop: Calling performTemporalOcclusionCulling, frame %d, isFirstFrame=%d\n", 
+                   occlusionCallCount - 1, occlusionOutput.isFirstFrame);
+        }
         occlusionPass.performTemporalOcclusionCulling(
             commandBuffer,
             occlusionOutput,
@@ -334,9 +412,13 @@ void renderTemporalCoherence(
             shadingParams
         );
         
-        // Mark first frame as complete after rendering
+        // Keep first frame mode active for all frames in flight during startup
         if (occlusionOutput.isFirstFrame) {
-            occlusionOutput.isFirstFrame = false;
+            framesProcessed++;
+            // Only clear first frame flag after all frames in flight have been processed
+            if (framesProcessed >= swapchain.imageCount) {
+                occlusionOutput.isFirstFrame = false;
+            }
         }
         
         // Swap temporal buffers for next frame
@@ -351,37 +433,61 @@ void renderTemporalCoherence(
         
         VK_CHECK(vkEndCommandBuffer(commandBuffer));
         
-        // Submit
+        // Submit using the current frame's semaphores and fence
         VkPipelineStageFlags submitStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &acquireSemaphore;
+        submitInfo.pWaitSemaphores = &acquireSemaphores[currentFrame];
         submitInfo.pWaitDstStageMask = &submitStageMask;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffer;
         submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &releaseSemaphore;
-        VK_CHECK(vkQueueSubmit(context.getQueue(), 1, &submitInfo, frameFence));
+        submitInfo.pSignalSemaphores = &releaseSemaphores[imageIndex];
+        VK_CHECK(vkQueueSubmit(context.getQueue(), 1, &submitInfo, frameFences[imageIndex]));
         
-        // Present
+        // Present using the release semaphore for this image
         VkPresentInfoKHR presentInfo = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         presentInfo.waitSemaphoreCount = 1;
-        presentInfo.pWaitSemaphores = &releaseSemaphore;
+        presentInfo.pWaitSemaphores = &releaseSemaphores[imageIndex];
         presentInfo.swapchainCount = 1;
         presentInfo.pSwapchains = &swapchain.swapchain;
         presentInfo.pImageIndices = &imageIndex;
         VK_CHECK(vkQueuePresentKHR(context.getQueue(), &presentInfo));
+        
+        // Save the temp resources from this frame to be destroyed later
+        if (frameCount < 20) {
+            printf("Frame %d: Saving resources to image %u (will be destroyed when old enough)\n", 
+                   frameCount-1, imageIndex);
+        }
+        frameResources[imageIndex].occlusionTempResources = occlusionOutput.tempResources;
+        occlusionOutput.tempResources = {}; // Clear the original so it doesn't get destroyed prematurely
+        frameResources[imageIndex].indirectTempResources = occlusionPass.getIndirectTempResources();
+        frameResources[imageIndex].hasResources = true;
+        frameResources[imageIndex].createdAtFrame = frameCount - 1;  // Record when created
+        
+        // Advance to next frame
+        currentFrame = (currentFrame + 1) % 3; // MAX_FRAMES_IN_FLIGHT
     }
     
     // Wait for device idle
     vkDeviceWaitIdle(device);
     
     // Cleanup
+    // Clean up any remaining frame resources
+    for (auto& frame : frameResources) {
+        if (frame.hasResources) {
+            frame.occlusionTempResources.destroy(device);
+        }
+    }
     occlusionOutput.destroy(device);
-    vkDestroyFence(device, frameFence, nullptr);
-    vkDestroySemaphore(device, releaseSemaphore, nullptr);
-    vkDestroySemaphore(device, acquireSemaphore, nullptr);
-    vkFreeCommandBuffers(device, context.getCommandPool(), 1, &commandBuffer);
+    
+    // Destroy all synchronization objects
+    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+        vkDestroyFence(device, frameFences[i], nullptr);
+        vkDestroySemaphore(device, releaseSemaphores[i], nullptr);
+        vkDestroySemaphore(device, acquireSemaphores[i], nullptr);
+    }
+    vkFreeCommandBuffers(device, context.getCommandPool(), swapchain.imageCount, commandBuffers.data());
     
     for (auto imageView : swapchainImageViews) {
         vkDestroyImageView(device, imageView, nullptr);
@@ -453,20 +559,36 @@ void renderTransientExtraction(
     float lastFrameTime = 0.0f;
     
     // Create synchronization objects
-    VkSemaphore acquireSemaphore = createSemaphore(device);
-    VkSemaphore releaseSemaphore = createSemaphore(device);
-    VkFenceCreateInfo fenceCreateInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    VkFence frameFence = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFence));
+    // We need more acquire semaphores than swapchain images to avoid reuse conflicts
+    const uint32_t MAX_FRAMES_IN_FLIGHT = 3;
+    std::vector<VkSemaphore> acquireSemaphores(MAX_FRAMES_IN_FLIGHT);
+    // Release semaphores are per swapchain image
+    std::vector<VkSemaphore> releaseSemaphores(swapchain.imageCount);
     
-    // Allocate command buffer
-    VkCommandBuffer commandBuffer;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        acquireSemaphores[i] = createSemaphore(device);
+    }
+    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+        releaseSemaphores[i] = createSemaphore(device);
+    }
+    
+    // Fences are per swapchain image
+    std::vector<VkFence> frameFences(swapchain.imageCount);
+    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+        VkFenceCreateInfo fenceCreateInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFences[i]));
+    }
+    
+    uint32_t currentFrame = 0;  // Track which set of sync objects to use
+    
+    // Allocate command buffers - one per frame to avoid conflicts
+    std::vector<VkCommandBuffer> commandBuffers(swapchain.imageCount);
     VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = context.getCommandPool();
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer));
+    allocInfo.commandBufferCount = swapchain.imageCount;
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()));
     
     // Main render loop
     while (!glfwWindowShouldClose(window)) {
@@ -532,11 +654,11 @@ void renderTransientExtraction(
         lastMouseX = mouseX;
         lastMouseY = mouseY;
         
-        VK_CHECK(vkWaitForFences(device, 1, &frameFence, VK_TRUE, UINT64_MAX));
-        VK_CHECK(vkResetFences(device, 1, &frameFence));
+        VK_CHECK(vkWaitForFences(device, 1, &frameFences[currentFrame], VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(device, 1, &frameFences[currentFrame]));
         
         uint32_t imageIndex;
-        VkResult result = vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquireSemaphore, VK_NULL_HANDLE, &imageIndex);
+        VkResult result = vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquireSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
         if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(device);
             // Recreate swapchain
@@ -581,6 +703,9 @@ void renderTransientExtraction(
         TransientExtractionPushConstants renderConstants;
         renderConstants.viewProj = viewProj;
         extractFrustumPlanes(viewProj, renderConstants.frustumPlanes);
+        
+        // Use the current frame's command buffer
+        VkCommandBuffer commandBuffer = commandBuffers[currentFrame];
         
         // Record command buffer
         VK_CHECK(vkResetCommandBuffer(commandBuffer, 0));
@@ -700,22 +825,22 @@ void renderTransientExtraction(
         VkPipelineStageFlags submitStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &acquireSemaphore;
+        submitInfo.pWaitSemaphores = &acquireSemaphores[currentFrame];
         submitInfo.pWaitDstStageMask = &submitStageMask;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffer;
         submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &releaseSemaphore;
+        submitInfo.pSignalSemaphores = &releaseSemaphores[currentFrame];
         
-        VK_CHECK(vkQueueSubmit(context.getQueue(), 1, &submitInfo, frameFence));
+        VK_CHECK(vkQueueSubmit(context.getQueue(), 1, &submitInfo, frameFences[currentFrame]));
         
         // Clean up temporary resources after submission
         // Note: Temp resources from extractAndRenderTransient are cleaned up internally
         
-        // Present
+        // Present using the current frame's release semaphore
         VkPresentInfoKHR presentInfo = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         presentInfo.waitSemaphoreCount = 1;
-        presentInfo.pWaitSemaphores = &releaseSemaphore;
+        presentInfo.pWaitSemaphores = &releaseSemaphores[currentFrame];
         presentInfo.swapchainCount = 1;
         presentInfo.pSwapchains = &swapchain.swapchain;
         presentInfo.pImageIndices = &imageIndex;
@@ -726,15 +851,22 @@ void renderTransientExtraction(
         } else {
             assert(result == VK_SUCCESS);
         }
+        
+        // Advance to next frame
+        currentFrame = (currentFrame + 1) % 3; // MAX_FRAMES_IN_FLIGHT
     }
     
     vkDeviceWaitIdle(device);
     
     // Cleanup
-    vkFreeCommandBuffers(device, context.getCommandPool(), 1, &commandBuffer);
-    vkDestroyFence(device, frameFence, nullptr);
-    vkDestroySemaphore(device, releaseSemaphore, nullptr);
-    vkDestroySemaphore(device, acquireSemaphore, nullptr);
+    vkFreeCommandBuffers(device, context.getCommandPool(), swapchain.imageCount, commandBuffers.data());
+    
+    // Destroy all synchronization objects
+    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+        vkDestroyFence(device, frameFences[i], nullptr);
+        vkDestroySemaphore(device, releaseSemaphores[i], nullptr);
+        vkDestroySemaphore(device, acquireSemaphores[i], nullptr);
+    }
     
     for (auto& view : swapchainImageViews) {
         vkDestroyImageView(device, view, nullptr);
