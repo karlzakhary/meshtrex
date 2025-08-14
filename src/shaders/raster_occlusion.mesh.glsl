@@ -3,6 +3,8 @@
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_int8: require
 
+#extension GL_EXT_debug_printf : enable
+
 #define WORKGROUP_SIZE 32
 #define MAX_VERTICES 128 // 32 threads * 4 vertices
 #define MAX_PRIMITIVES 64  // 32 threads * 2 triangles
@@ -78,18 +80,24 @@ void main() {
         vec2 screenMin = vec2(2.0);
         vec2 screenMax = vec2(-2.0);
         float minZ = 1.0;
+        float maxZ = -1.0;
+        bool hasVisibleVertex = false;
         
         for (uint i = 0; i < 8; i++) {
             vec4 clipPos = view.viewProj * vec4(corners[i], 1.0);
+            // Only consider vertices in front of the camera (w > 0)
             if (clipPos.w > 0.0) {
                 vec3 ndc = clipPos.xyz / clipPos.w;
                 screenMin = min(screenMin, ndc.xy);
                 screenMax = max(screenMax, ndc.xy);
                 minZ = min(minZ, ndc.z);
+                maxZ = max(maxZ, ndc.z);
+                hasVisibleVertex = true;
             }
         }
         
-        if (screenMin.x <= screenMax.x) { // Check if block is on screen
+        // Only generate proxy quad if at least one vertex is in front and screen bounds are valid
+        if (hasVisibleVertex && screenMin.x <= screenMax.x && screenMin.x <= 1.0 && screenMax.x >= -1.0 && screenMin.y <= 1.0 && screenMax.y >= -1.0) {
             uint vertexBase = threadID * 4;
             uint primitiveBase = threadID * 2;
             

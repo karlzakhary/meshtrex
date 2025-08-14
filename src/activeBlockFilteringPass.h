@@ -21,7 +21,7 @@ public:
 
     void recordDispatch(VkCommandBuffer cmd,
                         VkImageView minMaxImageView,
-                        VkSampler sampler,
+                        VkSampler& sampler,
                         const Buffer& compactedBlockIdBuffer, // Output
                         const Buffer& activeBlockCountBuffer, // Output (atomic counter)
                         const PushConstants& pushConstants) const;

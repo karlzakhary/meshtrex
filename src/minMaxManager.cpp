@@ -8,7 +8,6 @@
 #include "vulkan_utils.h"
 #include "minMaxPass.h"
 #include "minMaxOutput.h"
-#include "blockFilteringTestUtils.h"
 #include "gpuProfiler.h"
 #include <cstring>
 #include <iostream>
@@ -69,7 +68,7 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
     MinMaxPass minMaxPass(context, minMaxLeafShaderPath.c_str(), minMaxOctreeReduceShaderPath.c_str());
 
     // --- Prepare Resources (some persistent, some temporary) ---
-    MinMaxOutput output{}; // Create the output struct to hold persistent resources
+    MinMaxOutput output{};
     Buffer stagingBuffer = {}; // Temporary for upload
 
     // Create MinMax output image (persistent)
@@ -109,6 +108,17 @@ MinMaxOutput computeMinMaxMip(VulkanContext &context, Volume volume, PushConstan
             VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_ASPECT_COLOR_BIT, l, 1);
             pipelineBarrier(cmd, {}, 0, {}, 1, &minMaxPreComputeBarrier);
     }
+    
+    // Create persistent sampler for minMax texture - reused by all subsequent passes
+    VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    samplerInfo.magFilter = samplerInfo.minFilter = VK_FILTER_NEAREST;
+    samplerInfo.minLod = 0;
+    samplerInfo.maxLod = fullMipCount;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    VK_CHECK(vkCreateSampler(context.getDevice(), &samplerInfo, nullptr, &output.minMaxSampler));
+    std::cout << "MinMaxManager: Created persistent minMax sampler" << std::endl;
 
     // 1. Upload Volume Data (creates output.volumeImage and temporary stagingBuffer)
     //    Pass output.volumeImage by reference to be populated.

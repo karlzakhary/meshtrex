@@ -8,28 +8,23 @@
 #include <cstdint>
 
 struct MinMaxOutput {
-    Image volumeImage{};             // Handle to the uploaded volume data image
-    Image minMaxImage{};             // Handle to the intermediate min/max image (optional need)
+    Image volumeImage{};
+    Image minMaxImage{};
     std::vector<VkImageView> minMaxMipViews;
-    
-    // Temporary resources that need cleanup after command buffer submission
-    // Only populated when using external command buffer
+    VkSampler minMaxSampler = VK_NULL_HANDLE;
     TemporaryResources tempResources;
-
-    // Add handles needed for destruction by the caller
-    // If Image/Buffer structs don't store these, add them here.
-    // VkDevice device = VK_NULL_HANDLE;
-
-     // Default constructor (optional, but can be useful)
+    
     MinMaxOutput() = default;
-
     // Move constructor (important for transferring ownership)
     MinMaxOutput(MinMaxOutput&& other) noexcept :
         volumeImage(std::move(other.volumeImage)),
         minMaxImage(std::move(other.minMaxImage)),
         minMaxMipViews(std::move(other.minMaxMipViews)),
+        minMaxSampler(other.minMaxSampler),
         tempResources(std::move(other.tempResources))
-    {}
+    {
+        other.minMaxSampler = VK_NULL_HANDLE;
+    }
     // Move assignment operator (optional, but good practice)
     MinMaxOutput& operator=(MinMaxOutput&& other) noexcept {
         if (this != &other) {
@@ -43,7 +38,9 @@ struct MinMaxOutput {
              volumeImage = std::move(other.volumeImage);
              minMaxImage = std::move(other.minMaxImage);
              minMaxMipViews = std::move(other.minMaxMipViews);
+             minMaxSampler = other.minMaxSampler;
              tempResources = std::move(other.tempResources);
+             other.minMaxSampler = VK_NULL_HANDLE;
         }
         return *this;
     }
@@ -59,6 +56,9 @@ struct MinMaxOutput {
         destroyImage(minMaxImage, device);
         for (auto view : minMaxMipViews) {
             vkDestroyImageView(device, view, nullptr);
+        }
+        if (minMaxSampler != VK_NULL_HANDLE) {
+            vkDestroySampler(device, minMaxSampler, nullptr);
         }
         // Reset members to indicate they are cleaned up
     }

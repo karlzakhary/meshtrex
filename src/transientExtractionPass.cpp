@@ -15,17 +15,20 @@
 
 TransientExtractionPass::TransientExtractionPass(const VulkanContext& context, VkFormat swapchainFormat)
     : context_(context), device_(context.getDevice()), swapchainFormat_(swapchainFormat) {
+    createPersistentResources();  // Create samplers once
     loadShaders();
     createPipelineLayouts();
     createPipelines();
     createShadingParametersBuffer();
-    createMarchingCubesTables(true);  // Use unique tables by default
+    setupMarchingCubesTables(true);  // Use unique tables by default
     createIndirectDrawBuffer();
     createIndirectUpdatePipeline();
     useIndirectDraw_ = true;  // Enable indirect drawing by default
 }
 
 TransientExtractionPass::~TransientExtractionPass() {
+    destroyPersistentResources();  // Clean up persistent samplers
+    
     if (pass1Pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pass1Pipeline_, nullptr);
     }
@@ -72,15 +75,12 @@ TransientExtractionPass::~TransientExtractionPass() {
         vkDestroyShaderModule(device_, indirectUpdateComputeShader_, nullptr);
     }
     
-    if (shadingParamsBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, shadingParamsBuffer_, nullptr);
-    }
-    if (shadingParamsMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, shadingParamsMemory_, nullptr);
+    if (shadingParamsBuffer_.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(shadingParamsBuffer_, device_);
     }
     
     // Clean up marching cubes tables
-    destroyMarchingCubesTables();
+    MarchingCubesUtils::destroyMarchingCubesTables(mcTables_, device_);
     
     // Clean up indirect draw buffer
     if (indirectDrawBuffer_.buffer != VK_NULL_HANDLE) {
@@ -287,36 +287,20 @@ void TransientExtractionPass::createPipelines() {
 void TransientExtractionPass::createShadingParametersBuffer() {
     VkDeviceSize bufferSize = sizeof(ShadingParameters);
     
-    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bufferInfo.size = bufferSize;
-    bufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    
-    VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &shadingParamsBuffer_));
-    
-    VkMemoryRequirements memRequirements;
-    vkGetBufferMemoryRequirements(device_, shadingParamsBuffer_, &memRequirements);
-    
-    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocInfo.allocationSize = memRequirements.size;
-    allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                 memRequirements.memoryTypeBits,
-                                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 
-                                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    
-    VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &shadingParamsMemory_));
-    VK_CHECK(vkBindBufferMemory(device_, shadingParamsBuffer_, shadingParamsMemory_, 0));
+    createBuffer(shadingParamsBuffer_, device_, context_.getMemoryProperties(),
+                bufferSize,
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
 
 VkDescriptorSet TransientExtractionPass::createPassDescriptorSet(
     VkDescriptorPool pool,
     VkDescriptorSetLayout layout,
-    VkBuffer viewUniformBuffer,
+    const Buffer& viewUniformBuffer,
     VkImageView minMaxImageView,
     VkSampler minMaxSampler,
     VkImageView volumeImageView,
-    VkSampler volumeSampler,
-    VkBuffer pvsBuffer,
+    const Buffer& pvsBuffer,
     uint32_t bindingIndex) {
     
     VkDescriptorSet descriptorSet;
@@ -329,12 +313,12 @@ VkDescriptorSet TransientExtractionPass::createPassDescriptorSet(
     std::vector<VkWriteDescriptorSet> writes;
     
     // Binding 0: View parameters
-    VkDescriptorBufferInfo viewBufferInfo{viewUniformBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo viewBufferInfo{viewUniformBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
                      0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewBufferInfo, nullptr});
     
-    // Binding 1: Volume texture
-    VkDescriptorImageInfo volumeInfo{volumeSampler, volumeImageView, VK_IMAGE_LAYOUT_GENERAL};
+    // Binding 1: Volume texture (storage image - no sampler needed)
+    VkDescriptorImageInfo volumeInfo{VK_NULL_HANDLE, volumeImageView, VK_IMAGE_LAYOUT_GENERAL};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
                      1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &volumeInfo, nullptr, nullptr});
     
@@ -360,12 +344,12 @@ VkDescriptorSet TransientExtractionPass::createPassDescriptorSet(
                      5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &minMaxInfo, nullptr, nullptr});
     
     // Binding 10: Shading parameters
-    VkDescriptorBufferInfo shadingInfo{shadingParamsBuffer_, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo shadingInfo{shadingParamsBuffer_.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
                      10, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &shadingInfo, nullptr});
     
     // Binding 14/15: PVS buffer
-    VkDescriptorBufferInfo pvsInfo{pvsBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo pvsInfo{pvsBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet,
                      bindingIndex, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pvsInfo, nullptr});
     
@@ -415,12 +399,9 @@ void TransientExtractionPass::renderTransientPasses(
     depInfo.pImageMemoryBarriers = &volumeBarrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
     
-    // Update shading parameters
+    // Update shading parameters (buffer is already mapped for host-visible memory)
     {
-        void* mapped;
-        VK_CHECK(vkMapMemory(device_, shadingParamsMemory_, 0, sizeof(ShadingParameters), 0, &mapped));
-        memcpy(mapped, &shadingParams, sizeof(ShadingParameters));
-        vkUnmapMemory(device_, shadingParamsMemory_);
+        memcpy(shadingParamsBuffer_.data, &shadingParams, sizeof(ShadingParameters));
     }
     
     // Create view parameters uniform buffer
@@ -438,34 +419,8 @@ void TransientExtractionPass::renderTransientPasses(
     viewUniforms.blockGridDim = pushConstants.blockGridDim;
     viewUniforms.isovalue = pushConstants.isovalue;
     
-    VkBuffer viewUniformBuffer;
-    VkDeviceMemory viewUniformMemory;
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = sizeof(ViewUniforms);
-        bufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &viewUniformBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, viewUniformBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                     memRequirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 
-                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &viewUniformMemory));
-        VK_CHECK(vkBindBufferMemory(device_, viewUniformBuffer, viewUniformMemory, 0));
-        
-        void* mapped;
-        VK_CHECK(vkMapMemory(device_, viewUniformMemory, 0, sizeof(ViewUniforms), 0, &mapped));
-        memcpy(mapped, &viewUniforms, sizeof(ViewUniforms));
-        vkUnmapMemory(device_, viewUniformMemory);
-    }
+    // Update persistent uniform buffer with new data (buffer is already mapped)
+    memcpy(persistentViewUniformBuffer_pass1_.data, &viewUniforms, sizeof(ViewUniforms));
     
     // Create descriptor pool
     VkDescriptorPool descriptorPool;
@@ -483,38 +438,21 @@ void TransientExtractionPass::renderTransientPasses(
     poolInfo.pPoolSizes = poolSizes.data();
     VK_CHECK(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool));
     
-    // Create samplers
-    VkSampler volumeSampler, minMaxSampler;
-    
-    // Volume sampler - can use linear filtering for R8_UINT volume
-    VkSamplerCreateInfo volumeSamplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    volumeSamplerInfo.magFilter = volumeSamplerInfo.minFilter = VK_FILTER_NEAREST;
-    volumeSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    volumeSamplerInfo.addressModeU = volumeSamplerInfo.addressModeV = volumeSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    VK_CHECK(vkCreateSampler(device_, &volumeSamplerInfo, nullptr, &volumeSampler));
-    
-    // Min-max sampler - must use nearest filtering for R32G32_UINT format
-    VkSamplerCreateInfo minMaxSamplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    minMaxSamplerInfo.magFilter = minMaxSamplerInfo.minFilter = VK_FILTER_NEAREST;
-    minMaxSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    minMaxSamplerInfo.addressModeU = minMaxSamplerInfo.addressModeV = minMaxSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    VK_CHECK(vkCreateSampler(device_, &minMaxSamplerInfo, nullptr, &minMaxSampler));
-    
     // Get volume image view from minMaxOutput
     VkImageView volumeImageView = minMaxOutput.volumeImage.imageView;
     
     // Create descriptor sets
     VkDescriptorSet pass1DescriptorSet = createPassDescriptorSet(
         descriptorPool, pass1DescriptorSetLayout_,
-        viewUniformBuffer, minMaxOutput.minMaxImage.imageView, minMaxSampler,
-        volumeImageView, volumeSampler,
+        persistentViewUniformBuffer_pass1_, minMaxOutput.minMaxImage.imageView, minMaxOutput.minMaxSampler,
+        volumeImageView,
         occlusionOutput.pvsPreviousBuffer, 14
     );
     
     VkDescriptorSet pass2DescriptorSet = createPassDescriptorSet(
         descriptorPool, pass2DescriptorSetLayout_,
-        viewUniformBuffer, minMaxOutput.minMaxImage.imageView, minMaxSampler,
-        volumeImageView, volumeSampler,
+        persistentViewUniformBuffer_pass1_, minMaxOutput.minMaxImage.imageView, minMaxOutput.minMaxSampler,
+        volumeImageView,
         occlusionOutput.pvsDifferenceBuffer, 15
     );
     
@@ -607,10 +545,7 @@ void TransientExtractionPass::renderTransientPasses(
     // Add frame ID to debug output
     static int globalFrameCount = 0;
     int currentFrame = globalFrameCount++;
-    if (currentFrame < 10) {
-        printf("  [Frame %d] Pass 1: prevCount = %u, Pass 2: diffCount = %u, currCount = %u\n", 
-               currentFrame, localPrevCount, localDiffCount, occlusionOutput.pvsCurrentCount);
-    }
+
     // Pass 2 is disabled when bypassing PVS
     if (!bypassPVS_ && localDiffCount > 0) {
         // printf("  Rendering Pass 2: %u blocks, %u workgroups\n", occlusionOutput.pvsDifferenceCount, occlusionOutput.pvsDifferenceCount * 2);
@@ -665,11 +600,9 @@ void TransientExtractionPass::renderTransientPasses(
     
     // Store temporary resources (to be cleaned up after command buffer submission)
     // Using pass1 slots for the combined function
-    tempResources_.volumeSampler_pass1 = volumeSampler;
-    tempResources_.minMaxSampler_pass1 = minMaxSampler;
+    // Note: minMaxSampler is owned by MinMaxOutput, don't store for destruction
     tempResources_.descriptorPool_pass1 = descriptorPool;
-    tempResources_.viewUniformBuffer_pass1 = viewUniformBuffer;
-    tempResources_.viewUniformMemory_pass1 = viewUniformMemory;
+    // viewUniformBuffer_pass1 already created directly in tempResources_
 }
 
 void TransientExtractionPass::renderPass1_PreviousVisible(
@@ -686,8 +619,6 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
     
     // Debug tracking
     static int pass1CallCount = 0;
-    // printf("renderPass1_PreviousVisible called: %d, pvsPreviousCount=%u\n", 
-    //        pass1CallCount++, occlusionOutput.pvsPreviousCount);
     
     // Skip if no previous blocks to render
     if (occlusionOutput.pvsPreviousCount == 0) {
@@ -716,12 +647,9 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
     depInfo.pImageMemoryBarriers = &volumeBarrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
     
-    // Update shading parameters
+    // Update shading parameters (buffer is already mapped for host-visible memory)
     {
-        void* mapped;
-        VK_CHECK(vkMapMemory(device_, shadingParamsMemory_, 0, sizeof(ShadingParameters), 0, &mapped));
-        memcpy(mapped, &shadingParams, sizeof(ShadingParameters));
-        vkUnmapMemory(device_, shadingParamsMemory_);
+        memcpy(shadingParamsBuffer_.data, &shadingParams, sizeof(ShadingParameters));
     }
     
     // Create view parameters uniform buffer
@@ -739,34 +667,8 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
     viewUniforms.blockGridDim = pushConstants.blockGridDim;
     viewUniforms.isovalue = pushConstants.isovalue;
     
-    VkBuffer viewUniformBuffer;
-    VkDeviceMemory viewUniformMemory;
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = sizeof(ViewUniforms);
-        bufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &viewUniformBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, viewUniformBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                     memRequirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 
-                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &viewUniformMemory));
-        VK_CHECK(vkBindBufferMemory(device_, viewUniformBuffer, viewUniformMemory, 0));
-        
-        void* mapped;
-        VK_CHECK(vkMapMemory(device_, viewUniformMemory, 0, sizeof(ViewUniforms), 0, &mapped));
-        memcpy(mapped, &viewUniforms, sizeof(ViewUniforms));
-        vkUnmapMemory(device_, viewUniformMemory);
-    }
+    // Update persistent uniform buffer with new data (buffer is already mapped)
+    memcpy(persistentViewUniformBuffer_pass1_.data, &viewUniforms, sizeof(ViewUniforms));
     
     // Create descriptor pool (for Pass 1 only)
     VkDescriptorPool descriptorPool;
@@ -784,28 +686,16 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
     poolInfo.pPoolSizes = poolSizes.data();
     VK_CHECK(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool));
     
-    // Create samplers
-    VkSampler volumeSampler, minMaxSampler;
-    
-    VkSamplerCreateInfo volumeSamplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    volumeSamplerInfo.magFilter = volumeSamplerInfo.minFilter = VK_FILTER_NEAREST;
-    volumeSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    volumeSamplerInfo.addressModeU = volumeSamplerInfo.addressModeV = volumeSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    VK_CHECK(vkCreateSampler(device_, &volumeSamplerInfo, nullptr, &volumeSampler));
-    
-    VkSamplerCreateInfo minMaxSamplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    minMaxSamplerInfo.magFilter = minMaxSamplerInfo.minFilter = VK_FILTER_NEAREST;
-    minMaxSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    minMaxSamplerInfo.addressModeU = minMaxSamplerInfo.addressModeV = minMaxSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    VK_CHECK(vkCreateSampler(device_, &minMaxSamplerInfo, nullptr, &minMaxSampler));
+    // Use the sampler from MinMaxOutput - no need to create new ones
+    VkSampler minMaxSampler = minMaxOutput.minMaxSampler;
     
     VkImageView volumeImageView = minMaxOutput.volumeImage.imageView;
     
     // Create descriptor set for Pass 1
     VkDescriptorSet pass1DescriptorSet = createPassDescriptorSet(
         descriptorPool, pass1DescriptorSetLayout_,
-        viewUniformBuffer, minMaxOutput.minMaxImage.imageView, minMaxSampler,
-        volumeImageView, volumeSampler,
+        persistentViewUniformBuffer_pass1_, minMaxOutput.minMaxImage.imageView, minMaxSampler,
+        volumeImageView,
         occlusionOutput.pvsPreviousBuffer, 14
     );
     
@@ -912,11 +802,9 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
     vkCmdPipelineBarrier2(cmd, &depInfoBack);
     
     // Store Pass 1 temporary resources
-    tempResources_.volumeSampler_pass1 = volumeSampler;
-    tempResources_.minMaxSampler_pass1 = minMaxSampler;
+    // Note: minMaxSampler is owned by MinMaxOutput, don't store for destruction
     tempResources_.descriptorPool_pass1 = descriptorPool;
-    tempResources_.viewUniformBuffer_pass1 = viewUniformBuffer;
-    tempResources_.viewUniformMemory_pass1 = viewUniformMemory;
+    // viewUniformBuffer_pass1 already created directly in tempResources_
 }
 
 void TransientExtractionPass::renderPass2_NewlyVisible(
@@ -958,12 +846,9 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
     depInfo.pImageMemoryBarriers = &volumeBarrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
     
-    // Update shading parameters
+    // Update shading parameters (buffer is already mapped for host-visible memory)
     {
-        void* mapped;
-        VK_CHECK(vkMapMemory(device_, shadingParamsMemory_, 0, sizeof(ShadingParameters), 0, &mapped));
-        memcpy(mapped, &shadingParams, sizeof(ShadingParameters));
-        vkUnmapMemory(device_, shadingParamsMemory_);
+        memcpy(shadingParamsBuffer_.data, &shadingParams, sizeof(ShadingParameters));
     }
     
     // Create view parameters uniform buffer
@@ -981,34 +866,8 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
     viewUniforms.blockGridDim = pushConstants.blockGridDim;
     viewUniforms.isovalue = pushConstants.isovalue;
     
-    VkBuffer viewUniformBuffer;
-    VkDeviceMemory viewUniformMemory;
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = sizeof(ViewUniforms);
-        bufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &viewUniformBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, viewUniformBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                     memRequirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 
-                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &viewUniformMemory));
-        VK_CHECK(vkBindBufferMemory(device_, viewUniformBuffer, viewUniformMemory, 0));
-        
-        void* mapped;
-        VK_CHECK(vkMapMemory(device_, viewUniformMemory, 0, sizeof(ViewUniforms), 0, &mapped));
-        memcpy(mapped, &viewUniforms, sizeof(ViewUniforms));
-        vkUnmapMemory(device_, viewUniformMemory);
-    }
+    // Update persistent uniform buffer with new data (buffer is already mapped)
+    memcpy(persistentViewUniformBuffer_pass2_.data, &viewUniforms, sizeof(ViewUniforms));
     
     // Create descriptor pool (for Pass 2 only)
     VkDescriptorPool descriptorPool;
@@ -1026,28 +885,16 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
     poolInfo.pPoolSizes = poolSizes.data();
     VK_CHECK(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool));
     
-    // Create samplers
-    VkSampler volumeSampler, minMaxSampler;
-    
-    VkSamplerCreateInfo volumeSamplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    volumeSamplerInfo.magFilter = volumeSamplerInfo.minFilter = VK_FILTER_NEAREST;
-    volumeSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    volumeSamplerInfo.addressModeU = volumeSamplerInfo.addressModeV = volumeSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    VK_CHECK(vkCreateSampler(device_, &volumeSamplerInfo, nullptr, &volumeSampler));
-    
-    VkSamplerCreateInfo minMaxSamplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    minMaxSamplerInfo.magFilter = minMaxSamplerInfo.minFilter = VK_FILTER_NEAREST;
-    minMaxSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    minMaxSamplerInfo.addressModeU = minMaxSamplerInfo.addressModeV = minMaxSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    VK_CHECK(vkCreateSampler(device_, &minMaxSamplerInfo, nullptr, &minMaxSampler));
+    // Use the sampler from MinMaxOutput - no need to create new ones
+    VkSampler minMaxSampler = minMaxOutput.minMaxSampler;
     
     VkImageView volumeImageView = minMaxOutput.volumeImage.imageView;
     
     // Create descriptor set for Pass 2
     VkDescriptorSet pass2DescriptorSet = createPassDescriptorSet(
         descriptorPool, pass2DescriptorSetLayout_,
-        viewUniformBuffer, minMaxOutput.minMaxImage.imageView, minMaxSampler,
-        volumeImageView, volumeSampler,
+        persistentViewUniformBuffer_pass2_, minMaxOutput.minMaxImage.imageView, minMaxSampler,
+        volumeImageView,
         occlusionOutput.pvsDifferenceBuffer, 15
     );
     
@@ -1148,74 +995,14 @@ void TransientExtractionPass::renderPass2_NewlyVisible(
     vkCmdPipelineBarrier2(cmd, &depInfoBack);
     
     // Store Pass 2 temporary resources
-    tempResources_.volumeSampler_pass2 = volumeSampler;
-    tempResources_.minMaxSampler_pass2 = minMaxSampler;
+    // Note: minMaxSampler is owned by MinMaxOutput, don't store for destruction
     tempResources_.descriptorPool_pass2 = descriptorPool;
-    tempResources_.viewUniformBuffer_pass2 = viewUniformBuffer;
-    tempResources_.viewUniformMemory_pass2 = viewUniformMemory;
+    // viewUniformBuffer_pass2 already created directly in tempResources_
 }
 
-void TransientExtractionPass::createMarchingCubesTables(bool useUniqueTables) {
-    mcTables_.isUnique = useUniqueTables;
-    
-    // Create buffer for numVertices table (256 entries of uint8)
-    size_t numVerticesSize = 256 * sizeof(uint8_t);
-    createBuffer(mcTables_.numVerticesBuffer, device_, context_.getMemoryProperties(),
-                 numVerticesSize, 
-                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    
-    // Create buffer for triangle table
-    size_t triTableSize;
-    const void* triTableData;
-    const void* numVerticesData;
-    
-    if (useUniqueTables) {
-        // Unique tables: 256 x 16 uint8 values (changed from int32)
-        triTableSize = 256 * 16 * sizeof(uint8_t);
-        triTableData = &MarchingCubes::uniqueTriTable[0][0];  // Flatten 2D array
-        numVerticesData = &MarchingCubes::numUniqueVertsTable[0];
-    } else {
-        // Standard tables: 256 x 16 uint8 values  
-        triTableSize = 256 * 16 * sizeof(uint8_t);
-        triTableData = &MarchingCubes::triTable[0][0];  // Flatten 2D array
-        numVerticesData = &MarchingCubes::numVerticesTable[0];
-    }
-    
-    createBuffer(mcTables_.triTableBuffer, device_, context_.getMemoryProperties(),
-                 triTableSize,
-                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    
-    // Upload data to buffers using staging
-    Buffer stagingBuffer;
-    
-    // Upload numVertices table
-    createBuffer(stagingBuffer, device_, context_.getMemoryProperties(),
-                 numVerticesSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    memcpy(stagingBuffer.data, numVerticesData, numVerticesSize);
-    
-    VkCommandBuffer cmd = beginSingleTimeCommands(device_, context_.getCommandPool());
-    VkBufferCopy copyRegion{};
-    copyRegion.size = numVerticesSize;
-    vkCmdCopyBuffer(cmd, stagingBuffer.buffer, mcTables_.numVerticesBuffer.buffer, 1, &copyRegion);
-    endSingleTimeCommands(device_, context_.getCommandPool(), context_.getQueue(), cmd);
-    destroyBuffer(stagingBuffer, device_);
-    
-    // Upload triangle table
-    createBuffer(stagingBuffer, device_, context_.getMemoryProperties(),
-                 triTableSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    memcpy(stagingBuffer.data, triTableData, triTableSize);
-    
-    cmd = beginSingleTimeCommands(device_, context_.getCommandPool());
-    copyRegion.size = triTableSize;
-    vkCmdCopyBuffer(cmd, stagingBuffer.buffer, mcTables_.triTableBuffer.buffer, 1, &copyRegion);
-    endSingleTimeCommands(device_, context_.getCommandPool(), context_.getQueue(), cmd);
-    destroyBuffer(stagingBuffer, device_);
-    
-    // Buffer views no longer needed when using storage buffers
+void TransientExtractionPass::setupMarchingCubesTables(bool useUniqueTables) {
+    // Use the shared utility function to create MC tables
+    MarchingCubesUtils::createMarchingCubesTables(mcTables_, device_, context_, useUniqueTables);
 }
 
 void TransientExtractionPass::createIndirectUpdatePipeline() {
@@ -1404,9 +1191,40 @@ void TransientExtractionPass::updateIndirectDrawBufferGPU(VkCommandBuffer cmd,
     tempResources_.descriptorPool_indirectUpdate = descriptorPool;
 }
 
-void TransientExtractionPass::destroyMarchingCubesTables() {
-    // Buffer views no longer needed when using storage buffers
+// Note: destroyMarchingCubesTables is no longer needed as a separate function
+// Cleanup is done in destructor using MarchingCubesUtils::destroyMarchingCubesTables
+
+void TransientExtractionPass::createPersistentResources() {
+    // Create persistent uniform buffers for view parameters
+    // These are created once and reused across frames - we just update the data
     
-    destroyBuffer(mcTables_.numVerticesBuffer, device_);
-    destroyBuffer(mcTables_.triTableBuffer, device_);
+    struct ViewUniforms {
+        alignas(16) glm::mat4 viewProj;
+        alignas(16) glm::uvec4 volumeDim;
+        alignas(16) glm::uvec4 blockDim;
+        alignas(16) glm::uvec4 blockGridDim;
+        alignas(4) float isovalue;
+    };
+    
+    // Create pass1 uniform buffer
+    createBuffer(persistentViewUniformBuffer_pass1_, device_, context_.getMemoryProperties(),
+                sizeof(ViewUniforms),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    
+    // Create pass2 uniform buffer
+    createBuffer(persistentViewUniformBuffer_pass2_, device_, context_.getMemoryProperties(),
+                sizeof(ViewUniforms),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+}
+
+void TransientExtractionPass::destroyPersistentResources() {
+    // Destroy persistent uniform buffers
+    if (persistentViewUniformBuffer_pass1_.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(persistentViewUniformBuffer_pass1_, device_);
+    }
+    if (persistentViewUniformBuffer_pass2_.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(persistentViewUniformBuffer_pass2_, device_);
+    }
 }

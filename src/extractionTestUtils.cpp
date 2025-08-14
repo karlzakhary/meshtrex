@@ -1,5 +1,4 @@
 #include "extractionTestUtils.h"
-#include "blockFilteringTestUtils.h" // For mapUintBuffer
 #include "meshoptimizer.h"
 #include "vulkan_utils.h"
 
@@ -365,6 +364,123 @@ void writeGPUExtractionToOBJ(
     objFile.close();
     
     std::cout << "Successfully wrote deduplicated OBJ file: " << filePath << std::endl;
+}
+
+inline uint32_t mapCounterBuffer(VulkanContext& context, const Buffer& gpuBuffer)
+{
+    VkDevice device = context.getDevice();
+    VkDeviceSize counterSize = sizeof(uint32_t);
+
+    if (gpuBuffer.size < counterSize) {
+         throw std::runtime_error("GPU buffer is too small to contain a counter.");
+    }
+    if (gpuBuffer.buffer == VK_NULL_HANDLE) {
+        std::cerr << "Warning: Attempting to read counter from null GPU buffer." << std::endl;
+        return 0;
+    }
+
+
+    Buffer readbackBuffer = {};
+    createBuffer(readbackBuffer, device, context.getMemoryProperties(), counterSize,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    VkCommandBuffer cmd = beginSingleTimeCommands(device, context.getCommandPool());
+
+    // Barrier: Ensure shader writes to the counter (atomic) are finished before copy
+    VkBufferMemoryBarrier2 atomicWriteToTransferRead = bufferBarrier(
+        gpuBuffer.buffer,
+        VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, // Assuming Task shader wrote the atomic counter last
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,    // Covers atomic write
+        VK_PIPELINE_STAGE_2_COPY_BIT,
+        VK_ACCESS_2_TRANSFER_READ_BIT,
+        0, // Offset of counter
+        counterSize // Size of counter
+    );
+    pipelineBarrier(cmd, {}, 1, &atomicWriteToTransferRead, 0, {});
+
+
+    VkBufferCopy region = {0, 0, counterSize};
+    vkCmdCopyBuffer(cmd, gpuBuffer.buffer, readbackBuffer.buffer, 1, &region);
+
+    // Barrier: Ensure copy finishes before host read (implicitly handled by endSingleTimeCommands wait)
+
+    endSingleTimeCommands(device, context.getCommandPool(), context.getQueue(), cmd);
+    // Note: vkQueueWaitIdle happens inside endSingleTimeCommands
+
+    uint32_t counterValue = 0;
+    if (readbackBuffer.data) {
+        memcpy(&counterValue, readbackBuffer.data, counterSize);
+    } else {
+         std::cerr << "Warning: Readback buffer for counter not mapped." << std::endl;
+    }
+
+
+    destroyBuffer(readbackBuffer, device);
+    return counterValue;
+}
+
+inline std::vector<MeshletDescriptor> mapMeshletDescriptorBuffer(VulkanContext& context, const Buffer& gpuBuffer, uint32_t elementCount)
+{
+    VkDevice device = context.getDevice();
+    VkDeviceSize counterSize = sizeof(uint32_t);
+    VkDeviceSize elementSize = sizeof(MeshletDescriptor);
+    VkDeviceSize dataSize = elementCount * elementSize;
+    VkDeviceSize requiredBufferSize =  dataSize;
+    VkDeviceSize bufferOffset = 0; // Start reading after the counter
+
+    std::vector<MeshletDescriptor> cpuData;
+    cpuData.resize(elementCount);
+
+    if (elementCount == 0) return cpuData;
+
+    if (gpuBuffer.size < requiredBufferSize) {
+        std::cerr << "Warning: GPU buffer (" << gpuBuffer.size << " bytes) might be too small for requested MeshletDescriptor data size (" << dataSize << " bytes) + counter." << std::endl;
+        if (gpuBuffer.size <= bufferOffset) return {};
+        elementCount = std::min(elementCount, (uint32_t)((gpuBuffer.size - bufferOffset) / elementSize));
+        dataSize = elementCount * elementSize;
+        cpuData.resize(elementCount);
+        if (elementCount == 0) return cpuData;
+    }
+     if (gpuBuffer.buffer == VK_NULL_HANDLE) {
+        std::cerr << "Warning: Attempting to read MeshletDescriptor data from null GPU buffer." << std::endl;
+        return {};
+    }
+
+
+    Buffer readbackBuffer = {};
+    createBuffer(readbackBuffer, device, context.getMemoryProperties(), dataSize,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    VkCommandBuffer cmd = beginSingleTimeCommands(device, context.getCommandPool());
+
+    // Barrier: Ensure shader writes to data portion are finished before copy
+     VkBufferMemoryBarrier2 storageWriteToTransferRead = bufferBarrier(
+        gpuBuffer.buffer,
+        VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT, // Mesh shader wrote descriptors last
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COPY_BIT,
+        VK_ACCESS_2_TRANSFER_READ_BIT,
+        bufferOffset, // Offset of data
+        dataSize      // Size of data
+    );
+    pipelineBarrier(cmd, {}, 1, &storageWriteToTransferRead, 0, {});
+
+
+    VkBufferCopy region = {bufferOffset, 0, dataSize};
+    vkCmdCopyBuffer(cmd, gpuBuffer.buffer, readbackBuffer.buffer, 1, &region);
+
+    endSingleTimeCommands(device, context.getCommandPool(), context.getQueue(), cmd);
+
+     if (readbackBuffer.data) {
+        memcpy(cpuData.data(), readbackBuffer.data, dataSize);
+    } else {
+        std::cerr << "Warning: Readback buffer for MeshletDescriptor data not mapped." << std::endl;
+    }
+
+    destroyBuffer(readbackBuffer, device);
+    return cpuData;
 }
 
 bool validateMeshletDescriptors(VulkanContext& context, const ExtractionOutput& extractionOutput) {

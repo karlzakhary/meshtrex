@@ -15,6 +15,12 @@ void uploadBuffer(VkDevice device, VkCommandPool commandPool,
                   VkCommandBuffer commandBuffer, VkQueue queue,
                   const Buffer& buffer, const Buffer& scratch, const void *data,
                   size_t size);
+
+// Simple upload function that creates its own staging buffer
+void uploadBufferData(VkDevice device, VkCommandPool commandPool, VkQueue queue,
+                     const VkPhysicalDeviceMemoryProperties& memoryProperties,
+                     const Buffer& dstBuffer, const void* data, size_t size);
+
 void destroyBuffer(const Buffer& buffer, VkDevice device);
 
 void copy1DBufferTo3DImage(Buffer stagingBuffer,

@@ -140,6 +140,52 @@ void copy3DImageTo1DBuffer(Buffer readbackBuffer,
                            readbackBuffer.buffer, 1, &copyRegion);
 }
 
+void uploadBufferData(VkDevice device, VkCommandPool commandPool, VkQueue queue,
+                     const VkPhysicalDeviceMemoryProperties& memoryProperties,
+                     const Buffer& dstBuffer, const void* data, size_t size)
+{
+    // Create staging buffer
+    Buffer stagingBuffer;
+    createBuffer(stagingBuffer, device, memoryProperties, size,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    
+    // Copy data to staging buffer
+    memcpy(stagingBuffer.data, data, size);
+    
+    // Create command buffer for copy
+    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    
+    VkCommandBuffer commandBuffer;
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer));
+    
+    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    
+    VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
+    
+    VkBufferCopy copyRegion{};
+    copyRegion.size = size;
+    vkCmdCopyBuffer(commandBuffer, stagingBuffer.buffer, dstBuffer.buffer, 1, &copyRegion);
+    
+    VK_CHECK(vkEndCommandBuffer(commandBuffer));
+    
+    // Submit and wait
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    
+    VK_CHECK(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(queue));
+    
+    // Cleanup
+    vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+    destroyBuffer(stagingBuffer, device);
+}
+
 void destroyBuffer(const Buffer& buffer, VkDevice device)
 {
     // Only unmap if memory was previously mapped (data pointer is not null)
