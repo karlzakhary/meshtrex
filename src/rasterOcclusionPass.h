@@ -41,6 +41,16 @@ public:
         uint32_t frameIndex = 0;
         bool isFirstFrame = true;
         
+        // Camera tracking for temporal coherence
+        glm::mat4 previousViewProj = glm::mat4(1.0f);
+        bool needsOcclusionUpdate = true;  // Force update on first frame or when needed
+        uint32_t framesSinceLastUpdate = 0;
+        
+        // PVS stability tracking
+        uint32_t framesWithStablePVS = 0;  // Count frames where PVS didn't change
+        uint32_t lastStablePVSCount = 0;    // PVS count when it was stable
+        bool pvsChanged = true;              // Did PVS change in last occlusion test?
+        
         // Temporary resources that need to be kept alive until command buffer submission
         struct TempResources {
             VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
@@ -90,14 +100,16 @@ public:
     );
     
     // Perform occlusion culling with temporal coherence
-    void performTemporalOcclusionCulling(
+    // Returns true if occlusion culling was actually performed
+    bool performTemporalOcclusionCulling(
         VkCommandBuffer cmd,
         Output& output,  // In/out: contains previous frame data, updated with current
         const MinMaxOutput& minMaxOutput,
         const PushConstants& pushConstants,
         const glm::mat4& viewProjMatrix,
         VkImageView depthImageView,
-        VkExtent2D renderExtent
+        VkExtent2D renderExtent,
+        bool forceUpdate = false  // Force occlusion update regardless of camera movement
     );
     
     // Temporary descriptor pool for indirect update (cleaned up after command submission)

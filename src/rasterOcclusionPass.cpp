@@ -741,19 +741,94 @@ void RasterOcclusionPass::initializeOutput(Output& output, uint32_t numBlocks) {
     output.pvsDifferenceCount = 0;
 }
 
-void RasterOcclusionPass::performTemporalOcclusionCulling(
+bool RasterOcclusionPass::performTemporalOcclusionCulling(
     VkCommandBuffer cmd,
     Output& output,
     const MinMaxOutput& minMaxOutput,
     const PushConstants& pushConstants,
     const glm::mat4& viewProjMatrix,
     VkImageView depthImageView,
-    VkExtent2D renderExtent) {
+    VkExtent2D renderExtent,
+    bool forceUpdate) {
     
     // Calculate total number of blocks
     uint32_t totalBlocks = pushConstants.blockGridDim.x * 
                           pushConstants.blockGridDim.y * 
                           pushConstants.blockGridDim.z;
+    
+    // Check if we need to update occlusion based on camera movement and PVS stability
+    bool cameraChanged = false;
+    bool shouldCheckOcclusion = false;
+    
+    if (!output.isFirstFrame) {
+        // Decompose view-projection to analyze camera changes more precisely
+        // Extract camera position from inverse view-projection
+        glm::mat4 invViewProj = glm::inverse(viewProjMatrix);
+        glm::mat4 invPrevViewProj = glm::inverse(output.previousViewProj);
+        
+        // Camera position is the translation part of inverse view matrix
+        glm::vec3 currentCamPos = glm::vec3(invViewProj[3]);
+        glm::vec3 prevCamPos = glm::vec3(invPrevViewProj[3]);
+        
+        // Check position change
+        float positionDelta = glm::length(currentCamPos - prevCamPos);
+        
+        // Check rotation change by comparing view direction
+        glm::vec3 currentViewDir = -glm::normalize(glm::vec3(invViewProj[2]));
+        glm::vec3 prevViewDir = -glm::normalize(glm::vec3(invPrevViewProj[2]));
+        float rotationDelta = glm::acos(glm::clamp(glm::dot(currentViewDir, prevViewDir), -1.0f, 1.0f));
+        
+        // Adaptive thresholds based on distance from volume
+        // When zoomed in close, be less sensitive to small movements
+        float distanceFromVolume = glm::length(currentCamPos - glm::vec3(128.0f, 128.0f, 128.0f)); // Assuming volume center
+        float distanceScale = glm::clamp(distanceFromVolume / 500.0f, 0.5f, 2.0f);
+        
+        // Thresholds for camera movement (adaptive based on zoom)
+        // Increase thresholds to reduce false positives from numerical errors
+        const float BASE_POSITION_THRESHOLD = 2.0f;  // Increased from 1.0
+        const float BASE_ROTATION_THRESHOLD = 0.05f;  // Increased from 0.02 (~3 degrees)
+        
+        float positionThreshold = BASE_POSITION_THRESHOLD * distanceScale;
+        float rotationThreshold = BASE_ROTATION_THRESHOLD;
+        
+        // Debug: Log what's causing camera detection when zoomed in
+        static int debugCounter = 0;
+        bool positionChanged = positionDelta > positionThreshold;
+        bool rotationChanged = rotationDelta > rotationThreshold;
+        
+        if ((positionChanged || rotationChanged) && distanceFromVolume < 100.0f && debugCounter++ < 20) {
+            printf("  Camera detection: pos_delta=%.6f (thresh=%.3f) rot_delta=%.6f (thresh=%.3f) dist=%.1f\n",
+                   positionDelta, positionThreshold, rotationDelta, rotationThreshold, distanceFromVolume);
+        }
+        
+        cameraChanged = positionChanged || rotationChanged;
+        
+        // Be VERY conservative about occlusion updates to avoid z-fighting
+        if (cameraChanged) {
+            // Only update if camera moved significantly
+            shouldCheckOcclusion = true;
+        }
+        else {
+            // Camera hasn't moved - don't update unless absolutely necessary
+            // No periodic updates - they cause z-fighting for no benefit
+            shouldCheckOcclusion = false;
+        }
+    } else {
+        shouldCheckOcclusion = true;  // Always check on first frame
+    }
+    
+    // Determine if we need to run occlusion culling
+    output.needsOcclusionUpdate = output.isFirstFrame || shouldCheckOcclusion || forceUpdate;
+    
+    // If no update needed, just increment frame counter and return
+    if (!output.needsOcclusionUpdate) {
+        output.framesSinceLastUpdate++;
+        return false;  // No occlusion culling performed
+    }
+    
+    // Reset frame counter when we do update
+    output.framesSinceLastUpdate = 0;
+    output.previousViewProj = viewProjMatrix;
     
     // Initialize output on first frame
     if (output.isFirstFrame || output.visibilityBuffer.buffer == VK_NULL_HANDLE) {
@@ -1046,6 +1121,8 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
     if (output.isFirstFrame) {
         output.isFirstFrame = false;
     }
+    
+    return true;  // Occlusion culling was performed
 }
 
 void RasterOcclusionPass::Output::readbackPVSCounts(VkDevice device) {
@@ -1053,9 +1130,24 @@ void RasterOcclusionPass::Output::readbackPVSCounts(VkDevice device) {
         // The readback buffer is already mapped (host-visible buffers are mapped by createBuffer)
         uint32_t* counts = (uint32_t*)tempResources.readbackBuffer.data;
         
+        uint32_t oldPVSCount = pvsCurrentCount;
         pvsPreviousCount = counts[0];
         pvsCurrentCount = counts[1];
         pvsDifferenceCount = counts[2];
+        
+        // Check if PVS actually changed
+        // Don't use tolerance - it was causing issues
+        // Any change means we had z-fighting or actual visibility change
+        pvsChanged = (pvsCurrentCount != oldPVSCount) || (pvsDifferenceCount > 0);
+        
+        if (!pvsChanged) {
+            framesWithStablePVS++;
+            if (framesWithStablePVS == 1) {
+                lastStablePVSCount = pvsCurrentCount;
+            }
+        } else {
+            framesWithStablePVS = 0;
+        }
     }
 }
 

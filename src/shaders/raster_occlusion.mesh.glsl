@@ -2,7 +2,6 @@
 #extension GL_EXT_mesh_shader : require
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_int8: require
-
 #extension GL_EXT_debug_printf : enable
 
 #define WORKGROUP_SIZE 32
@@ -101,12 +100,18 @@ void main() {
             uint vertexBase = threadID * 4;
             uint primitiveBase = threadID * 2;
             
+            // Clamp screen coordinates to NDC bounds to prevent edge artifacts
+            // Blocks partially outside the screen should still be tested within screen bounds
+            vec2 clampedMin = clamp(screenMin, vec2(-1.0), vec2(1.0));
+            vec2 clampedMax = clamp(screenMax, vec2(-1.0), vec2(1.0));
+            
+            // Use conservative depth offset to prevent z-fighting
             float conservativeZ = minZ - 0.001;
             
-            gl_MeshVerticesEXT[vertexBase + 0].gl_Position = vec4(screenMin.x, screenMin.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 1].gl_Position = vec4(screenMax.x, screenMin.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 2].gl_Position = vec4(screenMin.x, screenMax.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 3].gl_Position = vec4(screenMax.x, screenMax.y, conservativeZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 0].gl_Position = vec4(clampedMin.x, clampedMin.y, conservativeZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 1].gl_Position = vec4(clampedMax.x, clampedMin.y, conservativeZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 2].gl_Position = vec4(clampedMin.x, clampedMax.y, conservativeZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 3].gl_Position = vec4(clampedMax.x, clampedMax.y, conservativeZ, 1.0);
             
             gl_PrimitiveTriangleIndicesEXT[primitiveBase + 0] = uvec3(vertexBase + 0, vertexBase + 1, vertexBase + 2);
             gl_PrimitiveTriangleIndicesEXT[primitiveBase + 1] = uvec3(vertexBase + 1, vertexBase + 3, vertexBase + 2);

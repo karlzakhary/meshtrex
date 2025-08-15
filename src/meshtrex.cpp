@@ -1,5 +1,6 @@
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <cstring>
 
 #ifndef __APPLE__
@@ -22,6 +23,7 @@
 #include "profilingManager.h"
 #include "densityUtils.h"
 #include "common.h"
+#include "config.h"
 #include "swapchain.h"
 #include "image.h"
 #include "buffer.h"
@@ -35,7 +37,8 @@ void renderTemporalCoherence(
     VulkanContext& context,
     MinMaxOutput& minMaxOutput,
     PushConstants& pushConstants,
-    bool pmb
+    bool pmb,
+    bool disableCoherenceOptimization = false
 ) {
     VkDevice device = context.getDevice();
     
@@ -49,7 +52,6 @@ void renderTemporalCoherence(
     std::vector<VkSemaphore> releaseSemaphores;
     std::vector<VkFence> frameFences;
     std::vector<VkCommandBuffer> commandBuffers;
-    const uint32_t MAX_FRAMES_IN_FLIGHT = 3;
     RasterOcclusionPass::Output occlusionOutput;
     
     try {
@@ -143,15 +145,17 @@ void renderTemporalCoherence(
     };
     std::vector<FrameResources> frameResources(swapchain.imageCount);
     
-        // Initialize temporal coherence components
-        printf("DEBUG: Swapchain has %u images\n", swapchain.imageCount);
-        RasterOcclusionPass occlusionPass(context);
-        TransientExtractionPass transientPass(context, swapchainFormat);
-        occlusionOutput.isFirstFrame = true;
+    RasterOcclusionPass occlusionPass(context);
+    TransientExtractionPass transientPass(context, swapchainFormat);
+    occlusionOutput.isFirstFrame = true;
     
     // Main render loop
     bool enableDebugColors = false;
+    bool disableTemporalCoherence = disableCoherenceOptimization;  // Flag to force occlusion updates every frame
     int framesProcessed = 0;  // Track frames processed for first-frame handling
+    int occlusionUpdateCount = 0;  // Track occlusion updates for statistics
+    int totalFrames = 0;  // Total frames rendered
+    bool occlusionUpdated = true;
     while (!glfwWindowShouldClose(window)) {
         float currentTime = (float)glfwGetTime();
         float deltaTime = currentTime - lastFrameTime;
@@ -209,6 +213,28 @@ void renderTemporalCoherence(
             cKeyPressed = true;
         } else if (glfwGetKey(window, GLFW_KEY_C) == GLFW_RELEASE) {
             cKeyPressed = false;
+        }
+        
+        // Toggle temporal coherence with 'T' key
+        static bool tKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS && !tKeyPressed) {
+            disableTemporalCoherence = !disableTemporalCoherence;
+            std::cout << "\n=== Temporal coherence " << (disableTemporalCoherence ? "DISABLED" : "ENABLED") << " ==="<< std::endl;
+            if (disableTemporalCoherence) {
+                std::cout << "Mode: Update occlusion EVERY frame (baseline)" << std::endl;
+            } else {
+                std::cout << "Mode: Smart updates only when camera moves" << std::endl;
+                std::cout << "Current stats: " << occlusionUpdateCount << " updates in " << totalFrames 
+                         << " frames (" << std::fixed << std::setprecision(1) 
+                         << (100.0f * float(occlusionUpdateCount) / float(std::max(1, totalFrames))) 
+                         << "% update rate)" << std::endl;
+            }
+            // Reset counters when switching modes
+            occlusionUpdateCount = 0;
+            totalFrames = 0;
+            tKeyPressed = true;
+        } else if (glfwGetKey(window, GLFW_KEY_T) == GLFW_RELEASE) {
+            tKeyPressed = false;
         }
         
         // Reset temporal state with 'R' key
@@ -361,48 +387,81 @@ void renderTemporalCoherence(
         shadingParams.viewPos = cameraPos;
         shadingParams.enableDebugColors = enableDebugColors ? 1 : 0;
         
-        transientPass.renderPass1_PreviousVisible(
+        // Skip Pass 1 on the very first frame since there's no previous PVS
+        // For all other frames, render Pass 1 if there are blocks in the previous buffer
+        if ((!occlusionOutput.isFirstFrame && occlusionOutput.pvsPreviousCount > 0) || occlusionUpdated) {
+            transientPass.renderPass1_PreviousVisible(
+                commandBuffer,
+                occlusionOutput,
+                minMaxOutput,
+                pushConstants,
+                viewProjMatrix,
+                cameraPos,
+                swapchainImageViews[imageIndex],
+                depthImage.imageView,
+                {swapchain.width, swapchain.height},
+                shadingParams
+            );
+        }
+        
+        // Step 2: Perform temporal occlusion culling against Pass 1's depth buffer (only when needed)
+        totalFrames++;
+        
+        occlusionUpdated = occlusionPass.performTemporalOcclusionCulling(
             commandBuffer,
             occlusionOutput,
             minMaxOutput,
             pushConstants,
             viewProjMatrix,
-            cameraPos,
-            swapchainImageViews[imageIndex],
             depthImage.imageView,
             {swapchain.width, swapchain.height},
-            shadingParams
+            disableTemporalCoherence  // Force update if temporal coherence is disabled
         );
         
-        // Step 2: Perform temporal occlusion culling against Pass 1's depth buffer
-        static int occlusionCallCount = 0;
-        // if (occlusionCallCount++ < 10) {
-        //     printf("Main loop: Calling performTemporalOcclusionCulling, frame %d, isFirstFrame=%d\n", 
-        //            occlusionCallCount - 1, occlusionOutput.isFirstFrame);
-        // }
-        occlusionPass.performTemporalOcclusionCulling(
-            commandBuffer,
-            occlusionOutput,
-            minMaxOutput,
-            pushConstants,
-            viewProjMatrix,
-            depthImage.imageView,
-            {swapchain.width, swapchain.height}
-        );
+        if (occlusionUpdated) {
+            occlusionUpdateCount++;
+            
+            // Always show stats, but with different formatting based on mode
+            if (disableTemporalCoherence) {
+                // When forcing updates every frame, show periodic stats
+                if (totalFrames % 60 == 0) {  // Report every second at 60fps
+                    printf("[Frame %d] Temporal coherence DISABLED - updating every frame (%d/%d, 0.0%% skip rate)\n", 
+                           totalFrames, occlusionUpdateCount, totalFrames);
+                }
+            } else {
+                // Smart mode - show why we updated
+                const char* reason = occlusionOutput.pvsChanged ? "PVS changed" : "Camera moved";
+                printf("[Frame %d] Occlusion culling performed (update %d/%d, %.1f%% skip rate) - %s\n", 
+                       totalFrames, occlusionUpdateCount, totalFrames,
+                       100.0f * (1.0f - float(occlusionUpdateCount) / float(totalFrames)),
+                       reason);
+                
+                // Report PVS stability if it's been stable for a while
+                if (occlusionOutput.framesWithStablePVS > 5) {
+                    printf("  -> PVS has been stable for %d frames (count=%d)\n", 
+                           occlusionOutput.framesWithStablePVS, occlusionOutput.pvsCurrentCount);
+                }
+            }
+        }
         
         // Step 3: Render Pass 2 - Newly visible blocks (PVS difference)
-        transientPass.renderPass2_NewlyVisible(
-            commandBuffer,
-            occlusionOutput,
-            minMaxOutput,
-            pushConstants,
-            viewProjMatrix,
-            cameraPos,
-            swapchainImageViews[imageIndex],
-            depthImage.imageView,
-            {swapchain.width, swapchain.height},
-            shadingParams
-        );
+        // On first few frames, always render Pass 2 to build up initial PVS
+        // After occlusion runs, the difference buffer will have all visible blocks
+        // For subsequent frames, only render if there are blocks in the difference buffer
+        if (occlusionOutput.frameIndex < 3 || occlusionUpdated || occlusionOutput.pvsDifferenceCount > 0) {
+            transientPass.renderPass2_NewlyVisible(
+                commandBuffer,
+                occlusionOutput,
+                minMaxOutput,
+                pushConstants,
+                viewProjMatrix,
+                cameraPos,
+                swapchainImageViews[imageIndex],
+                depthImage.imageView,
+                {swapchain.width, swapchain.height},
+                shadingParams
+            );
+        }
         
         // Keep first frame mode active for all frames in flight during startup
         if (occlusionOutput.isFirstFrame) {
@@ -413,8 +472,12 @@ void renderTemporalCoherence(
             }
         }
         
-        // Swap temporal buffers for next frame
-        occlusionOutput.swapTemporalBuffers();
+        // Only swap temporal buffers if occlusion was actually updated
+        // Otherwise we'd be swapping empty/stale buffers
+        // During first few frames, always swap to build up the buffers
+        if (occlusionUpdated || occlusionOutput.frameIndex < 3) {
+            occlusionOutput.swapTemporalBuffers();
+        }
         
         // Transition for present
         VkImageMemoryBarrier2 presentBarrier = imageBarrier(swapchain.images[imageIndex],
@@ -454,7 +517,7 @@ void renderTemporalCoherence(
         frameResources[imageIndex].createdAtFrame = frameCount - 1;  // Record when created
         
         // Advance to next frame
-        currentFrame = (currentFrame + 1) % 3; // MAX_FRAMES_IN_FLIGHT
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
     
         // Wait for device idle
@@ -542,7 +605,6 @@ void renderTransientExtraction(
     std::vector<VkSemaphore> releaseSemaphores;
     std::vector<VkFence> frameFences;
     std::vector<VkCommandBuffer> commandBuffers;
-    const uint32_t MAX_FRAMES_IN_FLIGHT = 3;
     
     try {
         // Create swapchain and window
@@ -884,7 +946,7 @@ void renderTransientExtraction(
         }
         
         // Advance to next frame
-        currentFrame = (currentFrame + 1) % 3; // MAX_FRAMES_IN_FLIGHT
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
     
         vkDeviceWaitIdle(device);
@@ -980,6 +1042,7 @@ int main(int argc, char** argv) {
     try {
         bool pmb = false; // Use regular marching cubes for transient rendering
         // Parse command line arguments
+        bool disableCoherenceOptimization = false;
         bool useDensityDispatch = false;
         bool useTransientExtraction = true;
         bool useTemporalCoherence = true;
@@ -1011,9 +1074,17 @@ int main(int argc, char** argv) {
                          << "  --density-dispatch    Enable density-based dispatch\n"
                          << "  --transient          Enable transient extraction (on-the-fly rendering)\n"
                          << "  --temporal           Enable temporal coherence rendering (two-pass approach)\n"
+                         << "  --no-coherence-opt   Disable temporal coherence optimization (force occlusion test every frame)\n"
                          << "  --volume <path>      Path to volume file\n"
                          << "  --isovalue <value>   Isovalue for surface extraction\n"
-                         << "  --help               Show this help message\n";
+                         << "  --help               Show this help message\n"
+                         << "\nRuntime controls:\n"
+                         << "  T                    Toggle temporal coherence optimization on/off\n"
+                         << "  C                    Toggle debug colors\n"
+                         << "  W/S                  Zoom in/out\n"
+                         << "  A/D                  Pan left/right\n"
+                         << "  Q/E                  Pan up/down\n"
+                         << "  Mouse drag           Rotate camera\n";
                 return 0;
             }
         }
@@ -1146,7 +1217,7 @@ int main(int argc, char** argv) {
                     if (useTemporalCoherence) {
                         // Temporal coherence rendering with two-pass approach
                         std::cout << "\n--- Starting Temporal Coherence Renderer ---" << std::endl;
-                        renderTemporalCoherence(context, minMaxOutput, pushConstants, pmb);
+                        renderTemporalCoherence(context, minMaxOutput, pushConstants, pmb, disableCoherenceOptimization);
                     } else {
                         // Standard transient extraction - render on-the-fly without storing geometry
                         std::cout << "\n--- Starting Transient Renderer ---" << std::endl;
@@ -1232,7 +1303,7 @@ int main(int argc, char** argv) {
                     if (useTemporalCoherence) {
                         // Temporal coherence rendering with two-pass approach
                         std::cout << "\n--- Starting Temporal Coherence Renderer ---" << std::endl;
-                        renderTemporalCoherence(context, minMaxOutput, pushConstants, pmb);
+                        renderTemporalCoherence(context, minMaxOutput, pushConstants, pmb, disableCoherenceOptimization);
                     } else {
                         // Standard transient extraction - render on-the-fly without storing geometry
                         std::cout << "\n--- Starting Transient Renderer ---" << std::endl;
