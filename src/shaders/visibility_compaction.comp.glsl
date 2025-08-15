@@ -39,12 +39,6 @@ void main() {
         if ((gl_LocalInvocationID.x % 32) == 31) {
             uint bitfieldIndex = globalID / 32;
             compactedVis.bitfield[bitfieldIndex] = ballot.x;
-            
-            // Debug output for first few bitfield entries
-            if (bitfieldIndex < 3 && ballot.x != 0) {
-                debugPrintfEXT("VisCompaction: bitfield[%d] = 0x%08x (%d visible blocks)", 
-                              bitfieldIndex, ballot.x, bitCount(ballot.x));
-            }
         }
     }
 }

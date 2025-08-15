@@ -4,8 +4,10 @@
 #include <vector>
 #include <memory>
 #include <glm/glm.hpp>
+#include "buffer.h"
 
 class VulkanContext;
+class SharedResources;
 struct MinMaxOutput;
 struct FilteringOutput;
 struct PushConstants;
@@ -17,64 +19,52 @@ public:
 
     struct Output {
         // Visibility buffer containing flags for each block
-        VkBuffer visibilityBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory visibilityMemory = VK_NULL_HANDLE;
-        VkDeviceSize visibilityBufferSize = 0;
+        Buffer visibilityBuffer{};
         
         // Bitfield buffers for current and previous frame
-        VkBuffer currentBitfieldBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory currentBitfieldMemory = VK_NULL_HANDLE;
-        VkDeviceSize bitfieldBufferSize = 0;
-        
-        VkBuffer previousBitfieldBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory previousBitfieldMemory = VK_NULL_HANDLE;
+        Buffer currentBitfieldBuffer{};
+        Buffer previousBitfieldBuffer{};
         
         // Compacted PVS data for current frame
-        VkBuffer pvsCurrentBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory pvsCurrentMemory = VK_NULL_HANDLE;
+        Buffer pvsCurrentBuffer{};
         uint32_t pvsCurrentCount = 0;
         
         // PVS difference (curr - prev)
-        VkBuffer pvsDifferenceBuffer = VK_NULL_HANDLE;  // PVScurr-prev
-        VkDeviceMemory pvsDifferenceMemory = VK_NULL_HANDLE;
+        Buffer pvsDifferenceBuffer{};  // PVScurr-prev
         uint32_t pvsDifferenceCount = 0;
         
         // Temporal coherence: Previous frame's PVS (for next frame)
-        VkBuffer pvsPreviousBuffer = VK_NULL_HANDLE;    // PVSprev
-        VkDeviceMemory pvsPreviousMemory = VK_NULL_HANDLE;
+        Buffer pvsPreviousBuffer{};    // PVSprev
         uint32_t pvsPreviousCount = 0;
-        
-        // PVS buffer size (same for all PVS buffers)
-        VkDeviceSize pvsBufferSize = 0;
         
         // Frame counter for temporal coherence
         uint32_t frameIndex = 0;
         bool isFirstFrame = true;
         
+        // Camera tracking for temporal coherence
+        glm::mat4 previousViewProj = glm::mat4(1.0f);
+        bool needsOcclusionUpdate = true;  // Force update on first frame or when needed
+        uint32_t framesSinceLastUpdate = 0;
+        
+        // PVS stability tracking
+        uint32_t framesWithStablePVS = 0;  // Count frames where PVS didn't change
+        uint32_t lastStablePVSCount = 0;    // PVS count when it was stable
+        bool pvsChanged = true;              // Did PVS change in last occlusion test?
+        
         // Temporary resources that need to be kept alive until command buffer submission
         struct TempResources {
-            VkSampler minMaxSampler = VK_NULL_HANDLE;
             VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-            VkBuffer uniformBuffer = VK_NULL_HANDLE;
-            VkDeviceMemory uniformMemory = VK_NULL_HANDLE;
-            VkBuffer stagingBuffer = VK_NULL_HANDLE;
-            VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-            VkBuffer stagingBuffer2 = VK_NULL_HANDLE;  // Second staging buffer for else branch
-            VkDeviceMemory stagingMemory2 = VK_NULL_HANDLE;
-            VkBuffer readbackBuffer = VK_NULL_HANDLE;  // Readback buffer for PVS counts
-            VkDeviceMemory readbackMemory = VK_NULL_HANDLE;
+            Buffer uniformBuffer{};
+            Buffer stagingBuffer{};
+            Buffer stagingBuffer2{};  // Second staging buffer for else branch
+            Buffer readbackBuffer{};  // Readback buffer for PVS counts
             
             void destroy(VkDevice device) {
-                if (minMaxSampler) vkDestroySampler(device, minMaxSampler, nullptr);
                 if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-                if (uniformBuffer) vkDestroyBuffer(device, uniformBuffer, nullptr);
-                if (uniformMemory) vkFreeMemory(device, uniformMemory, nullptr);
-                if (stagingBuffer) vkDestroyBuffer(device, stagingBuffer, nullptr);
-                if (stagingMemory) vkFreeMemory(device, stagingMemory, nullptr);
-                if (stagingBuffer2) vkDestroyBuffer(device, stagingBuffer2, nullptr);
-                if (stagingMemory2) vkFreeMemory(device, stagingMemory2, nullptr);
-                if (readbackBuffer) vkDestroyBuffer(device, readbackBuffer, nullptr);
-                if (readbackMemory) vkFreeMemory(device, readbackMemory, nullptr);
+                if (uniformBuffer.buffer) destroyBuffer(uniformBuffer, device);
+                if (stagingBuffer.buffer) destroyBuffer(stagingBuffer, device);
+                if (stagingBuffer2.buffer) destroyBuffer(stagingBuffer2, device);
+                if (readbackBuffer.buffer) destroyBuffer(readbackBuffer, device);
             }
         } tempResources;
         
@@ -110,15 +100,36 @@ public:
     );
     
     // Perform occlusion culling with temporal coherence
-    void performTemporalOcclusionCulling(
+    // Returns true if occlusion culling was actually performed
+    bool performTemporalOcclusionCulling(
         VkCommandBuffer cmd,
         Output& output,  // In/out: contains previous frame data, updated with current
         const MinMaxOutput& minMaxOutput,
         const PushConstants& pushConstants,
         const glm::mat4& viewProjMatrix,
         VkImageView depthImageView,
-        VkExtent2D renderExtent
+        VkExtent2D renderExtent,
+        bool forceUpdate = false  // Force occlusion update regardless of camera movement
     );
+    
+    // Temporary descriptor pool for indirect update (cleaned up after command submission)
+    struct IndirectTempResources {
+        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+        
+        void destroy(VkDevice device) {
+            if (descriptorPool) {
+                vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+                descriptorPool = VK_NULL_HANDLE;
+            }
+        }
+    };
+    
+    // Get indirect temp resources for deferred destruction
+    IndirectTempResources getIndirectTempResources() {
+        IndirectTempResources resources = indirectTempResources_;
+        indirectTempResources_ = {}; // Clear the original
+        return resources;
+    }
     
     // Clean up temporary resources for indirect draw (call after command buffer submission)
     void cleanupIndirectTempResources() {
@@ -128,6 +139,9 @@ public:
 private:
     const VulkanContext& context_;
     VkDevice device_;
+    
+    // Temporary descriptor pool for indirect update (cleaned up after command submission)
+    IndirectTempResources indirectTempResources_;
     
     // Pipeline for task/mesh shader occlusion culling
     VkPipeline occlusionPipeline_ = VK_NULL_HANDLE;
@@ -152,26 +166,29 @@ private:
     VkShaderModule buildOutputShader_ = VK_NULL_HANDLE;
     
     // Indirect draw support
-    VkBuffer indirectDrawBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory indirectDrawMemory_ = VK_NULL_HANDLE;
+    Buffer indirectDrawBuffer_{};
     VkPipeline indirectUpdatePipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout indirectUpdatePipelineLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout indirectUpdateDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkShaderModule indirectUpdateComputeShader_ = VK_NULL_HANDLE;
     bool useIndirectDraw_ = true;
     
-    // Temporary descriptor pool for indirect update (cleaned up after command submission)
-    struct IndirectTempResources {
-        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-        
-        void destroy(VkDevice device) {
-            if (descriptorPool) {
-                vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-                descriptorPool = VK_NULL_HANDLE;
-            }
-        }
-    } indirectTempResources_;
+    // Persistent resources - created once, reused across frames
+    static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 3;
+    std::array<VkDescriptorPool, MAX_FRAMES_IN_FLIGHT> persistentDescriptorPools_{};
+    uint32_t currentFrameIndex_ = 0;
     
+    void createPersistentResources();
+    void destroyPersistentResources();
+    
+public:
+    // Call this at the beginning of each frame to reset the descriptor pool and advance frame index
+    void beginFrame() {
+        currentFrameIndex_ = (currentFrameIndex_ + 1) % MAX_FRAMES_IN_FLIGHT;
+        vkResetDescriptorPool(device_, persistentDescriptorPools_[currentFrameIndex_], 0);
+    }
+    
+private:
     void createPipelineLayout();
     void createOcclusionPipeline();
     void createVisibilityCompactionPipeline();

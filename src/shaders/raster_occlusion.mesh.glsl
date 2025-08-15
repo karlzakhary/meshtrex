@@ -2,6 +2,7 @@
 #extension GL_EXT_mesh_shader : require
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_int8: require
+#extension GL_EXT_debug_printf : enable
 
 #define WORKGROUP_SIZE 32
 #define MAX_VERTICES 128 // 32 threads * 4 vertices
@@ -78,27 +79,40 @@ void main() {
         vec2 screenMin = vec2(2.0);
         vec2 screenMax = vec2(-2.0);
         float minZ = 1.0;
+        float maxZ = -1.0;
+        bool hasVisibleVertex = false;
         
         for (uint i = 0; i < 8; i++) {
             vec4 clipPos = view.viewProj * vec4(corners[i], 1.0);
+            // Only consider vertices in front of the camera (w > 0)
             if (clipPos.w > 0.0) {
                 vec3 ndc = clipPos.xyz / clipPos.w;
                 screenMin = min(screenMin, ndc.xy);
                 screenMax = max(screenMax, ndc.xy);
                 minZ = min(minZ, ndc.z);
+                maxZ = max(maxZ, ndc.z);
+                hasVisibleVertex = true;
             }
         }
         
-        if (screenMin.x <= screenMax.x) { // Check if block is on screen
+        // Only generate proxy quad if at least one vertex is in front and screen bounds are valid
+        if (hasVisibleVertex && screenMin.x <= screenMax.x && screenMin.x <= 1.0 && screenMax.x >= -1.0 && screenMin.y <= 1.0 && screenMax.y >= -1.0) {
             uint vertexBase = threadID * 4;
             uint primitiveBase = threadID * 2;
             
-            float conservativeZ = minZ - 0.001;
+            // Clamp screen coordinates to NDC bounds to prevent edge artifacts
+            // Blocks partially outside the screen should still be tested within screen bounds
+            vec2 clampedMin = clamp(screenMin, vec2(-1.0), vec2(1.0));
+            vec2 clampedMax = clamp(screenMax, vec2(-1.0), vec2(1.0));
             
-            gl_MeshVerticesEXT[vertexBase + 0].gl_Position = vec4(screenMin.x, screenMin.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 1].gl_Position = vec4(screenMax.x, screenMin.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 2].gl_Position = vec4(screenMin.x, screenMax.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 3].gl_Position = vec4(screenMax.x, screenMax.y, conservativeZ, 1.0);
+            // Use the farthest depth (maxZ) for occlusion testing
+            // This ensures the proxy quad is occluded if any part of the block is behind existing geometry
+            float occlusionZ = minZ;
+            
+            gl_MeshVerticesEXT[vertexBase + 0].gl_Position = vec4(clampedMin.x, clampedMin.y, occlusionZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 1].gl_Position = vec4(clampedMax.x, clampedMin.y, occlusionZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 2].gl_Position = vec4(clampedMin.x, clampedMax.y, occlusionZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 3].gl_Position = vec4(clampedMax.x, clampedMax.y, occlusionZ, 1.0);
             
             gl_PrimitiveTriangleIndicesEXT[primitiveBase + 0] = uvec3(vertexBase + 0, vertexBase + 1, vertexBase + 2);
             gl_PrimitiveTriangleIndicesEXT[primitiveBase + 1] = uvec3(vertexBase + 1, vertexBase + 3, vertexBase + 2);

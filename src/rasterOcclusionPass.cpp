@@ -23,6 +23,7 @@ RasterOcclusionPass::RasterOcclusionPass(const VulkanContext& context)
     createIndirectDrawBuffer();
     createIndirectUpdatePipeline();
     useIndirectDraw_ = true;  // Enable indirect drawing by default
+    createPersistentResources();
 }
 
 RasterOcclusionPass::~RasterOcclusionPass() {
@@ -73,11 +74,8 @@ RasterOcclusionPass::~RasterOcclusionPass() {
     }
     
     // Cleanup indirect draw resources
-    if (indirectDrawBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, indirectDrawBuffer_, nullptr);
-    }
-    if (indirectDrawMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, indirectDrawMemory_, nullptr);
+    if (indirectDrawBuffer_.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(indirectDrawBuffer_, device_);
     }
     if (indirectUpdatePipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, indirectUpdatePipeline_, nullptr);
@@ -91,6 +89,9 @@ RasterOcclusionPass::~RasterOcclusionPass() {
     if (indirectUpdateComputeShader_ != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device_, indirectUpdateComputeShader_, nullptr);
     }
+    
+    // Destroy persistent resources
+    destroyPersistentResources();
 }
 
 void RasterOcclusionPass::loadShaders() {
@@ -241,11 +242,12 @@ void RasterOcclusionPass::createOcclusionPipeline() {
     rasterizationState.cullMode = VK_CULL_MODE_NONE; // No culling for proxy geometry
     rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizationState.lineWidth = 1.0f;
-    // Conservative depth bias like Kreskowski's glPolygonOffset(-1, -60)
-    // This pulls proxy geometry forward to prevent incorrect culling at boundaries
+    // Depth bias similar to Kreskowski's glPolygonOffset(-1, -60)
+    // In Vulkan, positive values push away from camera (increase depth)
+    // We use positive values to push proxy quads slightly behind for proper occlusion
     rasterizationState.depthBiasEnable = VK_TRUE;
-    rasterizationState.depthBiasConstantFactor = -60.0f; // Pull forward aggressively
-    rasterizationState.depthBiasSlopeFactor = -1.0f;
+    rasterizationState.depthBiasConstantFactor = 60.0f; // Push back to avoid z-fighting with actual geometry
+    rasterizationState.depthBiasSlopeFactor = 1.0f;
     
     // Multisample state
     VkPipelineMultisampleStateCreateInfo multisampleState{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -319,76 +321,32 @@ void RasterOcclusionPass::createBuildOutputPipeline() {
 
 void RasterOcclusionPass::createVisibilityBuffer(Output& output, uint32_t numBlocks) {
     // Create visibility buffer - one uint per block
-    output.visibilityBufferSize = numBlocks * sizeof(uint32_t);
+    size_t bufferSize = numBlocks * sizeof(uint32_t);
     
-    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bufferInfo.size = output.visibilityBufferSize;
-    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    
-    VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &output.visibilityBuffer));
-    
-    VkMemoryRequirements memRequirements;
-    vkGetBufferMemoryRequirements(device_, output.visibilityBuffer, &memRequirements);
-    
-    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocInfo.allocationSize = memRequirements.size;
-    allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(), 
-                                                 memRequirements.memoryTypeBits,
-                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    
-    VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &output.visibilityMemory));
-    VK_CHECK(vkBindBufferMemory(device_, output.visibilityBuffer, output.visibilityMemory, 0));
+    createBuffer(output.visibilityBuffer, device_, context_.getMemoryProperties(),
+                bufferSize,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 }
 
 void RasterOcclusionPass::createBitfieldBuffers(Output& output, uint32_t numBlocks) {
     // Create bitfield buffers - 1 bit per block, so divide by 32
     uint32_t numBitfieldEntries = (numBlocks + 31) / 32;
-    output.bitfieldBufferSize = numBitfieldEntries * sizeof(uint32_t);
+    size_t bufferSize = numBitfieldEntries * sizeof(uint32_t);
+    
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT | 
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     
     // Current frame bitfield
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = output.bitfieldBufferSize;
-        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &output.currentBitfieldBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, output.currentBitfieldBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                     memRequirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &output.currentBitfieldMemory));
-        VK_CHECK(vkBindBufferMemory(device_, output.currentBitfieldBuffer, output.currentBitfieldMemory, 0));
-    }
+    createBuffer(output.currentBitfieldBuffer, device_, context_.getMemoryProperties(),
+                bufferSize, usage,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     
     // Previous frame bitfield
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = output.bitfieldBufferSize;
-        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &output.previousBitfieldBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, output.previousBitfieldBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                     memRequirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &output.previousBitfieldMemory));
-        VK_CHECK(vkBindBufferMemory(device_, output.previousBitfieldBuffer, output.previousBitfieldMemory, 0));
-    }
+    createBuffer(output.previousBitfieldBuffer, device_, context_.getMemoryProperties(),
+                bufferSize, usage,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 }
 
 RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
@@ -416,57 +374,24 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
     
     // Create PVS output buffers
     VkDeviceSize pvsBufferSize = (totalBlocks + 1) * sizeof(uint32_t); // +1 for count
-    output.pvsBufferSize = pvsBufferSize; // Store for later use
+    
+    VkBufferUsageFlags pvsUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     
     // PVS current buffer
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = pvsBufferSize;
-        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &output.pvsCurrentBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, output.pvsCurrentBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(), 
-                                                   memRequirements.memoryTypeBits,
-                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &output.pvsCurrentMemory));
-        VK_CHECK(vkBindBufferMemory(device_, output.pvsCurrentBuffer, output.pvsCurrentMemory, 0));
-    }
+    createBuffer(output.pvsCurrentBuffer, device_, context_.getMemoryProperties(),
+                pvsBufferSize, pvsUsage,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     
     // PVS difference buffer
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = pvsBufferSize;
-        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &output.pvsDifferenceBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, output.pvsDifferenceBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(), 
-                                                   memRequirements.memoryTypeBits,
-                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &output.pvsDifferenceMemory));
-        VK_CHECK(vkBindBufferMemory(device_, output.pvsDifferenceBuffer, output.pvsDifferenceMemory, 0));
-    }
+    createBuffer(output.pvsDifferenceBuffer, device_, context_.getMemoryProperties(),
+                pvsBufferSize, pvsUsage,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     
     // Clear buffers
-    vkCmdFillBuffer(cmd, output.visibilityBuffer, 0, output.visibilityBufferSize, 0);
-    vkCmdFillBuffer(cmd, output.currentBitfieldBuffer, 0, output.bitfieldBufferSize, 0);
-    vkCmdFillBuffer(cmd, output.pvsCurrentBuffer, 0, sizeof(uint32_t), 0); // Clear count
-    vkCmdFillBuffer(cmd, output.pvsDifferenceBuffer, 0, sizeof(uint32_t), 0); // Clear count
+    vkCmdFillBuffer(cmd, output.visibilityBuffer.buffer, 0, output.visibilityBuffer.size, 0);
+    vkCmdFillBuffer(cmd, output.currentBitfieldBuffer.buffer, 0, output.currentBitfieldBuffer.size, 0);
+    vkCmdFillBuffer(cmd, output.pvsCurrentBuffer.buffer, 0, sizeof(uint32_t), 0); // Clear count
+    vkCmdFillBuffer(cmd, output.pvsDifferenceBuffer.buffer, 0, sizeof(uint32_t), 0); // Clear count
     
     // Memory barrier after clear
     VkMemoryBarrier2 clearBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -495,51 +420,16 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
     viewUniforms.blockGridDim = pushConstants.blockGridDim;
     viewUniforms.isovalue = pushConstants.isovalue;
     
-    // Create uniform buffer
-    VkBuffer uniformBuffer;
-    VkDeviceMemory uniformMemory;
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = sizeof(ViewUniforms);
-        bufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &uniformBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, uniformBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                     memRequirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &uniformMemory));
-        VK_CHECK(vkBindBufferMemory(device_, uniformBuffer, uniformMemory, 0));
-        
-        // Upload data
-        void* mapped;
-        VK_CHECK(vkMapMemory(device_, uniformMemory, 0, sizeof(ViewUniforms), 0, &mapped));
-        memcpy(mapped, &viewUniforms, sizeof(ViewUniforms));
-        vkUnmapMemory(device_, uniformMemory);
-    }
+    // Create uniform buffer using Buffer struct
+    createBuffer(output.tempResources.uniformBuffer, device_, context_.getMemoryProperties(),
+                sizeof(ViewUniforms),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     
-    // Create descriptor pool and sets
-    VkDescriptorPool descriptorPool;
-    std::vector<VkDescriptorPoolSize> poolSizes = {
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8}  // Increased for new pipeline
-    };
+    // Copy data to uniform buffer (data is already mapped for host-visible buffers)
+    memcpy(output.tempResources.uniformBuffer.data, &viewUniforms, sizeof(ViewUniforms));
     
-    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolInfo.maxSets = 3; // One for occlusion, two for compaction stages
-    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    poolInfo.pPoolSizes = poolSizes.data();
-    VK_CHECK(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool));
-    
-    // Allocate descriptor sets
+    // Allocate descriptor sets from persistent pool
     VkDescriptorSet occlusionDescriptorSet, visibilityCompactionDescriptorSet, buildOutputDescriptorSet;
     std::array<VkDescriptorSetLayout, 3> layouts = {
         occlusionDescriptorSetLayout_, 
@@ -547,7 +437,7 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
         buildOutputDescriptorSetLayout_
     };
     VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    allocInfo.descriptorPool = descriptorPool;
+    allocInfo.descriptorPool = persistentDescriptorPools_[currentFrameIndex_];
     allocInfo.descriptorSetCount = 3;
     allocInfo.pSetLayouts = layouts.data();
     
@@ -557,32 +447,21 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
     visibilityCompactionDescriptorSet = sets[1];
     buildOutputDescriptorSet = sets[2];
     
-    // Create sampler for min-max texture (store in temp resources to avoid leak)
-    VkSampler minMaxSampler;
-    VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    samplerInfo.magFilter = samplerInfo.minFilter = VK_FILTER_NEAREST;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    VK_CHECK(vkCreateSampler(device_, &samplerInfo, nullptr, &minMaxSampler));
-    
-    // Store in temp resources for cleanup (critical to avoid sampler leak!)
-    output.tempResources.minMaxSampler = minMaxSampler;
-    
     // Update occlusion descriptor set
     std::vector<VkWriteDescriptorSet> writes;
     
     // Binding 0: View uniforms
-    VkDescriptorBufferInfo viewUboInfo{uniformBuffer, 0, sizeof(ViewUniforms)};
+    VkDescriptorBufferInfo viewUboInfo{output.tempResources.uniformBuffer.buffer, 0, sizeof(ViewUniforms)};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, occlusionDescriptorSet, 
                      0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewUboInfo, nullptr});
     
     // Binding 1: Min-max hierarchy texture
-    VkDescriptorImageInfo minMaxInfo{minMaxSampler, minMaxOutput.minMaxImage.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo minMaxInfo{minMaxOutput.minMaxSampler, minMaxOutput.minMaxImage.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, occlusionDescriptorSet,
                      1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &minMaxInfo, nullptr, nullptr});
     
     // Binding 2: Visibility buffer
-    VkDescriptorBufferInfo visibilityInfo{output.visibilityBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo visibilityInfo{output.visibilityBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, occlusionDescriptorSet,
                      2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &visibilityInfo, nullptr});
     
@@ -634,7 +513,7 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
     
     if (useIndirectDraw_) {
         // Use indirect draw - GPU calculates workgroup count
-        vkCmdDrawMeshTasksIndirectEXT(cmd, indirectDrawBuffer_, 0, 1, 0);
+        vkCmdDrawMeshTasksIndirectEXT(cmd, indirectDrawBuffer_.buffer, 0, 1, 0);
     } else {
         // Dispatch task shaders - blocks are processed in 8x8x8 groups, split into two 8x8x4 halves
         // So we need 2 workgroups per 8x8x8 = 512 blocks
@@ -671,7 +550,7 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
                      0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &visibilityInfo, nullptr});
     
     // Binding 1: Compacted bitfield (output)
-    VkDescriptorBufferInfo currentBitfieldInfo{output.currentBitfieldBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo currentBitfieldInfo{output.currentBitfieldBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, visibilityCompactionDescriptorSet,
                      1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &currentBitfieldInfo, nullptr});
     
@@ -718,17 +597,17 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
     
     // Binding 1: Previous frame bitfield (input)
     // For now, use the same buffer - in production, maintain separate previous frame bitfield
-    VkDescriptorBufferInfo previousBitfieldInfo{output.previousBitfieldBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo previousBitfieldInfo{output.previousBitfieldBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, buildOutputDescriptorSet,
                      1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &previousBitfieldInfo, nullptr});
     
     // Binding 2: PVS current buffer (output)
-    VkDescriptorBufferInfo pvsCurrentInfo{output.pvsCurrentBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo pvsCurrentInfo{output.pvsCurrentBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, buildOutputDescriptorSet,
                      2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pvsCurrentInfo, nullptr});
     
     // Binding 3: PVS difference buffer (output)
-    VkDescriptorBufferInfo pvsDifferenceInfo{output.pvsDifferenceBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo pvsDifferenceInfo{output.pvsDifferenceBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, buildOutputDescriptorSet,
                      3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pvsDifferenceInfo, nullptr});
     
@@ -760,12 +639,6 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
     finalDepInfo.pMemoryBarriers = &finalBarrier;
     vkCmdPipelineBarrier2(cmd, &finalDepInfo);
     
-    // Store temporary resources in output (to be cleaned up after command buffer submission)
-    // Note: minMaxSampler already stored above to prevent leak
-    output.tempResources.descriptorPool = descriptorPool;
-    output.tempResources.uniformBuffer = uniformBuffer;
-    output.tempResources.uniformMemory = uniformMemory;
-    
     return output;
 }
 
@@ -773,53 +646,33 @@ void RasterOcclusionPass::Output::destroy(VkDevice device) {
     // Clean up temporary resources first
     tempResources.destroy(device);
     
-    if (visibilityBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, visibilityBuffer, nullptr);
+    if (visibilityBuffer.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(visibilityBuffer, device);
     }
-    if (visibilityMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, visibilityMemory, nullptr);
+    if (currentBitfieldBuffer.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(currentBitfieldBuffer, device);
     }
-    if (currentBitfieldBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, currentBitfieldBuffer, nullptr);
+    if (previousBitfieldBuffer.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(previousBitfieldBuffer, device);
     }
-    if (currentBitfieldMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, currentBitfieldMemory, nullptr);
+    if (pvsCurrentBuffer.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(pvsCurrentBuffer, device);
     }
-    if (previousBitfieldBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, previousBitfieldBuffer, nullptr);
+    if (pvsDifferenceBuffer.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(pvsDifferenceBuffer, device);
     }
-    if (previousBitfieldMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, previousBitfieldMemory, nullptr);
-    }
-    if (pvsCurrentBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, pvsCurrentBuffer, nullptr);
-    }
-    if (pvsCurrentMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, pvsCurrentMemory, nullptr);
-    }
-    if (pvsDifferenceBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, pvsDifferenceBuffer, nullptr);
-    }
-    if (pvsDifferenceMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, pvsDifferenceMemory, nullptr);
-    }
-    if (pvsPreviousBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, pvsPreviousBuffer, nullptr);
-    }
-    if (pvsPreviousMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, pvsPreviousMemory, nullptr);
+    if (pvsPreviousBuffer.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(pvsPreviousBuffer, device);
     }
 }
 
 void RasterOcclusionPass::Output::swapTemporalBuffers() {
     // Swap current PVS to become previous PVS for next frame
     std::swap(pvsPreviousBuffer, pvsCurrentBuffer);
-    std::swap(pvsPreviousMemory, pvsCurrentMemory);
     std::swap(pvsPreviousCount, pvsCurrentCount);
     
     // Swap bitfield buffers as well
     std::swap(previousBitfieldBuffer, currentBitfieldBuffer);
-    std::swap(previousBitfieldMemory, currentBitfieldMemory);
     
     // Increment frame index
     frameIndex++;
@@ -829,15 +682,15 @@ void RasterOcclusionPass::Output::swapTemporalBuffers() {
 void RasterOcclusionPass::Output::copyCurrentToPrevious(VkDevice device, VkCommandBuffer cmd) {
     // Copy current bitfield to previous bitfield
     VkBufferCopy bitfieldCopy{};
-    bitfieldCopy.size = bitfieldBufferSize;
-    vkCmdCopyBuffer(cmd, currentBitfieldBuffer, previousBitfieldBuffer, 1, &bitfieldCopy);
+    bitfieldCopy.size = currentBitfieldBuffer.size;
+    vkCmdCopyBuffer(cmd, currentBitfieldBuffer.buffer, previousBitfieldBuffer.buffer, 1, &bitfieldCopy);
     
     // Copy current PVS to previous PVS
     // Copy the entire buffer to ensure all data is transferred
     // The buffer size includes space for the count + all block indices
     VkBufferCopy pvsCopy{};
-    pvsCopy.size = pvsBufferSize; // Use the full buffer size
-    vkCmdCopyBuffer(cmd, pvsCurrentBuffer, pvsPreviousBuffer, 1, &pvsCopy);
+    pvsCopy.size = pvsCurrentBuffer.size;
+    vkCmdCopyBuffer(cmd, pvsCurrentBuffer.buffer, pvsPreviousBuffer.buffer, 1, &pvsCopy);
     
     // Memory barrier to ensure copies complete
     VkMemoryBarrier2 copyBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -854,79 +707,25 @@ void RasterOcclusionPass::Output::copyCurrentToPrevious(VkDevice device, VkComma
 
 void RasterOcclusionPass::createPVSBuffers(Output& output, uint32_t maxBlocks) {
     VkDeviceSize pvsBufferSize = (maxBlocks + 1) * sizeof(uint32_t); // +1 for count
-    output.pvsBufferSize = pvsBufferSize; // Store for later use
+    
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT | 
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     
     // Create PVS current buffer
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = pvsBufferSize;
-        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
-                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | 
-                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &output.pvsCurrentBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, output.pvsCurrentBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                     memRequirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &output.pvsCurrentMemory));
-        VK_CHECK(vkBindBufferMemory(device_, output.pvsCurrentBuffer, output.pvsCurrentMemory, 0));
-    }
+    createBuffer(output.pvsCurrentBuffer, device_, context_.getMemoryProperties(),
+                pvsBufferSize, usage,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     
     // Create PVS difference buffer
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = pvsBufferSize;
-        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
-                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &output.pvsDifferenceBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, output.pvsDifferenceBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                     memRequirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &output.pvsDifferenceMemory));
-        VK_CHECK(vkBindBufferMemory(device_, output.pvsDifferenceBuffer, output.pvsDifferenceMemory, 0));
-    }
+    createBuffer(output.pvsDifferenceBuffer, device_, context_.getMemoryProperties(),
+                pvsBufferSize, usage,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     
     // Create PVS previous buffer (PVS_prev)
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = pvsBufferSize;
-        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
-                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | 
-                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &output.pvsPreviousBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, output.pvsPreviousBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                     memRequirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &output.pvsPreviousMemory));
-        VK_CHECK(vkBindBufferMemory(device_, output.pvsPreviousBuffer, output.pvsPreviousMemory, 0));
-    }
+    createBuffer(output.pvsPreviousBuffer, device_, context_.getMemoryProperties(),
+                pvsBufferSize, usage,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 }
 
 void RasterOcclusionPass::initializeOutput(Output& output, uint32_t numBlocks) {
@@ -943,33 +742,101 @@ void RasterOcclusionPass::initializeOutput(Output& output, uint32_t numBlocks) {
     output.pvsDifferenceCount = 0;
 }
 
-void RasterOcclusionPass::performTemporalOcclusionCulling(
+bool RasterOcclusionPass::performTemporalOcclusionCulling(
     VkCommandBuffer cmd,
     Output& output,
     const MinMaxOutput& minMaxOutput,
     const PushConstants& pushConstants,
     const glm::mat4& viewProjMatrix,
     VkImageView depthImageView,
-    VkExtent2D renderExtent) {
+    VkExtent2D renderExtent,
+    bool forceUpdate) {
     
     // Calculate total number of blocks
     uint32_t totalBlocks = pushConstants.blockGridDim.x * 
                           pushConstants.blockGridDim.y * 
                           pushConstants.blockGridDim.z;
     
-    // Debug output
-    static int occlusionCallCount = 0;
-    if (occlusionCallCount++ < 5) {
-        printf("performTemporalOcclusionCulling called: totalBlocks=%u, blockGridDim=(%u,%u,%u)\n",
-               totalBlocks, pushConstants.blockGridDim.x, pushConstants.blockGridDim.y, pushConstants.blockGridDim.z);
+    // Check if we need to update occlusion based on camera movement and PVS stability
+    bool cameraChanged = false;
+    bool shouldCheckOcclusion = false;
+    
+    if (!output.isFirstFrame) {
+        // Decompose view-projection to analyze camera changes more precisely
+        // Extract camera position from inverse view-projection
+        glm::mat4 invViewProj = glm::inverse(viewProjMatrix);
+        glm::mat4 invPrevViewProj = glm::inverse(output.previousViewProj);
+        
+        // Camera position is the translation part of inverse view matrix
+        glm::vec3 currentCamPos = glm::vec3(invViewProj[3]);
+        glm::vec3 prevCamPos = glm::vec3(invPrevViewProj[3]);
+        
+        // Check position change
+        float positionDelta = glm::length(currentCamPos - prevCamPos);
+        
+        // Check rotation change by comparing view direction
+        glm::vec3 currentViewDir = -glm::normalize(glm::vec3(invViewProj[2]));
+        glm::vec3 prevViewDir = -glm::normalize(glm::vec3(invPrevViewProj[2]));
+        float rotationDelta = glm::acos(glm::clamp(glm::dot(currentViewDir, prevViewDir), -1.0f, 1.0f));
+        
+        // Adaptive thresholds based on distance from volume
+        // When zoomed in close, be less sensitive to small movements
+        float distanceFromVolume = glm::length(currentCamPos - glm::vec3(128.0f, 128.0f, 128.0f)); // Assuming volume center
+        float distanceScale = glm::clamp(distanceFromVolume / 500.0f, 0.5f, 2.0f);
+        
+        // Thresholds for camera movement (adaptive based on zoom)
+        // Increase thresholds to reduce false positives from numerical errors
+        const float BASE_POSITION_THRESHOLD = 2.0f;  // Increased from 1.0
+        const float BASE_ROTATION_THRESHOLD = 0.05f;  // Increased from 0.02 (~3 degrees)
+        
+        float positionThreshold = BASE_POSITION_THRESHOLD * distanceScale;
+        float rotationThreshold = BASE_ROTATION_THRESHOLD;
+        
+        // Debug: Log what's causing camera detection when zoomed in
+        static int debugCounter = 0;
+        bool positionChanged = positionDelta > positionThreshold;
+        bool rotationChanged = rotationDelta > rotationThreshold;
+        
+        if ((positionChanged || rotationChanged) && distanceFromVolume < 100.0f && debugCounter++ < 20) {
+            printf("  Camera detection: pos_delta=%.6f (thresh=%.3f) rot_delta=%.6f (thresh=%.3f) dist=%.1f\n",
+                   positionDelta, positionThreshold, rotationDelta, rotationThreshold, distanceFromVolume);
+        }
+        
+        cameraChanged = positionChanged || rotationChanged;
+        
+        // Be VERY conservative about occlusion updates to avoid z-fighting
+        if (cameraChanged) {
+            // Only update if camera moved significantly
+            shouldCheckOcclusion = true;
+        }
+        else {
+            // Camera hasn't moved - don't update unless absolutely necessary
+            // No periodic updates - they cause z-fighting for no benefit
+            shouldCheckOcclusion = false;
+        }
+    } else {
+        shouldCheckOcclusion = true;  // Always check on first frame
     }
     
+    // Determine if we need to run occlusion culling
+    output.needsOcclusionUpdate = output.isFirstFrame || shouldCheckOcclusion || forceUpdate;
+    
+    // If no update needed, just increment frame counter and return
+    if (!output.needsOcclusionUpdate) {
+        output.framesSinceLastUpdate++;
+        return false;  // No occlusion culling performed
+    }
+    
+    // Reset frame counter when we do update
+    output.framesSinceLastUpdate = 0;
+    output.previousViewProj = viewProjMatrix;
+    
     // Initialize output on first frame
-    if (output.isFirstFrame || output.visibilityBuffer == VK_NULL_HANDLE) {
+    if (output.isFirstFrame || output.visibilityBuffer.buffer == VK_NULL_HANDLE) {
         initializeOutput(output, totalBlocks);
         
         // Clear the previous frame bitfield buffer on first frame
-        vkCmdFillBuffer(cmd, output.previousBitfieldBuffer, 0, output.bitfieldBufferSize, 0);
+        vkCmdFillBuffer(cmd, output.previousBitfieldBuffer.buffer, 0, output.currentBitfieldBuffer.size, 0);
         
         VkMemoryBarrier2 clearBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -984,10 +851,10 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
     }
     
     // Clear current frame buffers
-    vkCmdFillBuffer(cmd, output.visibilityBuffer, 0, output.visibilityBufferSize, 0);
-    vkCmdFillBuffer(cmd, output.currentBitfieldBuffer, 0, output.bitfieldBufferSize, 0);
-    vkCmdFillBuffer(cmd, output.pvsCurrentBuffer, 0, sizeof(uint32_t), 0); // Clear count
-    vkCmdFillBuffer(cmd, output.pvsDifferenceBuffer, 0, sizeof(uint32_t), 0); // Clear count
+    vkCmdFillBuffer(cmd, output.visibilityBuffer.buffer, 0, output.visibilityBuffer.size, 0);
+    vkCmdFillBuffer(cmd, output.currentBitfieldBuffer.buffer, 0, output.currentBitfieldBuffer.size, 0);
+    vkCmdFillBuffer(cmd, output.pvsCurrentBuffer.buffer, 0, sizeof(uint32_t), 0); // Clear count
+    vkCmdFillBuffer(cmd, output.pvsDifferenceBuffer.buffer, 0, sizeof(uint32_t), 0); // Clear count
     
     // Memory barrier after clear
     VkMemoryBarrier2 clearBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -1016,51 +883,16 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
     viewUniforms.blockGridDim = pushConstants.blockGridDim;
     viewUniforms.isovalue = pushConstants.isovalue;
     
-    // Create uniform buffer
-    VkBuffer uniformBuffer;
-    VkDeviceMemory uniformMemory;
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = sizeof(ViewUniforms);
-        bufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &uniformBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, uniformBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                     memRequirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &uniformMemory));
-        VK_CHECK(vkBindBufferMemory(device_, uniformBuffer, uniformMemory, 0));
-        
-        // Upload data
-        void* mapped;
-        VK_CHECK(vkMapMemory(device_, uniformMemory, 0, sizeof(ViewUniforms), 0, &mapped));
-        memcpy(mapped, &viewUniforms, sizeof(ViewUniforms));
-        vkUnmapMemory(device_, uniformMemory);
-    }
+    // Create uniform buffer using Buffer struct
+    createBuffer(output.tempResources.uniformBuffer, device_, context_.getMemoryProperties(),
+                sizeof(ViewUniforms),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     
-    // Create descriptor pool and sets
-    VkDescriptorPool descriptorPool;
-    std::vector<VkDescriptorPoolSize> poolSizes = {
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8}
-    };
+    // Copy data to uniform buffer (data is already mapped for host-visible buffers)
+    memcpy(output.tempResources.uniformBuffer.data, &viewUniforms, sizeof(ViewUniforms));
     
-    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolInfo.maxSets = 3;
-    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    poolInfo.pPoolSizes = poolSizes.data();
-    VK_CHECK(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool));
-    
-    // Allocate descriptor sets
+    // Allocate descriptor sets from persistent pool
     VkDescriptorSet occlusionDescriptorSet, visibilityCompactionDescriptorSet, buildOutputDescriptorSet;
     std::array<VkDescriptorSetLayout, 3> layouts = {
         occlusionDescriptorSetLayout_, 
@@ -1068,7 +900,7 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
         buildOutputDescriptorSetLayout_
     };
     VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    allocInfo.descriptorPool = descriptorPool;
+    allocInfo.descriptorPool = persistentDescriptorPools_[currentFrameIndex_];
     allocInfo.descriptorSetCount = 3;
     allocInfo.pSetLayouts = layouts.data();
     
@@ -1078,32 +910,21 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
     visibilityCompactionDescriptorSet = sets[1];
     buildOutputDescriptorSet = sets[2];
     
-    // Create sampler for min-max texture (store in temp resources to avoid leak)
-    VkSampler minMaxSampler;
-    VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    samplerInfo.magFilter = samplerInfo.minFilter = VK_FILTER_NEAREST;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    VK_CHECK(vkCreateSampler(device_, &samplerInfo, nullptr, &minMaxSampler));
-    
-    // Store in temp resources for cleanup (critical to avoid sampler leak!)
-    output.tempResources.minMaxSampler = minMaxSampler;
-    
     // Update occlusion descriptor set
     std::vector<VkWriteDescriptorSet> writes;
     
     // Binding 0: View uniforms
-    VkDescriptorBufferInfo viewUboInfo{uniformBuffer, 0, sizeof(ViewUniforms)};
+    VkDescriptorBufferInfo viewUboInfo{output.tempResources.uniformBuffer.buffer, 0, sizeof(ViewUniforms)};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, occlusionDescriptorSet, 
                      0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &viewUboInfo, nullptr});
     
     // Binding 1: Min-max hierarchy texture
-    VkDescriptorImageInfo minMaxInfo{minMaxSampler, minMaxOutput.minMaxImage.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo minMaxInfo{minMaxOutput.minMaxSampler, minMaxOutput.minMaxImage.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, occlusionDescriptorSet,
                      1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &minMaxInfo, nullptr, nullptr});
     
     // Binding 2: Visibility buffer
-    VkDescriptorBufferInfo visibilityInfo{output.visibilityBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo visibilityInfo{output.visibilityBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, occlusionDescriptorSet,
                      2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &visibilityInfo, nullptr});
     
@@ -1155,12 +976,12 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
     
     if (useIndirectDraw_) {
         // Use indirect draw - GPU calculates workgroup count
-        vkCmdDrawMeshTasksIndirectEXT(cmd, indirectDrawBuffer_, 0, 1, 0);
+        vkCmdDrawMeshTasksIndirectEXT(cmd, indirectDrawBuffer_.buffer, 0, 1, 0);
     } else {
         // Dispatch task shaders
-        uint32_t blocksPerGroup = 8 * 8 * 8; // 512
+        uint32_t blocksPerGroup = pushConstants.blockDim.x * pushConstants.blockDim.y * pushConstants.blockDim.z; // 512
         uint32_t numGroups = (totalBlocks + blocksPerGroup - 1) / blocksPerGroup;
-        uint32_t numWorkgroups = numGroups * 2; // 2 workgroups per 8x8x8 group
+        uint32_t numWorkgroups = numGroups * 2; // 2 workgroups per block
         vkCmdDrawMeshTasksEXT(cmd, numWorkgroups, 1, 1);
     }
     
@@ -1187,7 +1008,7 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
                      0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &visibilityInfo, nullptr});
     
     // Binding 1: Compacted bitfield (output)
-    VkDescriptorBufferInfo currentBitfieldInfo{output.currentBitfieldBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo currentBitfieldInfo{output.currentBitfieldBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, visibilityCompactionDescriptorSet,
                      1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &currentBitfieldInfo, nullptr});
     
@@ -1226,17 +1047,17 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
                      0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &currentBitfieldInfo, nullptr});
     
     // Binding 1: Previous frame bitfield (input)
-    VkDescriptorBufferInfo previousBitfieldInfo{output.previousBitfieldBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo previousBitfieldInfo{output.previousBitfieldBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, buildOutputDescriptorSet,
                      1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &previousBitfieldInfo, nullptr});
     
     // Binding 2: PVS current buffer (output)
-    VkDescriptorBufferInfo pvsCurrentInfo{output.pvsCurrentBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo pvsCurrentInfo{output.pvsCurrentBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, buildOutputDescriptorSet,
                      2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pvsCurrentInfo, nullptr});
     
     // Binding 3: PVS difference buffer (output)
-    VkDescriptorBufferInfo pvsDifferenceInfo{output.pvsDifferenceBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo pvsDifferenceInfo{output.pvsDifferenceBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, buildOutputDescriptorSet,
                      3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pvsDifferenceInfo, nullptr});
     
@@ -1268,295 +1089,11 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
     finalDepInfo.pMemoryBarriers = &finalBarrier;
     vkCmdPipelineBarrier2(cmd, &finalDepInfo);
     
-    // Debug: Print some stats and force some visibility for testing
-    static int debugFrameCounter = 0;
-    if (debugFrameCounter++ % 60 == 0) {
-        printf("Occlusion culling - Total blocks: %u, First frame: %s\n", 
-               totalBlocks, output.isFirstFrame ? "true" : "false");
-        printf("  Volume: %ux%ux%u, Block: %ux%ux%u, Grid: %ux%ux%u\n",
-               pushConstants.volumeDim.x, pushConstants.volumeDim.y, pushConstants.volumeDim.z,
-               pushConstants.blockDim.x, pushConstants.blockDim.y, pushConstants.blockDim.z,
-               pushConstants.blockGridDim.x, pushConstants.blockGridDim.y, pushConstants.blockGridDim.z);
-        printf("  Isovalue: %.3f\n", pushConstants.isovalue);
-        printf("  Test blocks added: first frame=%u, subsequent=%u\n",
-               output.isFirstFrame ? std::min(totalBlocks, 100u) : 120,
-               output.isFirstFrame ? std::min(totalBlocks, 100u) : 20);
-    }
-    
-    // TEMPORARY: Force some blocks to be visible for testing
-    // In production, these counts should be read back from GPU
-    // COMMENTED OUT to allow GPU to compute actual visibility
-    /*
-    if (output.isFirstFrame) {
-        output.pvsCurrentCount = 512;  // All blocks for testing
-        output.pvsDifferenceCount = 512;
-        
-        // Also populate the PVS buffers with some test block IDs
-        std::vector<uint32_t> testData;
-        
-        // For a 64x64x64 volume with 8x8x8 blocks, we have an 8x8x8 grid
-        // The sphere is centered at (32,32,32) with radius ~25.6
-        // So center block is at grid position (4,4,4)
-        
-        // Add all blocks that might contain the sphere
-        // Sphere radius is 25.6, centered at (32,32,32)
-        // So it spans roughly from voxel 6 to 58
-        // In block coordinates: 0-1 to 7 (all blocks!)
-        for (uint32_t z = 0; z < 8; z++) {
-            for (uint32_t y = 0; y < 8; y++) {
-                for (uint32_t x = 0; x < 8; x++) {
-                    uint32_t blockID = z * pushConstants.blockGridDim.x * pushConstants.blockGridDim.y +
-                                      y * pushConstants.blockGridDim.x + x;
-                    testData.push_back(blockID);
-                    
-                    // Debug: print block details for center block
-                    if (x == 4 && y == 4 && z == 4) {
-                        std::cout << "DEBUG: Center block (4,4,4) -> ID " << blockID << std::endl;
-                        std::cout << "  Block grid: " << pushConstants.blockGridDim.x << "x" 
-                                  << pushConstants.blockGridDim.y << "x" << pushConstants.blockGridDim.z << std::endl;
-                        std::cout << "  Block covers voxels: " << (x * 8) << "-" << ((x+1) * 8 - 1) << " x "
-                                  << (y * 8) << "-" << ((y+1) * 8 - 1) << " x "
-                                  << (z * 8) << "-" << ((z+1) * 8 - 1) << std::endl;
-                    }
-                }
-            }
-        }
-        
-        std::cout << "DEBUG: Forcing all " << testData.size() << " blocks to test sphere" << std::endl;
-        
-        // Insert count at the beginning
-        uint32_t actualCount = testData.size();
-        testData.insert(testData.begin(), actualCount);
-        output.pvsCurrentCount = actualCount;
-        output.pvsDifferenceCount = actualCount;
-        
-        // Upload test data to PVS buffers using staging buffer
-        VkDeviceSize dataSize = testData.size() * sizeof(uint32_t);
-        
-        // Create staging buffer
-        VkBuffer stagingBuffer;
-        VkDeviceMemory stagingMemory;
-        {
-            VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            bufferInfo.size = dataSize;
-            bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-            bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            
-            VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &stagingBuffer));
-            
-            VkMemoryRequirements memRequirements;
-            vkGetBufferMemoryRequirements(device_, stagingBuffer, &memRequirements);
-            
-            VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            allocInfo.allocationSize = memRequirements.size;
-            allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                         memRequirements.memoryTypeBits,
-                                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 
-                                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            
-            VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &stagingMemory));
-            VK_CHECK(vkBindBufferMemory(device_, stagingBuffer, stagingMemory, 0));
-            
-            // Copy data to staging buffer
-            void* mapped;
-            VK_CHECK(vkMapMemory(device_, stagingMemory, 0, dataSize, 0, &mapped));
-            memcpy(mapped, testData.data(), dataSize);
-            vkUnmapMemory(device_, stagingMemory);
-        }
-        
-        // Copy from staging to PVS buffers (include count)
-        VkBufferCopy copyRegion{};
-        copyRegion.srcOffset = 0;
-        copyRegion.dstOffset = 0; // Start from beginning (includes count)
-        copyRegion.size = dataSize;
-        
-        vkCmdCopyBuffer(cmd, stagingBuffer, output.pvsPreviousBuffer, 1, &copyRegion);
-        vkCmdCopyBuffer(cmd, stagingBuffer, output.pvsDifferenceBuffer, 1, &copyRegion);
-        
-        // Barrier to ensure copies complete before shader reads
-        VkMemoryBarrier2 copyBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-        copyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        copyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        copyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT;
-        copyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-        
-        VkDependencyInfo copyDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        copyDepInfo.memoryBarrierCount = 1;
-        copyDepInfo.pMemoryBarriers = &copyBarrier;
-        vkCmdPipelineBarrier2(cmd, &copyDepInfo);
-        
-        // Add to temp resources for cleanup
-        output.tempResources.stagingBuffer = stagingBuffer;
-        output.tempResources.stagingMemory = stagingMemory;
-    } else {
-        output.pvsCurrentCount = 512;  // All blocks
-        output.pvsDifferenceCount = 0;  // No new blocks for now
-        
-        // First update the previous buffer with all previous frame blocks
-        std::vector<uint32_t> prevData;
-        prevData.push_back(512); // Count for previous buffer (all blocks)
-        
-        // Add all blocks
-        for (uint32_t z = 0; z < 8; z++) {
-            for (uint32_t y = 0; y < 8; y++) {
-                for (uint32_t x = 0; x < 8; x++) {
-                    uint32_t blockID = z * pushConstants.blockGridDim.x * pushConstants.blockGridDim.y +
-                                      y * pushConstants.blockGridDim.x + x;
-                    prevData.push_back(blockID);
-                }
-            }
-        }
-        
-        // Upload previous frame data
-        {
-            VkDeviceSize prevDataSize = prevData.size() * sizeof(uint32_t);
-            
-            // Create staging buffer for previous data
-            VkBuffer prevStagingBuffer;
-            VkDeviceMemory prevStagingMemory;
-            {
-                VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                bufferInfo.size = prevDataSize;
-                bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-                bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-                
-                VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &prevStagingBuffer));
-                
-                VkMemoryRequirements memRequirements;
-                vkGetBufferMemoryRequirements(device_, prevStagingBuffer, &memRequirements);
-                
-                VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                allocInfo.allocationSize = memRequirements.size;
-                allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                             memRequirements.memoryTypeBits,
-                                                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 
-                                                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                
-                VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &prevStagingMemory));
-                VK_CHECK(vkBindBufferMemory(device_, prevStagingBuffer, prevStagingMemory, 0));
-                
-                // Copy data to staging buffer
-                void* mapped;
-                VK_CHECK(vkMapMemory(device_, prevStagingMemory, 0, prevDataSize, 0, &mapped));
-                memcpy(mapped, prevData.data(), prevDataSize);
-                vkUnmapMemory(device_, prevStagingMemory);
-            }
-            
-            // Copy to previous buffer
-            VkBufferCopy copyRegion{};
-            copyRegion.srcOffset = 0;
-            copyRegion.dstOffset = 0;
-            copyRegion.size = prevDataSize;
-            
-            vkCmdCopyBuffer(cmd, prevStagingBuffer, output.pvsPreviousBuffer, 1, &copyRegion);
-            
-            // Store for cleanup after command buffer submission
-            output.tempResources.stagingBuffer2 = prevStagingBuffer;
-            output.tempResources.stagingMemory2 = prevStagingMemory;
-        }
-        
-        // For now, no new blocks in difference buffer
-        std::vector<uint32_t> newData;
-        newData.push_back(0); // No new blocks
-        
-        // Update only difference buffer with new blocks using staging
-        VkDeviceSize dataSize = newData.size() * sizeof(uint32_t);
-        
-        // Create staging buffer for new blocks
-        VkBuffer stagingBuffer;
-        VkDeviceMemory stagingMemory;
-        {
-            VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            bufferInfo.size = dataSize;
-            bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-            bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            
-            VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &stagingBuffer));
-            
-            VkMemoryRequirements memRequirements;
-            vkGetBufferMemoryRequirements(device_, stagingBuffer, &memRequirements);
-            
-            VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            allocInfo.allocationSize = memRequirements.size;
-            allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                         memRequirements.memoryTypeBits,
-                                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 
-                                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            
-            VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &stagingMemory));
-            VK_CHECK(vkBindBufferMemory(device_, stagingBuffer, stagingMemory, 0));
-            
-            // Copy data to staging buffer  
-            void* mapped;
-            VK_CHECK(vkMapMemory(device_, stagingMemory, 0, dataSize, 0, &mapped));
-            memcpy(mapped, newData.data(), dataSize);
-            vkUnmapMemory(device_, stagingMemory);
-        }
-        
-        // Copy from staging to difference buffer
-        VkBufferCopy copyRegion{};
-        copyRegion.srcOffset = 0;
-        copyRegion.dstOffset = 0; // Start from beginning (includes count)
-        copyRegion.size = dataSize;
-        
-        vkCmdCopyBuffer(cmd, stagingBuffer, output.pvsDifferenceBuffer, 1, &copyRegion);
-        
-        // Barrier to ensure copy completes before shader reads
-        VkMemoryBarrier2 copyBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-        copyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        copyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        copyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT;
-        copyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-        
-        VkDependencyInfo copyDepInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        copyDepInfo.memoryBarrierCount = 1;
-        copyDepInfo.pMemoryBarriers = &copyBarrier;
-        vkCmdPipelineBarrier2(cmd, &copyDepInfo);
-        
-        // Add to temp resources for cleanup
-        output.tempResources.stagingBuffer = stagingBuffer;
-        output.tempResources.stagingMemory = stagingMemory;
-        
-        // Also need to update current buffer with the same blocks as previous
-        // Re-use the copyRegion from previous buffer copy
-        VkBufferCopy currentCopyRegion{};
-        currentCopyRegion.srcOffset = 0;
-        currentCopyRegion.dstOffset = 0;
-        currentCopyRegion.size = prevData.size() * sizeof(uint32_t);
-        vkCmdCopyBuffer(cmd, output.tempResources.stagingBuffer2, output.pvsCurrentBuffer, 1, &currentCopyRegion);
-        
-        // Update the actual count
-        output.pvsCurrentCount = 512;
-    }
-    */
-    
-    // Instead of hardcoded values, we should read back the counts from GPU
-    // For now, we'll rely on the GPU compute shaders to populate the PVS buffers correctly
-    
-    // Create readback buffers for PVS counts
-    VkBuffer readbackBuffer;
-    VkDeviceMemory readbackMemory;
-    {
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = 3 * sizeof(uint32_t); // For prev, current, and difference counts
-        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        
-        VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &readbackBuffer));
-        
-        VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device_, readbackBuffer, &memRequirements);
-        
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                     memRequirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 
-                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        
-        VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &readbackMemory));
-        VK_CHECK(vkBindBufferMemory(device_, readbackBuffer, readbackMemory, 0));
-    }
+    // Create readback buffer for PVS counts using Buffer struct
+    createBuffer(output.tempResources.readbackBuffer, device_, context_.getMemoryProperties(),
+                3 * sizeof(uint32_t), // For prev, current, and difference counts
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     
     // Copy counts from GPU buffers to readback buffer
     VkBufferCopy countCopy{};
@@ -1565,21 +1102,17 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
     // Copy previous count
     countCopy.srcOffset = 0;
     countCopy.dstOffset = 0;
-    vkCmdCopyBuffer(cmd, output.pvsPreviousBuffer, readbackBuffer, 1, &countCopy);
+    vkCmdCopyBuffer(cmd, output.pvsPreviousBuffer.buffer, output.tempResources.readbackBuffer.buffer, 1, &countCopy);
     
     // Copy current count
     countCopy.srcOffset = 0;
     countCopy.dstOffset = sizeof(uint32_t);
-    vkCmdCopyBuffer(cmd, output.pvsCurrentBuffer, readbackBuffer, 1, &countCopy);
+    vkCmdCopyBuffer(cmd, output.pvsCurrentBuffer.buffer, output.tempResources.readbackBuffer.buffer, 1, &countCopy);
     
     // Copy difference count
     countCopy.srcOffset = 0;
     countCopy.dstOffset = 2 * sizeof(uint32_t);
-    vkCmdCopyBuffer(cmd, output.pvsDifferenceBuffer, readbackBuffer, 1, &countCopy);
-    
-    // Store readback resources for later retrieval
-    output.tempResources.readbackBuffer = readbackBuffer;
-    output.tempResources.readbackMemory = readbackMemory;
+    vkCmdCopyBuffer(cmd, output.pvsDifferenceBuffer.buffer, output.tempResources.readbackBuffer.buffer, 1, &countCopy);
     
     // Copy current frame data to previous frame for next frame's temporal coherence
     // This ensures the previous PVS buffer contains the current frame's visible blocks
@@ -1589,25 +1122,63 @@ void RasterOcclusionPass::performTemporalOcclusionCulling(
     if (output.isFirstFrame) {
         output.isFirstFrame = false;
     }
+    
+    return true;  // Occlusion culling was performed
 }
 
 void RasterOcclusionPass::Output::readbackPVSCounts(VkDevice device) {
-    if (tempResources.readbackBuffer && tempResources.readbackMemory) {
-        // Map the readback buffer and read the counts
-        uint32_t* counts;
-        VK_CHECK(vkMapMemory(device, tempResources.readbackMemory, 0, 3 * sizeof(uint32_t), 0, (void**)&counts));
+    if (tempResources.readbackBuffer.buffer != VK_NULL_HANDLE) {
+        // The readback buffer is already mapped (host-visible buffers are mapped by createBuffer)
+        uint32_t* counts = (uint32_t*)tempResources.readbackBuffer.data;
         
+        uint32_t oldPVSCount = pvsCurrentCount;
         pvsPreviousCount = counts[0];
         pvsCurrentCount = counts[1];
         pvsDifferenceCount = counts[2];
         
-        vkUnmapMemory(device, tempResources.readbackMemory);
+        // Check if PVS actually changed
+        // Don't use tolerance - it was causing issues
+        // Any change means we had z-fighting or actual visibility change
+        pvsChanged = (pvsCurrentCount != oldPVSCount) || (pvsDifferenceCount > 0);
         
-        // Debug print for first few frames
-        static int readbackFrame = 0;
-        if (readbackFrame++ < 10) {
-            printf("GPU Readback [Frame %d]: prev=%u, curr=%u, diff=%u\n", 
-                   readbackFrame-1, pvsPreviousCount, pvsCurrentCount, pvsDifferenceCount);
+        if (!pvsChanged) {
+            framesWithStablePVS++;
+            if (framesWithStablePVS == 1) {
+                lastStablePVSCount = pvsCurrentCount;
+            }
+        } else {
+            framesWithStablePVS = 0;
+        }
+    }
+}
+
+void RasterOcclusionPass::createPersistentResources() {
+    // Create descriptor pools for each frame in flight
+    // Each pool needs enough descriptors for one frame's worth of operations
+    const uint32_t descriptorMultiplier = 10; // For all passes in a frame
+    
+    std::vector<VkDescriptorPoolSize> poolSizes = {
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 * descriptorMultiplier},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * descriptorMultiplier},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 * descriptorMultiplier}
+    };
+    
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = descriptorMultiplier * 3; // Enough sets for all operations in a frame
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    poolInfo.flags = 0; // No individual free - we'll reset the entire pool each frame
+    
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        VK_CHECK(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &persistentDescriptorPools_[i]));
+    }
+}
+
+void RasterOcclusionPass::destroyPersistentResources() {
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (persistentDescriptorPools_[i] != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(device_, persistentDescriptorPools_[i], nullptr);
+            persistentDescriptorPools_[i] = VK_NULL_HANDLE;
         }
     }
 }
@@ -1615,25 +1186,14 @@ void RasterOcclusionPass::Output::readbackPVSCounts(VkDevice device) {
 void RasterOcclusionPass::createIndirectDrawBuffer() {
     // Create buffer for indirect draw command
     // One command with 3 uint32_t values (groupCountX, Y, Z)
-    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bufferInfo.size = sizeof(uint32_t) * 3;
-    bufferInfo.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
-                       VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    Buffer indirectBuf;
+    createBuffer(indirectBuf, device_, context_.getMemoryProperties(),
+                sizeof(uint32_t) * 3,
+                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     
-    VK_CHECK(vkCreateBuffer(device_, &bufferInfo, nullptr, &indirectDrawBuffer_));
-    
-    VkMemoryRequirements memRequirements;
-    vkGetBufferMemoryRequirements(device_, indirectDrawBuffer_, &memRequirements);
-    
-    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocInfo.allocationSize = memRequirements.size;
-    allocInfo.memoryTypeIndex = selectMemoryType(context_.getMemoryProperties(),
-                                                 memRequirements.memoryTypeBits,
-                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    
-    VK_CHECK(vkAllocateMemory(device_, &allocInfo, nullptr, &indirectDrawMemory_));
-    VK_CHECK(vkBindBufferMemory(device_, indirectDrawBuffer_, indirectDrawMemory_, 0));
+    indirectDrawBuffer_ = indirectBuf;
 }
 
 void RasterOcclusionPass::createIndirectUpdatePipeline() {
@@ -1681,29 +1241,16 @@ void RasterOcclusionPass::createIndirectUpdatePipeline() {
 }
 
 void RasterOcclusionPass::updateIndirectDrawBufferGPU(VkCommandBuffer cmd, uint32_t totalBlocks) {
-    // Clean up any previous descriptor pool
-    indirectTempResources_.destroy(device_);
-    
-    // Create descriptor pool for compute shader
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
-    
-    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolInfo.maxSets = 1;
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes = &poolSize;
-    
-    VK_CHECK(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &indirectTempResources_.descriptorPool));
-    
-    // Allocate descriptor set
+    // Allocate descriptor set from persistent pool
     VkDescriptorSet descriptorSet;
     VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    allocInfo.descriptorPool = indirectTempResources_.descriptorPool;
+    allocInfo.descriptorPool = persistentDescriptorPools_[currentFrameIndex_];
     allocInfo.descriptorSetCount = 1;
     allocInfo.pSetLayouts = &indirectUpdateDescriptorSetLayout_;
     VK_CHECK(vkAllocateDescriptorSets(device_, &allocInfo, &descriptorSet));
     
     // Update descriptor set
-    VkDescriptorBufferInfo bufferInfo{indirectDrawBuffer_, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo bufferInfo{indirectDrawBuffer_.buffer, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = descriptorSet;
     write.dstBinding = 0;
@@ -1729,6 +1276,4 @@ void RasterOcclusionPass::updateIndirectDrawBufferGPU(VkCommandBuffer cmd, uint3
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                         0, 1, &barrier, 0, nullptr, 0, nullptr);
-    
-    // Descriptor pool is stored in indirectTempResources_ and will be cleaned up later
 }

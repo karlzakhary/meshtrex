@@ -7,7 +7,6 @@
 #include "image.h"
 #include "vulkan_utils.h"
 #include "minMaxPass.h"
-#include "blockFilteringTestUtils.h"
 #include "activeBlockFilteringPass.h"
 #include "gpuProfiler.h"
 #include <cstring>
@@ -70,22 +69,12 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, MinMaxOutput &minMaxO
 
     pipelineBarrier(cmd, {}, 2, bufferTransferToComputeBarriers, 0, {}); // Combined barrier
     
-    // Create sampler
-    VkSampler sampler = VK_NULL_HANDLE;
-    VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
-    sci.minLod = 0;
-    sci.maxLod = minMaxOutput.minMaxMipViews.size();
-    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sci.anisotropyEnable = VK_FALSE;
-    vkCreateSampler(context.getDevice(), &sci, nullptr, &sampler);
     // 5. Run Active Block Filtering Pass
     if (profiler) {
         profiler->beginProfileRegion(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, "Active_Block_Filtering");
     }
     
-    filteringPass.recordDispatch(cmd, minMaxOutput.minMaxImage.imageView, sampler, output.compactedBlockIdBuffer, output.activeBlockCountBuffer, pushConstants);
+    filteringPass.recordDispatch(cmd, minMaxOutput.minMaxImage.imageView, minMaxOutput.minMaxSampler, output.compactedBlockIdBuffer, output.activeBlockCountBuffer, pushConstants);
     
     if (profiler) {
         profiler->endProfileRegion(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -109,20 +98,9 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, MinMaxOutput &minMaxO
     if (ownCommandBuffer) {
         endSingleTimeCommands(context.getDevice(), context.getCommandPool(), context.getQueue(), cmd);
         std::cout << "Compute passes finished." << std::endl;
-    }
-
-    // --- No CPU readback - keep count on GPU for indirect dispatch ---
-    // The activeBlockCountBuffer will be used directly by the extraction pipeline
-    output.activeBlockCount = 0; // CPU-side count not available - stays on GPU
-
-    // --- Cleanup Only Temporary Resources ---
-    if (ownCommandBuffer) {
-        // Only destroy resources if we own the command buffer (already submitted)
-        vkDestroySampler(context.getDevice(), sampler, nullptr);
     } else {
         // When using external command buffer, store temporary resources for later cleanup
         output.tempResources.device = context.getDevice();
-        output.tempResources.addSampler(sampler);
         
         // Also store pipeline resources to prevent premature destruction
         output.tempResources.addPipeline(filteringPass.getPipeline());
@@ -133,10 +111,11 @@ FilteringOutput filterActiveBlocks(VulkanContext &context, MinMaxOutput &minMaxO
         // Transfer ownership to prevent double-free
         filteringPass.transferResourceOwnership();
     }
-    
-    // --- Return the Output Struct ---
-    // The ownership of resources within 'output' is transferred to the caller.
-    // The activeBlockCountBuffer will be used for GPU-driven indirect dispatch
+
+    // --- No CPU readback - keep count on GPU for indirect dispatch ---
+    // The activeBlockCountBuffer will be used directly by the extraction pipeline
+    output.activeBlockCount = 0; // CPU-side count not available - stays on GPU
+
     return output;
 }
 

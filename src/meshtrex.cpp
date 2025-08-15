@@ -1,5 +1,6 @@
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <cstring>
 
 #ifndef __APPLE__
@@ -11,7 +12,6 @@
 #include "filteringManager.h"
 #include "extractionManager.h"
 #include "transientExtractionManager.h"
-#include "blockFilteringTestUtils.h"
 #include "extractionTestUtils.h"
 #include <dlfcn.h>
 #include "renderdoc_app.h"
@@ -23,6 +23,7 @@
 #include "profilingManager.h"
 #include "densityUtils.h"
 #include "common.h"
+#include "config.h"
 #include "swapchain.h"
 #include "image.h"
 #include "buffer.h"
@@ -36,42 +37,52 @@ void renderTemporalCoherence(
     VulkanContext& context,
     MinMaxOutput& minMaxOutput,
     PushConstants& pushConstants,
-    bool pmb
+    bool pmb,
+    bool disableCoherenceOptimization = false
 ) {
     VkDevice device = context.getDevice();
     
-    // Create swapchain and window
+    // Initialize all resources to null for proper cleanup
     GLFWwindow* window = nullptr;
-    if (!glfwInit()) {
-        throw std::runtime_error("Failed to initialize GLFW");
-    }
-    
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    window = glfwCreateWindow(1280, 720, "MeshTrex Temporal Coherence Renderer", nullptr, nullptr);
-    if (!window) {
-        glfwTerminate();
-        throw std::runtime_error("Failed to create window");
-    }
-    
-    // Create surface
-    VkSurfaceKHR surface = createSurface(context.getInstance(), window);
-    
-    // Create swapchain
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
     Swapchain swapchain{};
-    VkFormat swapchainFormat = getSwapchainFormat(context.getPhysicalDevice(), surface);
-    createSwapchain(swapchain, context.getPhysicalDevice(), device, surface, context.getGraphicsQueueFamilyIndex(), window, swapchainFormat, VK_NULL_HANDLE);
-    
-    // Create depth buffer
     Image depthImage{};
-    VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
-    createImage(depthImage, device, context.getMemoryProperties(), VK_IMAGE_TYPE_2D, swapchain.width, swapchain.height, 1, 1, depthFormat, 
-                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    std::vector<VkImageView> swapchainImageViews;
+    std::vector<VkSemaphore> acquireSemaphores;
+    std::vector<VkSemaphore> releaseSemaphores;
+    std::vector<VkFence> frameFences;
+    std::vector<VkCommandBuffer> commandBuffers;
+    RasterOcclusionPass::Output occlusionOutput;
     
-    // Create image views
-    std::vector<VkImageView> swapchainImageViews(swapchain.imageCount);
-    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
-        swapchainImageViews[i] = createImageView(device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
-    }
+    try {
+        // Create swapchain and window
+        if (!glfwInit()) {
+            throw std::runtime_error("Failed to initialize GLFW");
+        }
+        
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        window = glfwCreateWindow(1280, 720, "MeshTrex Temporal Coherence Renderer", nullptr, nullptr);
+        if (!window) {
+            throw std::runtime_error("Failed to create window");
+        }
+        
+        // Create surface
+        surface = createSurface(context.getInstance(), window);
+    
+        // Create swapchain
+        VkFormat swapchainFormat = getSwapchainFormat(context.getPhysicalDevice(), surface);
+        createSwapchain(swapchain, context.getPhysicalDevice(), device, surface, context.getGraphicsQueueFamilyIndex(), window, swapchainFormat, VK_NULL_HANDLE);
+        
+        // Create depth buffer
+        VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
+        createImage(depthImage, device, context.getMemoryProperties(), VK_IMAGE_TYPE_2D, swapchain.width, swapchain.height, 1, 1, depthFormat, 
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+        
+        // Create image views
+        swapchainImageViews.resize(swapchain.imageCount);
+        for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+            swapchainImageViews[i] = createImageView(device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
+        }
     
     // Camera state - will be properly initialized based on actual volume dimensions
     // For now, assume typical volume centered around 128,128,128 (common for 256^3 volumes)
@@ -92,29 +103,60 @@ void renderTemporalCoherence(
     float lastFrameTime = 0.0f;
     
     // Create synchronization objects
-    VkSemaphore acquireSemaphore = createSemaphore(device);
-    VkSemaphore releaseSemaphore = createSemaphore(device);
-    VkFenceCreateInfo fenceCreateInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    VkFence frameFence = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFence));
+    // We need more acquire semaphores than swapchain images to avoid reuse conflicts
+    acquireSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+    // Release semaphores are per swapchain image
+    releaseSemaphores.resize(swapchain.imageCount);
     
-    // Allocate command buffer
-    VkCommandBuffer commandBuffer;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        acquireSemaphores[i] = createSemaphore(device);
+    }
+    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+        releaseSemaphores[i] = createSemaphore(device);
+    }
+    
+    // Fences are per swapchain image
+    frameFences.resize(swapchain.imageCount);
+    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+        VkFenceCreateInfo fenceCreateInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFences[i]));
+    }
+    
+    uint32_t currentFrame = 0;  // Track which set of sync objects to use
+    
+    // Allocate command buffers - one per frame to avoid conflicts
+    commandBuffers.resize(swapchain.imageCount);
     VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = context.getCommandPool();
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer));
+    allocInfo.commandBufferCount = swapchain.imageCount;
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()));
     
-    // Initialize temporal coherence components
+    // Track per-frame temporary resources
+    struct FrameResources {
+        bool hasResources = false;
+        uint32_t frameNumber = 0;
+        uint32_t createdAtFrame = 0;  // Track when resources were created
+        // Store the actual temp resources to destroy later
+        RasterOcclusionPass::Output::TempResources occlusionTempResources;
+        RasterOcclusionPass::IndirectTempResources indirectTempResources;
+        TransientExtractionPass::TempResources transientTempResources;
+    };
+    std::vector<FrameResources> frameResources(swapchain.imageCount);
+    
     RasterOcclusionPass occlusionPass(context);
     TransientExtractionPass transientPass(context, swapchainFormat);
-    RasterOcclusionPass::Output occlusionOutput;
     occlusionOutput.isFirstFrame = true;
     
     // Main render loop
     bool enableDebugColors = false;
+    bool disableTemporalCoherence = disableCoherenceOptimization;  // Flag to force occlusion updates every frame
+    bool freezePVS = false;  // Flag to freeze PVS updates for debugging
+    int framesProcessed = 0;  // Track frames processed for first-frame handling
+    int occlusionUpdateCount = 0;  // Track occlusion updates for statistics
+    int totalFrames = 0;  // Total frames rendered
+    bool occlusionUpdated = true;
     while (!glfwWindowShouldClose(window)) {
         float currentTime = (float)glfwGetTime();
         float deltaTime = currentTime - lastFrameTime;
@@ -174,9 +216,48 @@ void renderTemporalCoherence(
             cKeyPressed = false;
         }
         
+        // Toggle temporal coherence with 'T' key
+        static bool tKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS && !tKeyPressed) {
+            disableTemporalCoherence = !disableTemporalCoherence;
+            std::cout << "\n=== Temporal coherence " << (disableTemporalCoherence ? "DISABLED" : "ENABLED") << " ==="<< std::endl;
+            if (disableTemporalCoherence) {
+                std::cout << "Mode: Update occlusion EVERY frame (baseline)" << std::endl;
+            } else {
+                std::cout << "Mode: Smart updates only when camera moves" << std::endl;
+                std::cout << "Current stats: " << occlusionUpdateCount << " updates in " << totalFrames 
+                         << " frames (" << std::fixed << std::setprecision(1) 
+                         << (100.0f * float(occlusionUpdateCount) / float(std::max(1, totalFrames))) 
+                         << "% update rate)" << std::endl;
+            }
+            // Reset counters when switching modes
+            occlusionUpdateCount = 0;
+            totalFrames = 0;
+            tKeyPressed = true;
+        } else if (glfwGetKey(window, GLFW_KEY_T) == GLFW_RELEASE) {
+            tKeyPressed = false;
+        }
+        
+        // Freeze/unfreeze PVS with 'F' key
+        static bool fKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS && !fKeyPressed) {
+            freezePVS = !freezePVS;
+            std::cout << "\n=== PVS " << (freezePVS ? "FROZEN" : "UNFROZEN") << " ===" << std::endl;
+            if (freezePVS) {
+                std::cout << "PVS updates disabled - continuously rendering same PVS" << std::endl;
+                std::cout << "Current PVS blocks: " << occlusionOutput.pvsPreviousCount << std::endl;
+            } else {
+                std::cout << "PVS updates resumed" << std::endl;
+            }
+            fKeyPressed = true;
+        } else if (glfwGetKey(window, GLFW_KEY_F) == GLFW_RELEASE) {
+            fKeyPressed = false;
+        }
+        
         // Reset temporal state with 'R' key
         if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
             occlusionOutput.isFirstFrame = true;
+            framesProcessed = 0;  // Reset frame counter for first-frame handling
             std::cout << "Temporal state reset" << std::endl;
         }
         
@@ -221,23 +302,50 @@ void renderTemporalCoherence(
         projMatrix[1][1] *= -1; // Flip Y for Vulkan
         glm::mat4 viewProjMatrix = projMatrix * viewMatrix;
         
-        // Wait for previous frame
-        VK_CHECK(vkWaitForFences(device, 1, &frameFence, VK_TRUE, UINT64_MAX));
-        VK_CHECK(vkResetFences(device, 1, &frameFence));
+        // DEBUG: Print frame info
+        static int frameCount = 0;
+        frameCount++;
         
-        // Clean up temporary resources from previous frame (after fence wait)
-        occlusionPass.cleanupIndirectTempResources();
-        transientPass.cleanupTempResources();
-        
-        // Read back PVS counts from GPU before cleaning up resources
-        occlusionOutput.readbackPVSCounts(device);
-        
-        // Clean up temporary resources from previous frame now that GPU is done
-        occlusionOutput.cleanupTempResources(device);
+        // NOTE: We don't call occlusionOutput.cleanupTempResources() here anymore 
+        // because we're managing the lifecycle ourselves to avoid destroying resources in use
         
         // Acquire swapchain image
         uint32_t imageIndex;
-        VK_CHECK(vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquireSemaphore, VK_NULL_HANDLE, &imageIndex));
+        // Use a simple round-robin for acquire semaphores since we just need one that's free
+        VK_CHECK(vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquireSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex));
+        
+        // Wait for this image's fence (from its previous use)
+        VK_CHECK(vkWaitForFences(device, 1, &frameFences[imageIndex], VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(device, 1, &frameFences[imageIndex]));
+        
+        // Read back and destroy resources associated with this image from its previous use
+        // Only destroy if resources are old enough (at least MAX_FRAMES_IN_FLIGHT frames old)
+        if (frameResources[imageIndex].hasResources) {
+            uint32_t framesSinceCreation = frameCount - frameResources[imageIndex].createdAtFrame;
+            
+            // Only destroy if old enough (at least 3 frames old to ensure GPU is done)
+            if (framesSinceCreation >= 3) {
+                // Only read back if we have a readback buffer
+                if (frameResources[imageIndex].occlusionTempResources.readbackBuffer.buffer) {
+                    // Temporarily restore the readback buffer to occlusionOutput for reading
+                    occlusionOutput.tempResources.readbackBuffer = frameResources[imageIndex].occlusionTempResources.readbackBuffer;
+                    occlusionOutput.readbackPVSCounts(device);
+                    occlusionOutput.tempResources.readbackBuffer = {};
+                }
+                
+                // Now destroy the saved temp resources
+                frameResources[imageIndex].occlusionTempResources.destroy(device);
+                frameResources[imageIndex].indirectTempResources.destroy(device);
+                frameResources[imageIndex].transientTempResources.destroy(device);
+                frameResources[imageIndex].hasResources = false;
+            }
+        }
+        
+        // Use the command buffer associated with this swapchain image
+        VkCommandBuffer commandBuffer = commandBuffers[imageIndex];
+        
+        // Reset descriptor pool for this frame
+        occlusionPass.beginFrame();
         
         // Begin command buffer
         VK_CHECK(vkResetCommandBuffer(commandBuffer, 0));
@@ -296,51 +404,103 @@ void renderTemporalCoherence(
         shadingParams.viewPos = cameraPos;
         shadingParams.enableDebugColors = enableDebugColors ? 1 : 0;
         
-        transientPass.renderPass1_PreviousVisible(
-            commandBuffer,
-            occlusionOutput,
-            minMaxOutput,
-            pushConstants,
-            viewProjMatrix,
-            cameraPos,
-            swapchainImageViews[imageIndex],
-            depthImage.imageView,
-            {swapchain.width, swapchain.height},
-            shadingParams
-        );
-        
-        // Step 2: Perform temporal occlusion culling against Pass 1's depth buffer
-        occlusionPass.performTemporalOcclusionCulling(
-            commandBuffer,
-            occlusionOutput,
-            minMaxOutput,
-            pushConstants,
-            viewProjMatrix,
-            depthImage.imageView,
-            {swapchain.width, swapchain.height}
-        );
-        
-        // Step 3: Render Pass 2 - Newly visible blocks (PVS difference)
-        transientPass.renderPass2_NewlyVisible(
-            commandBuffer,
-            occlusionOutput,
-            minMaxOutput,
-            pushConstants,
-            viewProjMatrix,
-            cameraPos,
-            swapchainImageViews[imageIndex],
-            depthImage.imageView,
-            {swapchain.width, swapchain.height},
-            shadingParams
-        );
-        
-        // Mark first frame as complete after rendering
-        if (occlusionOutput.isFirstFrame) {
-            occlusionOutput.isFirstFrame = false;
+        // Skip Pass 1 on the very first frame since there's no previous PVS
+        // For all other frames, render Pass 1 if there are blocks in the previous buffer
+        if ((!occlusionOutput.isFirstFrame && occlusionOutput.pvsPreviousCount > 0) || occlusionUpdated) {
+            transientPass.renderPass1_PreviousVisible(
+                commandBuffer,
+                occlusionOutput,
+                minMaxOutput,
+                pushConstants,
+                viewProjMatrix,
+                cameraPos,
+                swapchainImageViews[imageIndex],
+                depthImage.imageView,
+                {swapchain.width, swapchain.height},
+                shadingParams
+            );
         }
         
-        // Swap temporal buffers for next frame
-        occlusionOutput.swapTemporalBuffers();
+        // Step 2: Perform temporal occlusion culling against Pass 1's depth buffer (only when needed)
+        totalFrames++;
+        
+        // Skip occlusion updates if PVS is frozen
+        if (freezePVS) {
+            occlusionUpdated = false;
+        } else {
+            occlusionUpdated = occlusionPass.performTemporalOcclusionCulling(
+                commandBuffer,
+                occlusionOutput,
+                minMaxOutput,
+                pushConstants,
+                viewProjMatrix,
+                depthImage.imageView,
+                {swapchain.width, swapchain.height},
+                disableTemporalCoherence  // Force update if temporal coherence is disabled
+            );
+        }
+        
+        if (occlusionUpdated) {
+            occlusionUpdateCount++;
+            
+            // Always show stats, but with different formatting based on mode
+            if (disableTemporalCoherence) {
+                // When forcing updates every frame, show periodic stats
+                if (totalFrames % 60 == 0) {  // Report every second at 60fps
+                    printf("[Frame %d] Temporal coherence DISABLED - updating every frame (%d/%d, 0.0%% skip rate)\n", 
+                           totalFrames, occlusionUpdateCount, totalFrames);
+                }
+            } else {
+                // Smart mode - show why we updated
+                const char* reason = occlusionOutput.pvsChanged ? "PVS changed" : "Camera moved";
+                printf("[Frame %d] Occlusion culling performed (update %d/%d, %.1f%% skip rate) - %s\n", 
+                       totalFrames, occlusionUpdateCount, totalFrames,
+                       100.0f * (1.0f - float(occlusionUpdateCount) / float(totalFrames)),
+                       reason);
+                
+                // Report PVS stability if it's been stable for a while
+                if (occlusionOutput.framesWithStablePVS > 5) {
+                    printf("  -> PVS has been stable for %d frames (count=%d)\n", 
+                           occlusionOutput.framesWithStablePVS, occlusionOutput.pvsCurrentCount);
+                }
+            }
+        }
+        
+        // Step 3: Render Pass 2 - Newly visible blocks (PVS difference)
+        // On first few frames, always render Pass 2 to build up initial PVS
+        // After occlusion runs, the difference buffer will have all visible blocks
+        // For subsequent frames, only render if there are blocks in the difference buffer
+        if (occlusionOutput.frameIndex < 3 || occlusionUpdated || occlusionOutput.pvsDifferenceCount > 0) {
+            transientPass.renderPass2_NewlyVisible(
+                commandBuffer,
+                occlusionOutput,
+                minMaxOutput,
+                pushConstants,
+                viewProjMatrix,
+                cameraPos,
+                swapchainImageViews[imageIndex],
+                depthImage.imageView,
+                {swapchain.width, swapchain.height},
+                shadingParams
+            );
+        }
+        
+        // Keep first frame mode active for all frames in flight during startup
+        if (occlusionOutput.isFirstFrame) {
+            framesProcessed++;
+            // Only clear first frame flag after all frames in flight have been processed
+            if (framesProcessed >= swapchain.imageCount) {
+                occlusionOutput.isFirstFrame = false;
+            }
+        }
+        
+        // Only swap temporal buffers if occlusion was actually updated
+        // Otherwise we'd be swapping empty/stale buffers
+        // During first few frames, always swap to build up the buffers
+        // Never swap when PVS is frozen to maintain the same PVS
+        if (!freezePVS && (occlusionUpdated || occlusionOutput.frameIndex < 3)) {
+            occlusionOutput.swapTemporalBuffers();
+        }
         
         // Transition for present
         VkImageMemoryBarrier2 presentBarrier = imageBarrier(swapchain.images[imageIndex],
@@ -351,46 +511,101 @@ void renderTemporalCoherence(
         
         VK_CHECK(vkEndCommandBuffer(commandBuffer));
         
-        // Submit
+        // Submit using the current frame's semaphores and fence
         VkPipelineStageFlags submitStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &acquireSemaphore;
+        submitInfo.pWaitSemaphores = &acquireSemaphores[currentFrame];
         submitInfo.pWaitDstStageMask = &submitStageMask;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffer;
         submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &releaseSemaphore;
-        VK_CHECK(vkQueueSubmit(context.getQueue(), 1, &submitInfo, frameFence));
+        submitInfo.pSignalSemaphores = &releaseSemaphores[imageIndex];
+        VK_CHECK(vkQueueSubmit(context.getQueue(), 1, &submitInfo, frameFences[imageIndex]));
         
-        // Present
+        // Present using the release semaphore for this image
         VkPresentInfoKHR presentInfo = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         presentInfo.waitSemaphoreCount = 1;
-        presentInfo.pWaitSemaphores = &releaseSemaphore;
+        presentInfo.pWaitSemaphores = &releaseSemaphores[imageIndex];
         presentInfo.swapchainCount = 1;
         presentInfo.pSwapchains = &swapchain.swapchain;
         presentInfo.pImageIndices = &imageIndex;
         VK_CHECK(vkQueuePresentKHR(context.getQueue(), &presentInfo));
+        
+        frameResources[imageIndex].occlusionTempResources = occlusionOutput.tempResources;
+        occlusionOutput.tempResources = {}; // Clear the original so it doesn't get destroyed prematurely
+        frameResources[imageIndex].indirectTempResources = occlusionPass.getIndirectTempResources();
+        frameResources[imageIndex].transientTempResources = transientPass.getTempResources();
+        frameResources[imageIndex].hasResources = true;
+        frameResources[imageIndex].createdAtFrame = frameCount - 1;  // Record when created
+        
+        // Advance to next frame
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
     
-    // Wait for device idle
-    vkDeviceWaitIdle(device);
+        // Wait for device idle
+        vkDeviceWaitIdle(device);
+        
+        // Cleanup
+        // Clean up any remaining frame resources
+        for (auto& frame : frameResources) {
+            if (frame.hasResources) {
+                frame.occlusionTempResources.destroy(device);
+                frame.indirectTempResources.destroy(device);
+                frame.transientTempResources.destroy(device);
+            }
+        }
+        occlusionOutput.destroy(device);
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error in renderTemporalCoherence: " << e.what() << std::endl;
+    }
     
-    // Cleanup
-    occlusionOutput.destroy(device);
-    vkDestroyFence(device, frameFence, nullptr);
-    vkDestroySemaphore(device, releaseSemaphore, nullptr);
-    vkDestroySemaphore(device, acquireSemaphore, nullptr);
-    vkFreeCommandBuffers(device, context.getCommandPool(), 1, &commandBuffer);
+    // Cleanup all resources - safe to call even if not created
+    if (!commandBuffers.empty()) {
+        vkFreeCommandBuffers(device, context.getCommandPool(), commandBuffers.size(), commandBuffers.data());
+    }
+    
+    for (size_t i = 0; i < frameFences.size(); i++) {
+        if (frameFences[i] != VK_NULL_HANDLE) {
+            vkDestroyFence(device, frameFences[i], nullptr);
+        }
+    }
+    
+    for (size_t i = 0; i < releaseSemaphores.size(); i++) {
+        if (releaseSemaphores[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, releaseSemaphores[i], nullptr);
+        }
+    }
+    
+    for (uint32_t i = 0; i < acquireSemaphores.size(); i++) {
+        if (acquireSemaphores[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, acquireSemaphores[i], nullptr);
+        }
+    }
     
     for (auto imageView : swapchainImageViews) {
-        vkDestroyImageView(device, imageView, nullptr);
+        if (imageView != VK_NULL_HANDLE) {
+            vkDestroyImageView(device, imageView, nullptr);
+        }
     }
     
-    destroyImage(depthImage, device);
-    destroySwapchain(device, swapchain);
-    vkDestroySurfaceKHR(context.getInstance(), surface, nullptr);
-    glfwDestroyWindow(window);
+    if (depthImage.image != VK_NULL_HANDLE) {
+        destroyImage(depthImage, device);
+    }
+    
+    if (swapchain.swapchain != VK_NULL_HANDLE) {
+        destroySwapchain(device, swapchain);
+    }
+    
+    if (surface != VK_NULL_HANDLE) {
+        vkDestroySurfaceKHR(context.getInstance(), surface, nullptr);
+    }
+    
+    if (window) {
+        glfwDestroyWindow(window);
+    }
+    
     glfwTerminate();
 }
 
@@ -403,38 +618,46 @@ void renderTransientExtraction(
 ) {
     VkDevice device = context.getDevice();
     
-    // Create swapchain and window
+    // Initialize all resources to null for proper cleanup
     GLFWwindow* window = nullptr;
-    if (!glfwInit()) {
-        throw std::runtime_error("Failed to initialize GLFW");
-    }
-    
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    window = glfwCreateWindow(1280, 720, "MeshTrex Transient Renderer", nullptr, nullptr);
-    if (!window) {
-        glfwTerminate();
-        throw std::runtime_error("Failed to create window");
-    }
-    
-    // Create surface
-    VkSurfaceKHR surface = createSurface(context.getInstance(), window);
-    
-    // Create swapchain
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
     Swapchain swapchain{};
-    VkFormat swapchainFormat = getSwapchainFormat(context.getPhysicalDevice(), surface);
-    createSwapchain(swapchain, context.getPhysicalDevice(), device, surface, context.getGraphicsQueueFamilyIndex(), window, swapchainFormat, VK_NULL_HANDLE);
-    
-    // Create depth buffer
     Image depthImage{};
-    VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
-    createImage(depthImage, device, context.getMemoryProperties(), VK_IMAGE_TYPE_2D, swapchain.width, swapchain.height, 1, 1, depthFormat, 
-                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    std::vector<VkImageView> swapchainImageViews;
+    std::vector<VkSemaphore> acquireSemaphores;
+    std::vector<VkSemaphore> releaseSemaphores;
+    std::vector<VkFence> frameFences;
+    std::vector<VkCommandBuffer> commandBuffers;
     
-    // Create image views
-    std::vector<VkImageView> swapchainImageViews(swapchain.imageCount);
-    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
-        swapchainImageViews[i] = createImageView(device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
-    }
+    try {
+        // Create swapchain and window
+        if (!glfwInit()) {
+            throw std::runtime_error("Failed to initialize GLFW");
+        }
+        
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        window = glfwCreateWindow(1280, 720, "MeshTrex Transient Renderer", nullptr, nullptr);
+        if (!window) {
+            throw std::runtime_error("Failed to create window");
+        }
+        
+        // Create surface
+        surface = createSurface(context.getInstance(), window);
+        
+        // Create swapchain
+        VkFormat swapchainFormat = getSwapchainFormat(context.getPhysicalDevice(), surface);
+        createSwapchain(swapchain, context.getPhysicalDevice(), device, surface, context.getGraphicsQueueFamilyIndex(), window, swapchainFormat, VK_NULL_HANDLE);
+        
+        // Create depth buffer
+        VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
+        createImage(depthImage, device, context.getMemoryProperties(), VK_IMAGE_TYPE_2D, swapchain.width, swapchain.height, 1, 1, depthFormat, 
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+        
+        // Create image views
+        swapchainImageViews.resize(swapchain.imageCount);
+        for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+            swapchainImageViews[i] = createImageView(device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
+        }
     
     // Camera state - properly initialized for better viewing
     glm::vec3 volumeCenter = glm::vec3(128.0f, 128.0f, 128.0f);  // Typical center for 256^3 volumes
@@ -453,20 +676,35 @@ void renderTransientExtraction(
     float lastFrameTime = 0.0f;
     
     // Create synchronization objects
-    VkSemaphore acquireSemaphore = createSemaphore(device);
-    VkSemaphore releaseSemaphore = createSemaphore(device);
-    VkFenceCreateInfo fenceCreateInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    VkFence frameFence = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFence));
+    // We need more acquire semaphores than swapchain images to avoid reuse conflicts
+    acquireSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+    // Release semaphores are per swapchain image
+    releaseSemaphores.resize(swapchain.imageCount);
     
-    // Allocate command buffer
-    VkCommandBuffer commandBuffer;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        acquireSemaphores[i] = createSemaphore(device);
+    }
+    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+        releaseSemaphores[i] = createSemaphore(device);
+    }
+    
+    // Fences are per swapchain image
+    frameFences.resize(swapchain.imageCount);
+    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+        VkFenceCreateInfo fenceCreateInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFences[i]));
+    }
+    
+    uint32_t currentFrame = 0;  // Track which set of sync objects to use
+    
+    // Allocate command buffers - one per frame to avoid conflicts
+    commandBuffers.resize(swapchain.imageCount);
     VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = context.getCommandPool();
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer));
+    allocInfo.commandBufferCount = swapchain.imageCount;
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()));
     
     // Main render loop
     while (!glfwWindowShouldClose(window)) {
@@ -532,11 +770,11 @@ void renderTransientExtraction(
         lastMouseX = mouseX;
         lastMouseY = mouseY;
         
-        VK_CHECK(vkWaitForFences(device, 1, &frameFence, VK_TRUE, UINT64_MAX));
-        VK_CHECK(vkResetFences(device, 1, &frameFence));
+        VK_CHECK(vkWaitForFences(device, 1, &frameFences[currentFrame], VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(device, 1, &frameFences[currentFrame]));
         
         uint32_t imageIndex;
-        VkResult result = vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquireSemaphore, VK_NULL_HANDLE, &imageIndex);
+        VkResult result = vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquireSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
         if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(device);
             // Recreate swapchain
@@ -581,6 +819,9 @@ void renderTransientExtraction(
         TransientExtractionPushConstants renderConstants;
         renderConstants.viewProj = viewProj;
         extractFrustumPlanes(viewProj, renderConstants.frustumPlanes);
+        
+        // Use the current frame's command buffer
+        VkCommandBuffer commandBuffer = commandBuffers[currentFrame];
         
         // Record command buffer
         VK_CHECK(vkResetCommandBuffer(commandBuffer, 0));
@@ -700,22 +941,22 @@ void renderTransientExtraction(
         VkPipelineStageFlags submitStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &acquireSemaphore;
+        submitInfo.pWaitSemaphores = &acquireSemaphores[currentFrame];
         submitInfo.pWaitDstStageMask = &submitStageMask;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffer;
         submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &releaseSemaphore;
+        submitInfo.pSignalSemaphores = &releaseSemaphores[currentFrame];
         
-        VK_CHECK(vkQueueSubmit(context.getQueue(), 1, &submitInfo, frameFence));
+        VK_CHECK(vkQueueSubmit(context.getQueue(), 1, &submitInfo, frameFences[currentFrame]));
         
         // Clean up temporary resources after submission
         // Note: Temp resources from extractAndRenderTransient are cleaned up internally
         
-        // Present
+        // Present using the current frame's release semaphore
         VkPresentInfoKHR presentInfo = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         presentInfo.waitSemaphoreCount = 1;
-        presentInfo.pWaitSemaphores = &releaseSemaphore;
+        presentInfo.pWaitSemaphores = &releaseSemaphores[currentFrame];
         presentInfo.swapchainCount = 1;
         presentInfo.pSwapchains = &swapchain.swapchain;
         presentInfo.pImageIndices = &imageIndex;
@@ -726,23 +967,63 @@ void renderTransientExtraction(
         } else {
             assert(result == VK_SUCCESS);
         }
+        
+        // Advance to next frame
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
     
-    vkDeviceWaitIdle(device);
+        vkDeviceWaitIdle(device);
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error in renderTransientExtraction: " << e.what() << std::endl;
+    }
     
-    // Cleanup
-    vkFreeCommandBuffers(device, context.getCommandPool(), 1, &commandBuffer);
-    vkDestroyFence(device, frameFence, nullptr);
-    vkDestroySemaphore(device, releaseSemaphore, nullptr);
-    vkDestroySemaphore(device, acquireSemaphore, nullptr);
+    // Cleanup - safe to call even if resources weren't created
+    if (!commandBuffers.empty()) {
+        vkFreeCommandBuffers(device, context.getCommandPool(), commandBuffers.size(), commandBuffers.data());
+    }
+    
+    // Destroy all synchronization objects
+    for (size_t i = 0; i < frameFences.size(); i++) {
+        if (frameFences[i] != VK_NULL_HANDLE) {
+            vkDestroyFence(device, frameFences[i], nullptr);
+        }
+    }
+    
+    for (size_t i = 0; i < releaseSemaphores.size(); i++) {
+        if (releaseSemaphores[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, releaseSemaphores[i], nullptr);
+        }
+    }
+    
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        if (i < acquireSemaphores.size() && acquireSemaphores[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, acquireSemaphores[i], nullptr);
+        }
+    }
     
     for (auto& view : swapchainImageViews) {
-        vkDestroyImageView(device, view, nullptr);
+        if (view != VK_NULL_HANDLE) {
+            vkDestroyImageView(device, view, nullptr);
+        }
     }
-    destroyImage(depthImage, device);
-    destroySwapchain(device, swapchain);
-    vkDestroySurfaceKHR(context.getInstance(), surface, nullptr);
-    glfwDestroyWindow(window);
+    
+    if (depthImage.image != VK_NULL_HANDLE) {
+        destroyImage(depthImage, device);
+    }
+    
+    if (swapchain.swapchain != VK_NULL_HANDLE) {
+        destroySwapchain(device, swapchain);
+    }
+    
+    if (surface != VK_NULL_HANDLE) {
+        vkDestroySurfaceKHR(context.getInstance(), surface, nullptr);
+    }
+    
+    if (window) {
+        glfwDestroyWindow(window);
+    }
+    
     glfwTerminate();
     
     // Cleanup transient extraction static resources
@@ -784,6 +1065,7 @@ int main(int argc, char** argv) {
     try {
         bool pmb = false; // Use regular marching cubes for transient rendering
         // Parse command line arguments
+        bool disableCoherenceOptimization = false;
         bool useDensityDispatch = false;
         bool useTransientExtraction = true;
         bool useTemporalCoherence = true;
@@ -815,9 +1097,19 @@ int main(int argc, char** argv) {
                          << "  --density-dispatch    Enable density-based dispatch\n"
                          << "  --transient          Enable transient extraction (on-the-fly rendering)\n"
                          << "  --temporal           Enable temporal coherence rendering (two-pass approach)\n"
+                         << "  --no-coherence-opt   Disable temporal coherence optimization (force occlusion test every frame)\n"
                          << "  --volume <path>      Path to volume file\n"
                          << "  --isovalue <value>   Isovalue for surface extraction\n"
-                         << "  --help               Show this help message\n";
+                         << "  --help               Show this help message\n"
+                         << "\nRuntime controls:\n"
+                         << "  T                    Toggle temporal coherence optimization on/off\n"
+                         << "  F                    Freeze/unfreeze PVS updates (debug visualization)\n"
+                         << "  R                    Reset temporal state\n"
+                         << "  C                    Toggle debug colors\n"
+                         << "  W/S                  Zoom in/out\n"
+                         << "  A/D                  Pan left/right\n"
+                         << "  Q/E                  Pan up/down\n"
+                         << "  Mouse drag           Rotate camera\n";
                 return 0;
             }
         }
@@ -928,13 +1220,8 @@ int main(int argc, char** argv) {
                     extractionResultGPU.tempResources.cleanup();
                 }
                 
-                if (useTransientExtraction) {
-                    // For transient extraction, keep min-max and filtering results for rendering
-                    // They will be cleaned up after rendering
-                } else {
-                    minMaxOutput.cleanup(context.getDevice());
-                    filteringResult.cleanup(context.getDevice());
-                }
+                // Don't cleanup here - resources are still needed for rendering
+                // Cleanup will happen after rendering completes
                                 
                 if (!useTransientExtraction) {
                     profiler.setExtractionStats(
@@ -955,7 +1242,7 @@ int main(int argc, char** argv) {
                     if (useTemporalCoherence) {
                         // Temporal coherence rendering with two-pass approach
                         std::cout << "\n--- Starting Temporal Coherence Renderer ---" << std::endl;
-                        renderTemporalCoherence(context, minMaxOutput, pushConstants, pmb);
+                        renderTemporalCoherence(context, minMaxOutput, pushConstants, pmb, disableCoherenceOptimization);
                     } else {
                         // Standard transient extraction - render on-the-fly without storing geometry
                         std::cout << "\n--- Starting Transient Renderer ---" << std::endl;
@@ -969,8 +1256,16 @@ int main(int argc, char** argv) {
                     std::cout << "\n--- Starting Persistent Renderer ---" << std::endl;
                     RenderingManager renderingManager(context);
                     renderingManager.render(extractionResultGPU);
+                    
+                    // Cleanup min-max and filtering results after persistent rendering
+                    minMaxOutput.cleanup(context.getDevice());
+                    filteringResult.cleanup(context.getDevice());
                 } else {
                     std::cout << "\nSkipping rendering as no meshlets were generated." << std::endl;
+                    
+                    // Still need to cleanup even if no rendering happened
+                    minMaxOutput.cleanup(context.getDevice());
+                    filteringResult.cleanup(context.getDevice());
                 }
                 
                 
@@ -1033,7 +1328,7 @@ int main(int argc, char** argv) {
                     if (useTemporalCoherence) {
                         // Temporal coherence rendering with two-pass approach
                         std::cout << "\n--- Starting Temporal Coherence Renderer ---" << std::endl;
-                        renderTemporalCoherence(context, minMaxOutput, pushConstants, pmb);
+                        renderTemporalCoherence(context, minMaxOutput, pushConstants, pmb, disableCoherenceOptimization);
                     } else {
                         // Standard transient extraction - render on-the-fly without storing geometry
                         std::cout << "\n--- Starting Transient Renderer ---" << std::endl;
@@ -1047,16 +1342,24 @@ int main(int argc, char** argv) {
                     std::cout << "\n--- Starting Persistent Renderer ---" << std::endl;
                     RenderingManager renderingManager(context);
                     renderingManager.render(extractionResultGPU);
+                    
+                    // Cleanup min-max and filtering results after persistent rendering
+                    minMaxOutput.cleanup(context.getDevice());
+                    filteringResult.cleanup(context.getDevice());
                 } else {
                     std::cout << "\nSkipping rendering as no meshlets were generated." << std::endl;
+                    
+                    // Still need to cleanup even if no rendering happened
+                    minMaxOutput.cleanup(context.getDevice());
+                    filteringResult.cleanup(context.getDevice());
                 }
             } catch (std::exception& e) {
                 std::cout << e.what() << std::endl;
+                // Cleanup resources in case of exception
+                minMaxOutput.cleanup(context.getDevice());
+                filteringResult.cleanup(context.getDevice());
             }
         }
-        
-        // Note: filteringResult and minMaxOutput cleanup happens automatically
-        // when they go out of scope at the end of main()
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;

@@ -249,6 +249,7 @@ VkDevice createDevice(VkInstance instance, VkPhysicalDevice physicalDevice,
     features.features.shaderInt64 = true;
     features.features.samplerAnisotropy = true;
     features.features.shaderStorageImageWriteWithoutFormat = true;
+    features.features.fragmentStoresAndAtomics = true;  // Required for raster occlusion pass
 
     VkPhysicalDeviceVulkan11Features features11 = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};

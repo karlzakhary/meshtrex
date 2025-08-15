@@ -86,7 +86,7 @@ void ActiveBlockFilteringPass::createPipeline(const char* shaderPath) {
 
 void ActiveBlockFilteringPass::recordDispatch(VkCommandBuffer cmd,
                                            VkImageView minMaxImageView,
-                                           VkSampler sampler,
+                                           VkSampler& sampler,
                                            const Buffer& compactedBlockIdBuffer,
                                            const Buffer& activeBlockCountBuffer,
                                            const PushConstants& pushConstants) const

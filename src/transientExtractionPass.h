@@ -6,6 +6,7 @@
 #include <memory>
 #include <glm/glm.hpp>
 #include "buffer.h"
+#include "marchingCubesUtils.h"
 
 class VulkanContext;
 struct MinMaxOutput;
@@ -90,65 +91,29 @@ public:
     // Temporary resources that need to be kept alive until command buffer submission
     struct TempResources {
         // Resources from Pass 1
-        VkSampler volumeSampler_pass1 = VK_NULL_HANDLE;
-        VkSampler minMaxSampler_pass1 = VK_NULL_HANDLE;
+        // Note: minMaxSampler is owned by MinMaxOutput, not tracked here
+        // Note: viewUniformBuffer is now persistent, not tracked here
         VkDescriptorPool descriptorPool_pass1 = VK_NULL_HANDLE;
-        VkBuffer viewUniformBuffer_pass1 = VK_NULL_HANDLE;
-        VkDeviceMemory viewUniformMemory_pass1 = VK_NULL_HANDLE;
         
         // Resources from Pass 2
-        VkSampler volumeSampler_pass2 = VK_NULL_HANDLE;
-        VkSampler minMaxSampler_pass2 = VK_NULL_HANDLE;
+        // Note: minMaxSampler is owned by MinMaxOutput, not tracked here
+        // Note: viewUniformBuffer is now persistent, not tracked here
         VkDescriptorPool descriptorPool_pass2 = VK_NULL_HANDLE;
-        VkBuffer viewUniformBuffer_pass2 = VK_NULL_HANDLE;
-        VkDeviceMemory viewUniformMemory_pass2 = VK_NULL_HANDLE;
         
         // Resources from indirect update compute
         VkDescriptorPool descriptorPool_indirectUpdate = VK_NULL_HANDLE;
         
         void destroy(VkDevice device) {
             // Clean up Pass 1 resources
-            if (volumeSampler_pass1) {
-                vkDestroySampler(device, volumeSampler_pass1, nullptr);
-                volumeSampler_pass1 = VK_NULL_HANDLE;
-            }
-            if (minMaxSampler_pass1) {
-                vkDestroySampler(device, minMaxSampler_pass1, nullptr);
-                minMaxSampler_pass1 = VK_NULL_HANDLE;
-            }
             if (descriptorPool_pass1) {
                 vkDestroyDescriptorPool(device, descriptorPool_pass1, nullptr);
                 descriptorPool_pass1 = VK_NULL_HANDLE;
             }
-            if (viewUniformBuffer_pass1) {
-                vkDestroyBuffer(device, viewUniformBuffer_pass1, nullptr);
-                viewUniformBuffer_pass1 = VK_NULL_HANDLE;
-            }
-            if (viewUniformMemory_pass1) {
-                vkFreeMemory(device, viewUniformMemory_pass1, nullptr);
-                viewUniformMemory_pass1 = VK_NULL_HANDLE;
-            }
             
             // Clean up Pass 2 resources
-            if (volumeSampler_pass2) {
-                vkDestroySampler(device, volumeSampler_pass2, nullptr);
-                volumeSampler_pass2 = VK_NULL_HANDLE;
-            }
-            if (minMaxSampler_pass2) {
-                vkDestroySampler(device, minMaxSampler_pass2, nullptr);
-                minMaxSampler_pass2 = VK_NULL_HANDLE;
-            }
             if (descriptorPool_pass2) {
                 vkDestroyDescriptorPool(device, descriptorPool_pass2, nullptr);
                 descriptorPool_pass2 = VK_NULL_HANDLE;
-            }
-            if (viewUniformBuffer_pass2) {
-                vkDestroyBuffer(device, viewUniformBuffer_pass2, nullptr);
-                viewUniformBuffer_pass2 = VK_NULL_HANDLE;
-            }
-            if (viewUniformMemory_pass2) {
-                vkFreeMemory(device, viewUniformMemory_pass2, nullptr);
-                viewUniformMemory_pass2 = VK_NULL_HANDLE;
             }
             
             // Clean up indirect update resources
@@ -164,10 +129,25 @@ public:
         tempResources_.destroy(device_);
         tempResources_ = {}; // Reset to null handles
     }
+    
+    // Get temp resources for deferred destruction
+    TempResources getTempResources() {
+        TempResources resources = tempResources_;
+        tempResources_ = {}; // Clear the original
+        return resources;
+    }
 
 private:
     const VulkanContext& context_;
     VkDevice device_;
+    
+    // Persistent resources - created once, reused across frames
+    // Note: We use the minMaxSampler from MinMaxOutput instead of creating our own
+    Buffer persistentViewUniformBuffer_pass1_{};
+    Buffer persistentViewUniformBuffer_pass2_{};
+    
+    void createPersistentResources();
+    void destroyPersistentResources();
     
     // Pipeline for pass 1 (PVS_prev)
     VkPipeline pass1Pipeline_ = VK_NULL_HANDLE;
@@ -192,8 +172,7 @@ private:
     VkShaderModule indirectUpdateComputeShader_ = VK_NULL_HANDLE;  // Compute shader for indirect draw updates
     
     // Shading parameters buffer
-    VkBuffer shadingParamsBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory shadingParamsMemory_ = VK_NULL_HANDLE;
+    Buffer shadingParamsBuffer_{};
     
     // Swapchain format
     VkFormat swapchainFormat_;
@@ -202,12 +181,7 @@ private:
     bool bypassPVS_ = false;  // Set to true to bypass occlusion culling
     
     // Marching cubes lookup tables as TBOs
-    struct MarchingCubesTables {
-        Buffer numVerticesBuffer;     // Buffer for numUniqueVerticesTable or numVerticesTable
-        Buffer triTableBuffer;         // Buffer for uniqueTriTable or triTable
-        bool isUnique = false;  // Whether using unique or standard tables
-    };
-    MarchingCubesTables mcTables_;
+    MarchingCubesTables mcTables_;  // Using shared struct from marchingCubesUtils.h
     
     // Indirect draw buffers for GPU-driven rendering
     Buffer indirectDrawBuffer_ = {};  // Contains VkDrawMeshTasksIndirectCommandEXT structs
@@ -218,8 +192,7 @@ private:
     void createPipelines();
     void loadShaders();
     void createShadingParametersBuffer();
-    void createMarchingCubesTables(bool useUniqueTables = false);
-    void destroyMarchingCubesTables();
+    void setupMarchingCubesTables(bool useUniqueTables = false);
     void createIndirectDrawBuffer();
     void createIndirectUpdatePipeline();
     void updateIndirectDrawBuffer(VkCommandBuffer cmd, 
@@ -232,12 +205,11 @@ private:
     VkDescriptorSet createPassDescriptorSet(
         VkDescriptorPool pool,
         VkDescriptorSetLayout layout,
-        VkBuffer viewUniformBuffer,
+        const Buffer& viewUniformBuffer,
         VkImageView minMaxImageView,
         VkSampler minMaxSampler,
         VkImageView volumeImageView,
-        VkSampler volumeSampler,
-        VkBuffer pvsBuffer,  // Either pvsPrev or pvsDifference
+        const Buffer& pvsBuffer,  // Either pvsPrev or pvsDifference
         uint32_t bindingIndex  // 14 for pvsPrev, 15 for pvsDifference
     );
 };
