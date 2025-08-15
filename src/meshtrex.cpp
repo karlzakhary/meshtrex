@@ -152,6 +152,7 @@ void renderTemporalCoherence(
     // Main render loop
     bool enableDebugColors = false;
     bool disableTemporalCoherence = disableCoherenceOptimization;  // Flag to force occlusion updates every frame
+    bool freezePVS = false;  // Flag to freeze PVS updates for debugging
     int framesProcessed = 0;  // Track frames processed for first-frame handling
     int occlusionUpdateCount = 0;  // Track occlusion updates for statistics
     int totalFrames = 0;  // Total frames rendered
@@ -235,6 +236,22 @@ void renderTemporalCoherence(
             tKeyPressed = true;
         } else if (glfwGetKey(window, GLFW_KEY_T) == GLFW_RELEASE) {
             tKeyPressed = false;
+        }
+        
+        // Freeze/unfreeze PVS with 'F' key
+        static bool fKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS && !fKeyPressed) {
+            freezePVS = !freezePVS;
+            std::cout << "\n=== PVS " << (freezePVS ? "FROZEN" : "UNFROZEN") << " ===" << std::endl;
+            if (freezePVS) {
+                std::cout << "PVS updates disabled - continuously rendering same PVS" << std::endl;
+                std::cout << "Current PVS blocks: " << occlusionOutput.pvsPreviousCount << std::endl;
+            } else {
+                std::cout << "PVS updates resumed" << std::endl;
+            }
+            fKeyPressed = true;
+        } else if (glfwGetKey(window, GLFW_KEY_F) == GLFW_RELEASE) {
+            fKeyPressed = false;
         }
         
         // Reset temporal state with 'R' key
@@ -407,16 +424,21 @@ void renderTemporalCoherence(
         // Step 2: Perform temporal occlusion culling against Pass 1's depth buffer (only when needed)
         totalFrames++;
         
-        occlusionUpdated = occlusionPass.performTemporalOcclusionCulling(
-            commandBuffer,
-            occlusionOutput,
-            minMaxOutput,
-            pushConstants,
-            viewProjMatrix,
-            depthImage.imageView,
-            {swapchain.width, swapchain.height},
-            disableTemporalCoherence  // Force update if temporal coherence is disabled
-        );
+        // Skip occlusion updates if PVS is frozen
+        if (freezePVS) {
+            occlusionUpdated = false;
+        } else {
+            occlusionUpdated = occlusionPass.performTemporalOcclusionCulling(
+                commandBuffer,
+                occlusionOutput,
+                minMaxOutput,
+                pushConstants,
+                viewProjMatrix,
+                depthImage.imageView,
+                {swapchain.width, swapchain.height},
+                disableTemporalCoherence  // Force update if temporal coherence is disabled
+            );
+        }
         
         if (occlusionUpdated) {
             occlusionUpdateCount++;
@@ -475,7 +497,8 @@ void renderTemporalCoherence(
         // Only swap temporal buffers if occlusion was actually updated
         // Otherwise we'd be swapping empty/stale buffers
         // During first few frames, always swap to build up the buffers
-        if (occlusionUpdated || occlusionOutput.frameIndex < 3) {
+        // Never swap when PVS is frozen to maintain the same PVS
+        if (!freezePVS && (occlusionUpdated || occlusionOutput.frameIndex < 3)) {
             occlusionOutput.swapTemporalBuffers();
         }
         
@@ -1080,6 +1103,8 @@ int main(int argc, char** argv) {
                          << "  --help               Show this help message\n"
                          << "\nRuntime controls:\n"
                          << "  T                    Toggle temporal coherence optimization on/off\n"
+                         << "  F                    Freeze/unfreeze PVS updates (debug visualization)\n"
+                         << "  R                    Reset temporal state\n"
                          << "  C                    Toggle debug colors\n"
                          << "  W/S                  Zoom in/out\n"
                          << "  A/D                  Pan left/right\n"

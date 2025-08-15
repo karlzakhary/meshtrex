@@ -105,13 +105,14 @@ void main() {
             vec2 clampedMin = clamp(screenMin, vec2(-1.0), vec2(1.0));
             vec2 clampedMax = clamp(screenMax, vec2(-1.0), vec2(1.0));
             
-            // Use conservative depth offset to prevent z-fighting
-            float conservativeZ = minZ - 0.001;
+            // Use the farthest depth (maxZ) for occlusion testing
+            // This ensures the proxy quad is occluded if any part of the block is behind existing geometry
+            float occlusionZ = minZ;
             
-            gl_MeshVerticesEXT[vertexBase + 0].gl_Position = vec4(clampedMin.x, clampedMin.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 1].gl_Position = vec4(clampedMax.x, clampedMin.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 2].gl_Position = vec4(clampedMin.x, clampedMax.y, conservativeZ, 1.0);
-            gl_MeshVerticesEXT[vertexBase + 3].gl_Position = vec4(clampedMax.x, clampedMax.y, conservativeZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 0].gl_Position = vec4(clampedMin.x, clampedMin.y, occlusionZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 1].gl_Position = vec4(clampedMax.x, clampedMin.y, occlusionZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 2].gl_Position = vec4(clampedMin.x, clampedMax.y, occlusionZ, 1.0);
+            gl_MeshVerticesEXT[vertexBase + 3].gl_Position = vec4(clampedMax.x, clampedMax.y, occlusionZ, 1.0);
             
             gl_PrimitiveTriangleIndicesEXT[primitiveBase + 0] = uvec3(vertexBase + 0, vertexBase + 1, vertexBase + 2);
             gl_PrimitiveTriangleIndicesEXT[primitiveBase + 1] = uvec3(vertexBase + 1, vertexBase + 3, vertexBase + 2);
