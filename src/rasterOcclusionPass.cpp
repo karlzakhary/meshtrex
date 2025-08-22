@@ -257,7 +257,7 @@ void RasterOcclusionPass::createOcclusionPipeline() {
     VkPipelineDepthStencilStateCreateInfo depthStencilState{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depthStencilState.depthTestEnable = VK_TRUE;
     depthStencilState.depthWriteEnable = VK_FALSE; // Don't write to depth
-    depthStencilState.depthCompareOp = VK_COMPARE_OP_LESS;
+    depthStencilState.depthCompareOp = VK_COMPARE_OP_GREATER;  // Reversed-Z: greater values are closer
     
     // Color blend state - no color output
     VkPipelineColorBlendStateCreateInfo colorBlendState{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
@@ -680,17 +680,21 @@ void RasterOcclusionPass::Output::swapTemporalBuffers() {
 }
 
 void RasterOcclusionPass::Output::copyCurrentToPrevious(VkDevice device, VkCommandBuffer cmd) {
-    // Copy current bitfield to previous bitfield
-    VkBufferCopy bitfieldCopy{};
-    bitfieldCopy.size = currentBitfieldBuffer.size;
-    vkCmdCopyBuffer(cmd, currentBitfieldBuffer.buffer, previousBitfieldBuffer.buffer, 1, &bitfieldCopy);
+    // Copy current bitfield to previous bitfield (only if buffers exist - may not exist in compute-only mode)
+    if (currentBitfieldBuffer.buffer != VK_NULL_HANDLE && previousBitfieldBuffer.buffer != VK_NULL_HANDLE) {
+        VkBufferCopy bitfieldCopy{};
+        bitfieldCopy.size = currentBitfieldBuffer.size;
+        vkCmdCopyBuffer(cmd, currentBitfieldBuffer.buffer, previousBitfieldBuffer.buffer, 1, &bitfieldCopy);
+    }
     
-    // Copy current PVS to previous PVS
+    // Copy current PVS to previous PVS (check for null in case of compute-only initialization)
     // Copy the entire buffer to ensure all data is transferred
     // The buffer size includes space for the count + all block indices
-    VkBufferCopy pvsCopy{};
-    pvsCopy.size = pvsCurrentBuffer.size;
-    vkCmdCopyBuffer(cmd, pvsCurrentBuffer.buffer, pvsPreviousBuffer.buffer, 1, &pvsCopy);
+    if (pvsCurrentBuffer.buffer != VK_NULL_HANDLE && pvsPreviousBuffer.buffer != VK_NULL_HANDLE) {
+        VkBufferCopy pvsCopy{};
+        pvsCopy.size = pvsCurrentBuffer.size;
+        vkCmdCopyBuffer(cmd, pvsCurrentBuffer.buffer, pvsPreviousBuffer.buffer, 1, &pvsCopy);
+    }
     
     // Memory barrier to ensure copies complete
     VkMemoryBarrier2 copyBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};

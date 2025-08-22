@@ -78,8 +78,8 @@ void main() {
         
         vec2 screenMin = vec2(2.0);
         vec2 screenMax = vec2(-2.0);
-        float minZ = 1.0;
-        float maxZ = -1.0;
+        float minZ = 1.0;  // Reversed-Z: farthest point
+        float maxZ = 0.0;  // Reversed-Z: closest point (initialized to far plane)
         bool hasVisibleVertex = false;
         
         for (uint i = 0; i < 8; i++) {
@@ -105,9 +105,9 @@ void main() {
             vec2 clampedMin = clamp(screenMin, vec2(-1.0), vec2(1.0));
             vec2 clampedMax = clamp(screenMax, vec2(-1.0), vec2(1.0));
             
-            // Use the farthest depth (maxZ) for occlusion testing
-            // This ensures the proxy quad is occluded if any part of the block is behind existing geometry
-            float occlusionZ = minZ;
+            // Reversed-Z: Use the closest depth (maxZ) for occlusion testing
+            // With reversed-Z, higher values are closer to the camera
+            float occlusionZ = maxZ;
             
             gl_MeshVerticesEXT[vertexBase + 0].gl_Position = vec4(clampedMin.x, clampedMin.y, occlusionZ, 1.0);
             gl_MeshVerticesEXT[vertexBase + 1].gl_Position = vec4(clampedMax.x, clampedMin.y, occlusionZ, 1.0);

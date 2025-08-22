@@ -210,13 +210,13 @@ void TransientExtractionPass::createPipelines() {
     VkPipelineDepthStencilStateCreateInfo pass1DepthStencilState{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     pass1DepthStencilState.depthTestEnable = VK_TRUE;
     pass1DepthStencilState.depthWriteEnable = VK_TRUE;
-    pass1DepthStencilState.depthCompareOp = VK_COMPARE_OP_LESS;
+    pass1DepthStencilState.depthCompareOp = VK_COMPARE_OP_GREATER;  // Reversed-Z: greater values are closer
     
     // Pass 2: Depth test with LESS (only newly visible parts)
     VkPipelineDepthStencilStateCreateInfo pass2DepthStencilState{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     pass2DepthStencilState.depthTestEnable = VK_TRUE;
     pass2DepthStencilState.depthWriteEnable = VK_TRUE;
-    pass2DepthStencilState.depthCompareOp = VK_COMPARE_OP_LESS;
+    pass2DepthStencilState.depthCompareOp = VK_COMPARE_OP_GREATER;  // Reversed-Z: greater values are closer
     
     VkPipelineColorBlendAttachmentState colorBlendAttachment{};
     colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | 
@@ -727,7 +727,7 @@ void TransientExtractionPass::renderPass1_PreviousVisible(
     depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;    // Clear depth for Pass 1
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    depthAttachment.clearValue.depthStencil = {1.0f, 0};
+    depthAttachment.clearValue.depthStencil = {0.0f, 0};  // Reversed-Z: clear to far plane
     
     VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
     renderingInfo.renderArea = scissor;

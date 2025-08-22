@@ -136,6 +136,9 @@ public:
         indirectTempResources_.destroy(device_);
     }
 
+    // Initialize output for first frame
+    void initializeOutput(Output& output, uint32_t numBlocks);
+
 private:
     const VulkanContext& context_;
     VkDevice device_;
@@ -199,9 +202,6 @@ private:
     void createVisibilityBuffer(Output& output, uint32_t numBlocks);
     void createBitfieldBuffers(Output& output, uint32_t numBlocks);
     void createPVSBuffers(Output& output, uint32_t maxBlocks);
-    
-    // Initialize output for first frame
-    void initializeOutput(Output& output, uint32_t numBlocks);
     
     // Indirect draw helpers
     void createIndirectDrawBuffer();

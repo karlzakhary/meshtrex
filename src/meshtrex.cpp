@@ -16,6 +16,7 @@
 #include <dlfcn.h>
 #include "renderdoc_app.h"
 #include "rasterOcclusionPass.h"
+#include "computeOcclusionPass.h"
 #include "transientExtractionPass.h"
 
 #include "vulkan_context.h"
@@ -73,10 +74,10 @@ void renderTemporalCoherence(
         VkFormat swapchainFormat = getSwapchainFormat(context.getPhysicalDevice(), surface);
         createSwapchain(swapchain, context.getPhysicalDevice(), device, surface, context.getGraphicsQueueFamilyIndex(), window, swapchainFormat, VK_NULL_HANDLE);
         
-        // Create depth buffer
+        // Create depth buffer (with sampled bit for Hi-Z generation)
         VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
         createImage(depthImage, device, context.getMemoryProperties(), VK_IMAGE_TYPE_2D, swapchain.width, swapchain.height, 1, 1, depthFormat, 
-                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         
         // Create image views
         swapchainImageViews.resize(swapchain.imageCount);
@@ -145,7 +146,8 @@ void renderTemporalCoherence(
     };
     std::vector<FrameResources> frameResources(swapchain.imageCount);
     
-    RasterOcclusionPass occlusionPass(context);
+    RasterOcclusionPass rasterOcclusionPass(context);
+    ComputeOcclusionPass computeOcclusionPass(context);
     TransientExtractionPass transientPass(context, swapchainFormat);
     occlusionOutput.isFirstFrame = true;
     
@@ -153,6 +155,7 @@ void renderTemporalCoherence(
     bool enableDebugColors = false;
     bool disableTemporalCoherence = disableCoherenceOptimization;  // Flag to force occlusion updates every frame
     bool freezePVS = false;  // Flag to freeze PVS updates for debugging
+    bool useComputeOcclusion = true;  // Toggle between raster and compute occlusion
     int framesProcessed = 0;  // Track frames processed for first-frame handling
     int occlusionUpdateCount = 0;  // Track occlusion updates for statistics
     int totalFrames = 0;  // Total frames rendered
@@ -254,6 +257,24 @@ void renderTemporalCoherence(
             fKeyPressed = false;
         }
         
+        // Toggle occlusion method with 'O' key
+        static bool oKeyPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS && !oKeyPressed) {
+            useComputeOcclusion = !useComputeOcclusion;
+            std::cout << "\n=== Occlusion method: " << (useComputeOcclusion ? "COMPUTE (Hi-Z)" : "RASTER") << " ===" << std::endl;
+            if (useComputeOcclusion) {
+                std::cout << "Using compute-based Hi-Z occlusion culling" << std::endl;
+            } else {
+                std::cout << "Using raster-based proxy quad occlusion culling" << std::endl;
+            }
+            // Reset occlusion state when switching methods
+            occlusionOutput.isFirstFrame = true;
+            framesProcessed = 0;
+            oKeyPressed = true;
+        } else if (glfwGetKey(window, GLFW_KEY_O) == GLFW_RELEASE) {
+            oKeyPressed = false;
+        }
+        
         // Reset temporal state with 'R' key
         if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
             occlusionOutput.isFirstFrame = true;
@@ -298,16 +319,21 @@ void renderTemporalCoherence(
         
         // Compute matrices
         glm::mat4 viewMatrix = glm::lookAt(cameraPos, cameraTarget, cameraUp);
+        // Standard projection first
         glm::mat4 projMatrix = glm::perspective(glm::radians(45.0f), (float)swapchain.width / (float)swapchain.height, 0.1f, 1000.0f);
         projMatrix[1][1] *= -1; // Flip Y for Vulkan
+        
+        // Convert to reversed-Z by modifying the projection matrix
+        // Reversed-Z: z' = -z_near / (z_far - z)
+        projMatrix[2][2] = 0.0f;  // Was: -(far+near)/(far-near) for standard
+        projMatrix[2][3] = -1.0f;
+        projMatrix[3][2] = 0.1f;  // near plane value
+        
         glm::mat4 viewProjMatrix = projMatrix * viewMatrix;
         
         // DEBUG: Print frame info
         static int frameCount = 0;
         frameCount++;
-        
-        // NOTE: We don't call occlusionOutput.cleanupTempResources() here anymore 
-        // because we're managing the lifecycle ourselves to avoid destroying resources in use
         
         // Acquire swapchain image
         uint32_t imageIndex;
@@ -345,7 +371,12 @@ void renderTemporalCoherence(
         VkCommandBuffer commandBuffer = commandBuffers[imageIndex];
         
         // Reset descriptor pool for this frame
-        occlusionPass.beginFrame();
+        // Begin frame for the active occlusion pass
+        if (useComputeOcclusion) {
+            computeOcclusionPass.beginFrame();
+        } else {
+            rasterOcclusionPass.beginFrame();
+        }
         
         // Begin command buffer
         VK_CHECK(vkResetCommandBuffer(commandBuffer, 0));
@@ -370,7 +401,7 @@ void renderTemporalCoherence(
         
         // Clear color buffer always, but only clear depth on first frame
         VkClearColorValue clearColor = {0.1f, 0.2f, 0.3f, 1.0f};
-        VkClearDepthStencilValue clearDepth = {1.0f, 0};
+        VkClearDepthStencilValue clearDepth = {0.0f, 0};  // Reversed-Z: clear to far plane
         
         VkRenderingAttachmentInfo colorAttachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         colorAttachment.imageView = swapchainImageViews[imageIndex];
@@ -382,7 +413,18 @@ void renderTemporalCoherence(
         VkRenderingAttachmentInfo depthAttachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         depthAttachment.imageView = depthImage.imageView;
         depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        depthAttachment.loadOp = occlusionOutput.isFirstFrame ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        // Depth clear logic depends on occlusion method:
+        // - Raster: Always clear (hardware depth test needs clean slate)
+        // - Compute: Preserve previous frame's depth for Hi-Z (except first frame)
+        bool shouldClearDepth = false;
+        if (useComputeOcclusion) {
+            // Compute path: only clear on very first frame, preserve depth for Hi-Z generation
+            shouldClearDepth = occlusionOutput.isFirstFrame;
+        } else {
+            // Raster path: always clear depth for proper hardware occlusion testing
+            shouldClearDepth = true;
+        }
+        depthAttachment.loadOp = shouldClearDepth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         depthAttachment.clearValue.depthStencil = clearDepth;
         
@@ -404,9 +446,83 @@ void renderTemporalCoherence(
         shadingParams.viewPos = cameraPos;
         shadingParams.enableDebugColors = enableDebugColors ? 1 : 0;
         
-        // Skip Pass 1 on the very first frame since there's no previous PVS
-        // For all other frames, render Pass 1 if there are blocks in the previous buffer
-        if ((!occlusionOutput.isFirstFrame && occlusionOutput.pvsPreviousCount > 0) || occlusionUpdated) {
+        // Step 2: Prepare for occlusion culling (check if update needed, initialize buffers)
+        totalFrames++;
+        bool occlusionShouldUpdate = false;
+        
+        // Skip occlusion updates if PVS is frozen
+        if (freezePVS) {
+            occlusionUpdated = false;
+        } else {
+            // Ensure output buffers are initialized (needed for both methods)
+            if (occlusionOutput.pvsCurrentBuffer.buffer == VK_NULL_HANDLE) {
+                uint32_t blocksX = (pushConstants.volumeDim.x + 7) / 8;
+                uint32_t blocksY = (pushConstants.volumeDim.y + 7) / 8;
+                uint32_t blocksZ = (pushConstants.volumeDim.z + 7) / 8;
+                uint32_t totalBlocks = blocksX * blocksY * blocksZ;
+                
+                if (useComputeOcclusion) {
+                    computeOcclusionPass.initializeOutput(occlusionOutput, totalBlocks);
+                } else {
+                    rasterOcclusionPass.initializeOutput(occlusionOutput, totalBlocks);
+                }
+            }
+            
+            // Choose occlusion method based on toggle
+            if (useComputeOcclusion) {
+                // For compute occlusion, only prepare buffers at this stage
+                // IMPORTANT: Always force update on first frame to populate initial PVS
+                bool forceUpdate = (disableTemporalCoherence && !freezePVS) || occlusionOutput.isFirstFrame;
+                printf("[MAIN] Calling performComputeOcclusionCulling: frame=%d, disableTC=%d, freezePVS=%d, isFirst=%d, forceUpdate=%d\n",
+                       totalFrames, disableTemporalCoherence, freezePVS, occlusionOutput.isFirstFrame, forceUpdate);
+                occlusionShouldUpdate = computeOcclusionPass.performComputeOcclusionCulling(
+                    commandBuffer,
+                    occlusionOutput,
+                    minMaxOutput,
+                    pushConstants,
+                    viewProjMatrix,
+                    depthImage.image,
+                    depthImage.imageView,
+                    {swapchain.width, swapchain.height},
+                    forceUpdate
+                );
+            }
+            // Note: Raster occlusion will be performed AFTER Pass 1 rendering
+        }
+        
+        // Step 3: Different flow for raster vs compute occlusion
+        if (useComputeOcclusion && !freezePVS) {
+            // COMPUTE PATH: Generate Hi-Z from previous frame's complete depth, then cull
+            if (occlusionShouldUpdate) {
+                // Generate Hi-Z pyramid from the previous frame's COMPLETE depth buffer
+                // The depth buffer here contains the full rendered scene from the last frame
+                computeOcclusionPass.generateHiZPyramid(
+                    commandBuffer,
+                    depthImage.image,
+                    depthImage.imageView,
+                    {swapchain.width, swapchain.height}
+                );
+                
+                // Run occlusion culling - test current frame's blocks against previous frame's complete depth
+                computeOcclusionPass.runOcclusionCulling(
+                    commandBuffer,
+                    occlusionOutput,
+                    minMaxOutput,
+                    pushConstants,
+                    viewProjMatrix,
+                    {swapchain.width, swapchain.height}
+                );
+                occlusionUpdated = true;
+            } else {
+                // Temporal coherence says no update needed - keep using existing PVS
+                occlusionUpdated = false;
+            }
+        }
+        
+        // Step 4: Render Pass 1 - Previous frame's visible blocks
+        // For raster: this establishes depth for occlusion testing
+        // For compute: this is just normal rendering after occlusion was already done
+        if (occlusionOutput.pvsPreviousCount > 0) {
             transientPass.renderPass1_PreviousVisible(
                 commandBuffer,
                 occlusionOutput,
@@ -421,14 +537,10 @@ void renderTemporalCoherence(
             );
         }
         
-        // Step 2: Perform temporal occlusion culling against Pass 1's depth buffer (only when needed)
-        totalFrames++;
-        
-        // Skip occlusion updates if PVS is frozen
-        if (freezePVS) {
-            occlusionUpdated = false;
-        } else {
-            occlusionUpdated = occlusionPass.performTemporalOcclusionCulling(
+        // Step 5: For raster occlusion, perform occlusion culling AFTER Pass 1
+        // Pass 1 has established depth, now test new blocks against it
+        if (!useComputeOcclusion && !freezePVS) {
+            occlusionUpdated = rasterOcclusionPass.performTemporalOcclusionCulling(
                 commandBuffer,
                 occlusionOutput,
                 minMaxOutput,
@@ -436,7 +548,7 @@ void renderTemporalCoherence(
                 viewProjMatrix,
                 depthImage.imageView,
                 {swapchain.width, swapchain.height},
-                disableTemporalCoherence  // Force update if temporal coherence is disabled
+                disableTemporalCoherence && !freezePVS
             );
         }
         
@@ -453,10 +565,10 @@ void renderTemporalCoherence(
             } else {
                 // Smart mode - show why we updated
                 const char* reason = occlusionOutput.pvsChanged ? "PVS changed" : "Camera moved";
-                printf("[Frame %d] Occlusion culling performed (update %d/%d, %.1f%% skip rate) - %s\n", 
-                       totalFrames, occlusionUpdateCount, totalFrames,
-                       100.0f * (1.0f - float(occlusionUpdateCount) / float(totalFrames)),
-                       reason);
+                // printf("[Frame %d] Occlusion culling performed (update %d/%d, %.1f%% skip rate) - %s\n", 
+                //        totalFrames, occlusionUpdateCount, totalFrames,
+                //        100.0f * (1.0f - float(occlusionUpdateCount) / float(totalFrames)),
+                //        reason);
                 
                 // Report PVS stability if it's been stable for a while
                 if (occlusionOutput.framesWithStablePVS > 5) {
@@ -466,11 +578,9 @@ void renderTemporalCoherence(
             }
         }
         
-        // Step 3: Render Pass 2 - Newly visible blocks (PVS difference)
-        // On first few frames, always render Pass 2 to build up initial PVS
-        // After occlusion runs, the difference buffer will have all visible blocks
-        // For subsequent frames, only render if there are blocks in the difference buffer
-        if (occlusionOutput.frameIndex < 3 || occlusionUpdated || occlusionOutput.pvsDifferenceCount > 0) {
+        // Step 5: Render Pass 2 - Newly visible blocks (PVS difference)
+        // Simple condition: render if we have new blocks or during bootstrap
+        if (!freezePVS && (occlusionUpdated || occlusionOutput.pvsDifferenceCount > 0)) {
             transientPass.renderPass2_NewlyVisible(
                 commandBuffer,
                 occlusionOutput,
@@ -494,12 +604,13 @@ void renderTemporalCoherence(
             }
         }
         
-        // Only swap temporal buffers if occlusion was actually updated
-        // Otherwise we'd be swapping empty/stale buffers
-        // During first few frames, always swap to build up the buffers
-        // Never swap when PVS is frozen to maintain the same PVS
-        if (!freezePVS && (occlusionUpdated || occlusionOutput.frameIndex < 3)) {
-            occlusionOutput.swapTemporalBuffers();
+        // Buffer management for both raster and compute occlusion
+        if (!freezePVS) {
+            // Both paths now use buffer swapping for consistency
+            // After an update, swap buffers so current becomes previous for next frame
+            if (occlusionUpdated || occlusionOutput.frameIndex < 3) {
+                occlusionOutput.swapTemporalBuffers();
+            }
         }
         
         // Transition for present
@@ -534,7 +645,7 @@ void renderTemporalCoherence(
         
         frameResources[imageIndex].occlusionTempResources = occlusionOutput.tempResources;
         occlusionOutput.tempResources = {}; // Clear the original so it doesn't get destroyed prematurely
-        frameResources[imageIndex].indirectTempResources = occlusionPass.getIndirectTempResources();
+        frameResources[imageIndex].indirectTempResources = rasterOcclusionPass.getIndirectTempResources();
         frameResources[imageIndex].transientTempResources = transientPass.getTempResources();
         frameResources[imageIndex].hasResources = true;
         frameResources[imageIndex].createdAtFrame = frameCount - 1;  // Record when created
@@ -648,10 +759,10 @@ void renderTransientExtraction(
         VkFormat swapchainFormat = getSwapchainFormat(context.getPhysicalDevice(), surface);
         createSwapchain(swapchain, context.getPhysicalDevice(), device, surface, context.getGraphicsQueueFamilyIndex(), window, swapchainFormat, VK_NULL_HANDLE);
         
-        // Create depth buffer
+        // Create depth buffer (with sampled bit for Hi-Z generation)
         VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
         createImage(depthImage, device, context.getMemoryProperties(), VK_IMAGE_TYPE_2D, swapchain.width, swapchain.height, 1, 1, depthFormat, 
-                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         
         // Create image views
         swapchainImageViews.resize(swapchain.imageCount);
@@ -659,319 +770,304 @@ void renderTransientExtraction(
             swapchainImageViews[i] = createImageView(device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
         }
     
-    // Camera state - properly initialized for better viewing
-    glm::vec3 volumeCenter = glm::vec3(128.0f, 128.0f, 128.0f);  // Typical center for 256^3 volumes
-    float cameraDistance = 400.0f;
-    float cameraYaw = -45.0f * 3.14159f / 180.0f;
-    float cameraPitch = 30.0f * 3.14159f / 180.0f;
-    
-    glm::vec3 cameraPos;
-    cameraPos.x = volumeCenter.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
-    cameraPos.y = volumeCenter.y + cameraDistance * sin(cameraPitch);
-    cameraPos.z = volumeCenter.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
-    
-    glm::vec3 cameraTarget = volumeCenter;
-    glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
-    double lastMouseX = 0, lastMouseY = 0;
-    float lastFrameTime = 0.0f;
-    
-    // Create synchronization objects
-    // We need more acquire semaphores than swapchain images to avoid reuse conflicts
-    acquireSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
-    // Release semaphores are per swapchain image
-    releaseSemaphores.resize(swapchain.imageCount);
-    
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-        acquireSemaphores[i] = createSemaphore(device);
-    }
-    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
-        releaseSemaphores[i] = createSemaphore(device);
-    }
-    
-    // Fences are per swapchain image
-    frameFences.resize(swapchain.imageCount);
-    for (uint32_t i = 0; i < swapchain.imageCount; i++) {
-        VkFenceCreateInfo fenceCreateInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFences[i]));
-    }
-    
-    uint32_t currentFrame = 0;  // Track which set of sync objects to use
-    
-    // Allocate command buffers - one per frame to avoid conflicts
-    commandBuffers.resize(swapchain.imageCount);
-    VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    allocInfo.commandPool = context.getCommandPool();
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = swapchain.imageCount;
-    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()));
-    
-    // Main render loop
-    while (!glfwWindowShouldClose(window)) {
-        float currentTime = (float)glfwGetTime();
-        float deltaTime = currentTime - lastFrameTime;
-        lastFrameTime = currentTime;
-        glfwPollEvents();
+        // Camera state - properly initialized for better viewing
+        glm::vec3 volumeCenter = glm::vec3(128.0f, 128.0f, 128.0f);  // Typical center for 256^3 volumes
+        float cameraDistance = 400.0f;
+        float cameraYaw = -45.0f * 3.14159f / 180.0f;
+        float cameraPitch = 30.0f * 3.14159f / 180.0f;
         
-        // Camera controls - improved for better exploration
-        const float zoomSpeed = 300.0f * deltaTime;  // Increased from 100
-        const float panSpeed = 150.0f * deltaTime;   // Increased from 50
+        glm::vec3 cameraPos;
+        cameraPos.x = volumeCenter.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
+        cameraPos.y = volumeCenter.y + cameraDistance * sin(cameraPitch);
+        cameraPos.z = volumeCenter.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
         
-        // W/S: Zoom in/out
-        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
-            cameraDistance = glm::max(10.0f, cameraDistance - zoomSpeed);
+        glm::vec3 cameraTarget = volumeCenter;
+        glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+        double lastMouseX = 0, lastMouseY = 0;
+        float lastFrameTime = 0.0f;
+        
+        // Create synchronization objects
+        // We need more acquire semaphores than swapchain images to avoid reuse conflicts
+        acquireSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+        // Release semaphores are per swapchain image
+        releaseSemaphores.resize(swapchain.imageCount);
+        
+        for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            acquireSemaphores[i] = createSemaphore(device);
         }
-        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
-            cameraDistance = glm::min(1000.0f, cameraDistance + zoomSpeed);
+        for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+            releaseSemaphores[i] = createSemaphore(device);
         }
         
-        // A/D: Pan camera target left/right
-        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
-            glm::vec3 forward = glm::normalize(cameraPos - cameraTarget);
-            glm::vec3 right = glm::normalize(glm::cross(cameraUp, forward));
-            cameraTarget -= right * panSpeed;
-        }
-        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
-            glm::vec3 forward = glm::normalize(cameraPos - cameraTarget);
-            glm::vec3 right = glm::normalize(glm::cross(cameraUp, forward));
-            cameraTarget += right * panSpeed;
+        // Fences are per swapchain image
+        frameFences.resize(swapchain.imageCount);
+        for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+            VkFenceCreateInfo fenceCreateInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFences[i]));
         }
         
-        // Q/E: Pan camera target up/down  
-        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
-            cameraTarget.y -= panSpeed;
-        }
-        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
-            cameraTarget.y += panSpeed;
-        }
+        uint32_t currentFrame = 0;  // Track which set of sync objects to use
         
-        // Update camera position based on spherical coordinates
-        cameraPos.x = cameraTarget.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
-        cameraPos.y = cameraTarget.y + cameraDistance * sin(cameraPitch);
-        cameraPos.z = cameraTarget.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
+        // Allocate command buffers - one per frame to avoid conflicts
+        commandBuffers.resize(swapchain.imageCount);
+        VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocInfo.commandPool = context.getCommandPool();
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = swapchain.imageCount;
+        VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()));
         
-        // Mouse controls for rotation
-        double mouseX, mouseY;
-        glfwGetCursorPos(window, &mouseX, &mouseY);
-        if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
-            float deltaX = (float)(mouseX - lastMouseX) * 1.0f;  // Doubled from 0.5
-            float deltaY = (float)(mouseY - lastMouseY) * 1.0f;  // Doubled from 0.5
+        // Main render loop
+        while (!glfwWindowShouldClose(window)) {
+            float currentTime = (float)glfwGetTime();
+            float deltaTime = currentTime - lastFrameTime;
+            lastFrameTime = currentTime;
+            glfwPollEvents();
             
-            // Update yaw and pitch (increased sensitivity)
-            cameraYaw -= deltaX * 0.02f;   // Doubled from 0.01
-            cameraPitch -= deltaY * 0.02f; // Doubled from 0.01
-            cameraPitch = glm::clamp(cameraPitch, -89.0f * 3.14159f / 180.0f, 89.0f * 3.14159f / 180.0f);
+            // Camera controls - improved for better exploration
+            const float zoomSpeed = 300.0f * deltaTime;  // Increased from 100
+            const float panSpeed = 150.0f * deltaTime;   // Increased from 50
             
-            // Update camera position
+            // W/S: Zoom in/out
+            if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
+                cameraDistance = glm::max(10.0f, cameraDistance - zoomSpeed);
+            }
+            if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+                cameraDistance = glm::min(1000.0f, cameraDistance + zoomSpeed);
+            }
+            
+            // A/D: Pan camera target left/right
+            if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
+                glm::vec3 forward = glm::normalize(cameraPos - cameraTarget);
+                glm::vec3 right = glm::normalize(glm::cross(cameraUp, forward));
+                cameraTarget -= right * panSpeed;
+            }
+            if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
+                glm::vec3 forward = glm::normalize(cameraPos - cameraTarget);
+                glm::vec3 right = glm::normalize(glm::cross(cameraUp, forward));
+                cameraTarget += right * panSpeed;
+            }
+            
+            // Q/E: Pan camera target up/down  
+            if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
+                cameraTarget.y -= panSpeed;
+            }
+            if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
+                cameraTarget.y += panSpeed;
+            }
+            
+            // Update camera position based on spherical coordinates
             cameraPos.x = cameraTarget.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
             cameraPos.y = cameraTarget.y + cameraDistance * sin(cameraPitch);
             cameraPos.z = cameraTarget.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
-        }
-        lastMouseX = mouseX;
-        lastMouseY = mouseY;
-        
-        VK_CHECK(vkWaitForFences(device, 1, &frameFences[currentFrame], VK_TRUE, UINT64_MAX));
-        VK_CHECK(vkResetFences(device, 1, &frameFences[currentFrame]));
-        
-        uint32_t imageIndex;
-        VkResult result = vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquireSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
-        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
-            vkDeviceWaitIdle(device);
-            // Recreate swapchain
-            for (auto& view : swapchainImageViews) {
-                vkDestroyImageView(device, view, nullptr);
-            }
-            swapchainImageViews.clear();
-            destroyImage(depthImage, device);
-            destroySwapchain(device, swapchain);
             
-            int width, height;
-            glfwGetFramebufferSize(window, &width, &height);
-            createSwapchain(swapchain, context.getPhysicalDevice(), device, surface, context.getGraphicsQueueFamilyIndex(), window, swapchainFormat, swapchain.swapchain);
-            createImage(depthImage, device, context.getMemoryProperties(), VK_IMAGE_TYPE_2D, swapchain.width, swapchain.height, 1, 1, depthFormat,
-                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
-            
-            swapchainImageViews.resize(swapchain.imageCount);
-            for (uint32_t i = 0; i < swapchain.imageCount; i++) {
-                swapchainImageViews[i] = createImageView(device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
+            // Mouse controls for rotation
+            double mouseX, mouseY;
+            glfwGetCursorPos(window, &mouseX, &mouseY);
+            if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+                float deltaX = (float)(mouseX - lastMouseX) * 1.0f;  // Doubled from 0.5
+                float deltaY = (float)(mouseY - lastMouseY) * 1.0f;  // Doubled from 0.5
+                
+                // Update yaw and pitch (increased sensitivity)
+                cameraYaw -= deltaX * 0.02f;   // Doubled from 0.01
+                cameraPitch -= deltaY * 0.02f; // Doubled from 0.01
+                cameraPitch = glm::clamp(cameraPitch, -89.0f * 3.14159f / 180.0f, 89.0f * 3.14159f / 180.0f);
+                
+                // Update camera position
+                cameraPos.x = cameraTarget.x + cameraDistance * cos(cameraPitch) * cos(cameraYaw);
+                cameraPos.y = cameraTarget.y + cameraDistance * sin(cameraPitch);
+                cameraPos.z = cameraTarget.z + cameraDistance * cos(cameraPitch) * sin(cameraYaw);
             }
-            continue;
-        }
-        assert(result == VK_SUCCESS);
-        
-        // Build view-projection matrix and frustum planes
-        float fov = glm::radians(60.0f);
-        float aspect = (float)swapchain.width / (float)swapchain.height;
-        float nearPlane = 0.1f;
-        float farPlane = 1000.0f;
-        
-        glm::mat4 proj = glm::mat4(0.0f);
-        float tanHalfFov = tan(fov / 2.0f);
-        proj[0][0] = 1.0f / (aspect * tanHalfFov);
-        proj[1][1] = 1.0f / tanHalfFov;
-        proj[2][2] = nearPlane / (farPlane - nearPlane);
-        proj[2][3] = -1.0f;
-        proj[3][2] = (farPlane * nearPlane) / (farPlane - nearPlane);
-        glm::mat4 view = glm::lookAt(cameraPos, cameraTarget, glm::vec3(0, 1, 0));
-        glm::mat4 viewProj = proj * view;
-        
-        // Extract frustum planes
-        TransientExtractionPushConstants renderConstants;
-        renderConstants.viewProj = viewProj;
-        extractFrustumPlanes(viewProj, renderConstants.frustumPlanes);
-        
-        // Use the current frame's command buffer
-        VkCommandBuffer commandBuffer = commandBuffers[currentFrame];
-        
-        // Record command buffer
-        VK_CHECK(vkResetCommandBuffer(commandBuffer, 0));
-        VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
-        
-        // Prepare all barriers for transient extraction BEFORE beginning rendering
-        std::vector<VkBufferMemoryBarrier2> bufferBarriers;
-        std::vector<VkImageMemoryBarrier2> imageBarriers;
-        
-        // Transition images for rendering
-        VkImageMemoryBarrier2 colorBarrier = imageBarrier(swapchain.images[imageIndex], 
-            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        
-        VkImageMemoryBarrier2 depthBarrier = imageBarrier(depthImage.image,
-            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
-        depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        
-        imageBarriers.push_back(colorBarrier);
-        imageBarriers.push_back(depthBarrier);
-        
-        // Add barriers for transient extraction inputs
-        const VkPipelineStageFlags2 EXTRACTION_SHADER_STAGES = 
-            VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
-        
-        // Ensure filtering outputs are readable
-        bufferBarriers.push_back(bufferBarrier(
-            filteringResult.activeBlockCountBuffer.buffer,
-            VK_PIPELINE_STAGE_2_COPY_BIT,
-            VK_ACCESS_2_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
-            VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-            0, VK_WHOLE_SIZE
-        ));
-        
-        bufferBarriers.push_back(bufferBarrier(
-            filteringResult.compactedBlockIdBuffer.buffer,
-            VK_PIPELINE_STAGE_2_COPY_BIT,
-            VK_ACCESS_2_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
-            VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-            0, VK_WHOLE_SIZE
-        ));
-
-        
-        // Volume image is already in GENERAL layout from min-max pass, no barrier needed
-
-        // Min-max image barrier
-        // imageBarriers.push_back(imageBarrier(
-        //     minMaxOutput.minMaxImage.image,
-        //     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        //     VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        //     VK_IMAGE_LAYOUT_GENERAL,
-        //     VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
-        //     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-        //     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        //     VK_IMAGE_ASPECT_COLOR_BIT
-        // ));
-        
-        // Execute all barriers before beginning rendering
-        pipelineBarrier(commandBuffer, 0, bufferBarriers.size(), bufferBarriers.data(), 
-                       imageBarriers.size(), imageBarriers.data());
-        
-        // Begin rendering
-        VkClearColorValue clearColor = {0.1f, 0.2f, 0.3f, 1.0f};
-        VkClearDepthStencilValue clearDepth = {0.0f, 0};
-        
-        VkRenderingAttachmentInfo colorAttachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        colorAttachment.imageView = swapchainImageViews[imageIndex];
-        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        colorAttachment.clearValue.color = clearColor;
-        
-        VkRenderingAttachmentInfo depthAttachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        depthAttachment.imageView = depthImage.imageView;
-        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        depthAttachment.clearValue.depthStencil = clearDepth;
-        
-        VkRenderingInfo renderingInfo = {VK_STRUCTURE_TYPE_RENDERING_INFO};
-        renderingInfo.renderArea = {{0, 0}, {swapchain.width, swapchain.height}};
-        renderingInfo.layerCount = 1;
-        renderingInfo.colorAttachmentCount = 1;
-        renderingInfo.pColorAttachments = &colorAttachment;
-        renderingInfo.pDepthAttachment = &depthAttachment;
-        
-        vkCmdBeginRendering(commandBuffer, &renderingInfo);
-        
-        VkViewport viewport = {0.0f, (float)swapchain.height, (float)swapchain.width, -(float)swapchain.height, 0.0f, 1.0f};
-        VkRect2D scissor = {{0, 0}, {swapchain.width, swapchain.height}};
-        vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-        vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-        
-        // Call transient extraction and render (no barriers needed inside)
-        extractAndRenderTransient(context, minMaxOutput, filteringResult, pushConstants, renderConstants, commandBuffer, swapchainFormat, depthFormat, nullptr, pmb);
-        
-        vkCmdEndRendering(commandBuffer);
-        
-        // Transition for present
-        VkImageMemoryBarrier2 presentBarrier = imageBarrier(swapchain.images[imageIndex],
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT_KHR, 0, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-        pipelineBarrier(commandBuffer, 0, 0, nullptr, 1, &presentBarrier);
-        
-        VK_CHECK(vkEndCommandBuffer(commandBuffer));
-        
-        // Submit
-        VkPipelineStageFlags submitStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &acquireSemaphores[currentFrame];
-        submitInfo.pWaitDstStageMask = &submitStageMask;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffer;
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &releaseSemaphores[currentFrame];
-        
-        VK_CHECK(vkQueueSubmit(context.getQueue(), 1, &submitInfo, frameFences[currentFrame]));
-        
-        // Clean up temporary resources after submission
-        // Note: Temp resources from extractAndRenderTransient are cleaned up internally
-        
-        // Present using the current frame's release semaphore
-        VkPresentInfoKHR presentInfo = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-        presentInfo.waitSemaphoreCount = 1;
-        presentInfo.pWaitSemaphores = &releaseSemaphores[currentFrame];
-        presentInfo.swapchainCount = 1;
-        presentInfo.pSwapchains = &swapchain.swapchain;
-        presentInfo.pImageIndices = &imageIndex;
-        
-        result = vkQueuePresentKHR(context.getQueue(), &presentInfo);
-        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
-            // Handle next iteration
-        } else {
+            lastMouseX = mouseX;
+            lastMouseY = mouseY;
+            
+            VK_CHECK(vkWaitForFences(device, 1, &frameFences[currentFrame], VK_TRUE, UINT64_MAX));
+            VK_CHECK(vkResetFences(device, 1, &frameFences[currentFrame]));
+            
+            uint32_t imageIndex;
+            VkResult result = vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquireSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+            if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+                vkDeviceWaitIdle(device);
+                // Recreate swapchain
+                for (auto& view : swapchainImageViews) {
+                    vkDestroyImageView(device, view, nullptr);
+                }
+                swapchainImageViews.clear();
+                destroyImage(depthImage, device);
+                destroySwapchain(device, swapchain);
+                
+                int width, height;
+                glfwGetFramebufferSize(window, &width, &height);
+                createSwapchain(swapchain, context.getPhysicalDevice(), device, surface, context.getGraphicsQueueFamilyIndex(), window, swapchainFormat, swapchain.swapchain);
+                createImage(depthImage, device, context.getMemoryProperties(), VK_IMAGE_TYPE_2D, swapchain.width, swapchain.height, 1, 1, depthFormat,
+                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+                
+                swapchainImageViews.resize(swapchain.imageCount);
+                for (uint32_t i = 0; i < swapchain.imageCount; i++) {
+                    swapchainImageViews[i] = createImageView(device, swapchain.images[i], swapchainFormat, VK_IMAGE_TYPE_2D, 0, 1);
+                }
+                continue;
+            }
             assert(result == VK_SUCCESS);
+            
+            // Build view-projection matrix and frustum planes
+            float fov = glm::radians(60.0f);
+            float aspect = (float)swapchain.width / (float)swapchain.height;
+            float nearPlane = 0.1f;
+            float farPlane = 1000.0f;
+            
+            // Reversed-Z projection matrix (infinite far plane version for better precision)
+            glm::mat4 proj = glm::mat4(0.0f);
+            float tanHalfFov = tan(fov / 2.0f);
+            proj[0][0] = 1.0f / (aspect * tanHalfFov);
+            proj[1][1] = 1.0f / tanHalfFov;
+            proj[2][2] = 0.0f;  // Reversed-Z
+            proj[2][3] = -1.0f;
+            proj[3][2] = nearPlane;  // Reversed-Z
+            glm::mat4 view = glm::lookAt(cameraPos, cameraTarget, glm::vec3(0, 1, 0));
+            glm::mat4 viewProj = proj * view;
+            
+            // Extract frustum planes
+            TransientExtractionPushConstants renderConstants;
+            renderConstants.viewProj = viewProj;
+            extractFrustumPlanes(viewProj, renderConstants.frustumPlanes);
+            
+            // Use the current frame's command buffer
+            VkCommandBuffer commandBuffer = commandBuffers[currentFrame];
+            
+            // Record command buffer
+            VK_CHECK(vkResetCommandBuffer(commandBuffer, 0));
+            VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
+            
+            // Prepare all barriers for transient extraction BEFORE beginning rendering
+            std::vector<VkBufferMemoryBarrier2> bufferBarriers;
+            std::vector<VkImageMemoryBarrier2> imageBarriers;
+            
+            // Transition images for rendering
+            VkImageMemoryBarrier2 colorBarrier = imageBarrier(swapchain.images[imageIndex], 
+                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            
+            VkImageMemoryBarrier2 depthBarrier = imageBarrier(depthImage.image,
+                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+            depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            
+            imageBarriers.push_back(colorBarrier);
+            imageBarriers.push_back(depthBarrier);
+            
+            // Add barriers for transient extraction inputs
+            const VkPipelineStageFlags2 EXTRACTION_SHADER_STAGES = 
+                VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+            
+            // Ensure filtering outputs are readable
+            bufferBarriers.push_back(bufferBarrier(
+                filteringResult.activeBlockCountBuffer.buffer,
+                VK_PIPELINE_STAGE_2_COPY_BIT,
+                VK_ACCESS_2_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                0, VK_WHOLE_SIZE
+            ));
+            
+            bufferBarriers.push_back(bufferBarrier(
+                filteringResult.compactedBlockIdBuffer.buffer,
+                VK_PIPELINE_STAGE_2_COPY_BIT,
+                VK_ACCESS_2_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                0, VK_WHOLE_SIZE
+            ));
+            
+            // Execute all barriers before beginning rendering
+            pipelineBarrier(commandBuffer, 0, bufferBarriers.size(), bufferBarriers.data(), 
+                        imageBarriers.size(), imageBarriers.data());
+            
+            // Begin rendering
+            VkClearColorValue clearColor = {0.1f, 0.2f, 0.3f, 1.0f};
+            VkClearDepthStencilValue clearDepth = {0.0f, 0};
+            
+            VkRenderingAttachmentInfo colorAttachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            colorAttachment.imageView = swapchainImageViews[imageIndex];
+            colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            colorAttachment.clearValue.color = clearColor;
+            
+            VkRenderingAttachmentInfo depthAttachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            depthAttachment.imageView = depthImage.imageView;
+            depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            depthAttachment.clearValue.depthStencil = clearDepth;
+            
+            VkRenderingInfo renderingInfo = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+            renderingInfo.renderArea = {{0, 0}, {swapchain.width, swapchain.height}};
+            renderingInfo.layerCount = 1;
+            renderingInfo.colorAttachmentCount = 1;
+            renderingInfo.pColorAttachments = &colorAttachment;
+            renderingInfo.pDepthAttachment = &depthAttachment;
+            
+            vkCmdBeginRendering(commandBuffer, &renderingInfo);
+            
+            VkViewport viewport = {0.0f, (float)swapchain.height, (float)swapchain.width, -(float)swapchain.height, 0.0f, 1.0f};
+            VkRect2D scissor = {{0, 0}, {swapchain.width, swapchain.height}};
+            vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+            vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+            
+            // Call transient extraction and render (no barriers needed inside)
+            extractAndRenderTransient(context, minMaxOutput, filteringResult, pushConstants, renderConstants, commandBuffer, swapchainFormat, depthFormat, nullptr, pmb);
+            
+            vkCmdEndRendering(commandBuffer);
+            
+            // Transition for present
+            VkImageMemoryBarrier2 presentBarrier = imageBarrier(swapchain.images[imageIndex],
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT_KHR, 0, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+            pipelineBarrier(commandBuffer, 0, 0, nullptr, 1, &presentBarrier);
+            
+            VK_CHECK(vkEndCommandBuffer(commandBuffer));
+            
+            // Submit
+            VkPipelineStageFlags submitStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submitInfo.waitSemaphoreCount = 1;
+            submitInfo.pWaitSemaphores = &acquireSemaphores[currentFrame];
+            submitInfo.pWaitDstStageMask = &submitStageMask;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &commandBuffer;
+            submitInfo.signalSemaphoreCount = 1;
+            submitInfo.pSignalSemaphores = &releaseSemaphores[currentFrame];
+            
+            VK_CHECK(vkQueueSubmit(context.getQueue(), 1, &submitInfo, frameFences[currentFrame]));
+            
+            // Clean up temporary resources after submission
+            // Note: Temp resources from extractAndRenderTransient are cleaned up internally
+            
+            // Present using the current frame's release semaphore
+            VkPresentInfoKHR presentInfo = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+            presentInfo.waitSemaphoreCount = 1;
+            presentInfo.pWaitSemaphores = &releaseSemaphores[currentFrame];
+            presentInfo.swapchainCount = 1;
+            presentInfo.pSwapchains = &swapchain.swapchain;
+            presentInfo.pImageIndices = &imageIndex;
+            
+            result = vkQueuePresentKHR(context.getQueue(), &presentInfo);
+            if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+                // Handle next iteration
+            } else {
+                assert(result == VK_SUCCESS);
+            }
+            
+            // Advance to next frame
+            currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
         }
-        
-        // Advance to next frame
-        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
-    }
-    
         vkDeviceWaitIdle(device);
         
     } catch (const std::exception& e) {
@@ -1103,6 +1199,7 @@ int main(int argc, char** argv) {
                          << "  --help               Show this help message\n"
                          << "\nRuntime controls:\n"
                          << "  T                    Toggle temporal coherence optimization on/off\n"
+                         << "  O                    Toggle occlusion method (Raster vs Compute Hi-Z)\n"
                          << "  F                    Freeze/unfreeze PVS updates (debug visualization)\n"
                          << "  R                    Reset temporal state\n"
                          << "  C                    Toggle debug colors\n"
