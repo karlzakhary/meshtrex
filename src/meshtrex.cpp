@@ -18,6 +18,7 @@
 #include "rasterOcclusionPass.h"
 #include "computeOcclusionPass.h"
 #include "transientExtractionPass.h"
+#include "generateMultiSphereVolume.h"
 
 #include "vulkan_context.h"
 #include "renderingManager.h"
@@ -456,9 +457,9 @@ void renderTemporalCoherence(
         } else {
             // Ensure output buffers are initialized (needed for both methods)
             if (occlusionOutput.pvsCurrentBuffer.buffer == VK_NULL_HANDLE) {
-                uint32_t blocksX = (pushConstants.volumeDim.x + 7) / 8;
-                uint32_t blocksY = (pushConstants.volumeDim.y + 7) / 8;
-                uint32_t blocksZ = (pushConstants.volumeDim.z + 7) / 8;
+                uint32_t blocksX = (pushConstants.volumeDim.x + pushConstants.blockDim.x - 1) / pushConstants.blockDim.x;
+                uint32_t blocksY = (pushConstants.volumeDim.y + pushConstants.blockDim.y - 1) / pushConstants.blockDim.y;
+                uint32_t blocksZ = (pushConstants.volumeDim.z + pushConstants.blockDim.z - 1) / pushConstants.blockDim.z;
                 uint32_t totalBlocks = blocksX * blocksY * blocksZ;
                 
                 if (useComputeOcclusion) {
@@ -473,8 +474,7 @@ void renderTemporalCoherence(
                 // For compute occlusion, only prepare buffers at this stage
                 // IMPORTANT: Always force update on first frame to populate initial PVS
                 bool forceUpdate = (disableTemporalCoherence && !freezePVS) || occlusionOutput.isFirstFrame;
-                printf("[MAIN] Calling performComputeOcclusionCulling: frame=%d, disableTC=%d, freezePVS=%d, isFirst=%d, forceUpdate=%d\n",
-                       totalFrames, disableTemporalCoherence, freezePVS, occlusionOutput.isFirstFrame, forceUpdate);
+               
                 occlusionShouldUpdate = computeOcclusionPass.performComputeOcclusionCulling(
                     commandBuffer,
                     occlusionOutput,
@@ -522,7 +522,7 @@ void renderTemporalCoherence(
         // Step 4: Render Pass 1 - Previous frame's visible blocks
         // For raster: this establishes depth for occlusion testing
         // For compute: this is just normal rendering after occlusion was already done
-        if (occlusionOutput.pvsPreviousCount > 0) {
+        if (occlusionOutput.pvsPreviousCount > 0 || true) {
             transientPass.renderPass1_PreviousVisible(
                 commandBuffer,
                 occlusionOutput,
@@ -1168,6 +1168,11 @@ int main(int argc, char** argv) {
         std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/bonsai_256x256x256_uint8.raw");
         float isovalue = 80;
         bool requestMeshShading = false;
+        
+        // Synthetic data options
+        bool useSyntheticData = true;
+        std::string syntheticType = "stress";  // "random", "layered", or "stress"
+        int numSpheres = 1000;
 #ifndef __APPLE__
         requestMeshShading = true;
 #endif
@@ -1187,6 +1192,16 @@ int main(int argc, char** argv) {
                 volumePath = argv[++i];
             } else if (strcmp(argv[i], "--isovalue") == 0 && i + 1 < argc) {
                 isovalue = std::stof(argv[++i]);
+            } else if (strcmp(argv[i], "--synthetic") == 0) {
+                useSyntheticData = true;
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    syntheticType = argv[++i];  // "random", "layered", or "stress"
+                }
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    numSpheres = std::stoi(argv[++i]);
+                }
+                std::cout << "Using synthetic " << syntheticType << " sphere data with " 
+                         << numSpheres << " spheres" << std::endl;
             } else if (strcmp(argv[i], "--help") == 0) {
                 std::cout << "Usage: " << argv[0] << " [options]\n"
                          << "Options:\n"
@@ -1196,6 +1211,9 @@ int main(int argc, char** argv) {
                          << "  --no-coherence-opt   Disable temporal coherence optimization (force occlusion test every frame)\n"
                          << "  --volume <path>      Path to volume file\n"
                          << "  --isovalue <value>   Isovalue for surface extraction\n"
+                         << "  --synthetic [type] [count]  Use synthetic sphere data\n"
+                         << "                       type: random, layered, or stress (default: random)\n"
+                         << "                       count: number of spheres (default: 1000)\n"
                          << "  --help               Show this help message\n"
                          << "\nRuntime controls:\n"
                          << "  T                    Toggle temporal coherence optimization on/off\n"
@@ -1219,10 +1237,53 @@ int main(int argc, char** argv) {
         }
         VulkanContext context(requestMeshShading);
 
-        Volume volume = loadVolume(volumePath.c_str());
-        // Use with isovalue = 128
-        // Volume volume {glm::vec3(64,64,64), "uint_8", generateSphereVolume(64,64,64)};
-        std::cout << "Volume " << volumePath.c_str() << " is loaded.";
+        Volume volume;
+        
+        if (useSyntheticData) {
+            // Generate synthetic sphere data for testing occlusion
+            int volumeSize = 256;  // Use 256^3 for good testing
+            
+            if (syntheticType == "layered") {
+                std::cout << "Generating layered sphere volume (" << volumeSize << "^3)..." << std::endl;
+                volume = {
+                    glm::vec3(volumeSize, volumeSize, volumeSize),
+                    "uint_8",
+                    MultiSphereVolumeGenerator::generateLayeredSphereVolume(
+                        volumeSize, volumeSize, volumeSize,
+                        numSpheres / 10,  // spheres per layer
+                        10  // number of layers
+                    )
+                };
+            } else if (syntheticType == "stress") {
+                std::cout << "Generating occlusion stress test volume (" << volumeSize << "^3)..." << std::endl;
+                volume = {
+                    glm::vec3(volumeSize, volumeSize, volumeSize),
+                    "uint_8",
+                    MultiSphereVolumeGenerator::generateOcclusionStressTest(
+                        volumeSize, volumeSize, volumeSize
+                    )
+                };
+            } else {  // "random" or default
+                std::cout << "Generating random sphere volume (" << volumeSize << "^3) with " 
+                         << numSpheres << " spheres..." << std::endl;
+                volume = {
+                    glm::vec3(volumeSize, volumeSize, volumeSize),
+                    "uint_8",
+                    MultiSphereVolumeGenerator::generateMultiSphereVolume(
+                        volumeSize, volumeSize, volumeSize,
+                        numSpheres,
+                        8.0f,   // minRadius - increased from 2.0f
+                        20.0f,  // maxRadius - increased from 8.0f
+                        true,   // randomPlacement
+                        true    // allowOverlap
+                    )
+                };
+            }
+            std::cout << "Synthetic volume generated successfully.";
+        } else {
+            volume = loadVolume(volumePath.c_str());
+            std::cout << "Volume " << volumePath.c_str() << " is loaded.";
+        }
         
         PushConstants pushConstants = {};
         pushConstants.volumeDim = glm::uvec4(volume.volume_dims, 1);

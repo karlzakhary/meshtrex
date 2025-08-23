@@ -120,8 +120,6 @@ void main() {
             uint mask = 1u << bit;
             
             if ((visibleBlocksCurrent & mask) != 0) {
-                // Note: Each 8x8x8 block generates 2 task shader jobs (split into 8x8x4)
-                // But we store block indices, not job indices, so no change needed here
                 pvsCurrent.indices[writeOffsetCurrent + numWrittenCurrent] = baseBlockIndex + bit;
                 numWrittenCurrent++;
             }

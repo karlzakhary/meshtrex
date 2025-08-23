@@ -142,7 +142,7 @@ void ComputeOcclusionPass::createHiZPyramid(VkExtent2D baseExtent) {
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
     imageInfo.format = VK_FORMAT_R32_SFLOAT;
     imageInfo.extent = {baseExtent.width, baseExtent.height, 1};
-    imageInfo.mipLevels = hiZPyramid_.levels;  // Multiple mip levels in one image!
+    imageInfo.mipLevels = hiZPyramid_.levels;
     imageInfo.arrayLayers = 1;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -282,7 +282,6 @@ void ComputeOcclusionPass::createPipelines() {
         
         VK_CHECK(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &hiZInitDescLayout_));
         
-        // Pipeline layout (no push constants needed)
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pipelineLayoutInfo.setLayoutCount = 1;
         pipelineLayoutInfo.pSetLayouts = &hiZInitDescLayout_;
@@ -319,19 +318,11 @@ void ComputeOcclusionPass::createPipelines() {
         layoutInfo.pBindings = bindings.data();
         
         VK_CHECK(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &hiZGenerateDescLayout_));
-        
-        // Push constants for mip level info
-        VkPushConstantRange pushRange{};
-        pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pushRange.offset = 0;
-        pushRange.size = sizeof(uint32_t) * 3; // mipLevel, inputWidth, inputHeight
-        
+
         // Pipeline layout
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pipelineLayoutInfo.setLayoutCount = 1;
         pipelineLayoutInfo.pSetLayouts = &hiZGenerateDescLayout_;
-        pipelineLayoutInfo.pushConstantRangeCount = 1;
-        pipelineLayoutInfo.pPushConstantRanges = &pushRange;
         
         VK_CHECK(vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &hiZGenerateLayout_));
         
@@ -349,7 +340,7 @@ void ComputeOcclusionPass::createPipelines() {
     // Create compute occlusion culling pipeline
     {
         // Descriptor set layout
-        std::vector<VkDescriptorSetLayoutBinding> bindings(6);
+        std::vector<VkDescriptorSetLayoutBinding> bindings(5);
         
         // Min-max texture sampler
         bindings[0].binding = 0;
@@ -363,29 +354,23 @@ void ComputeOcclusionPass::createPipelines() {
         bindings[1].descriptorCount = 1;
         bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         
-        // Previous PVS buffer
+        // Previous visibility bitfield
         bindings[2].binding = 2;
         bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[2].descriptorCount = 1;
         bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         
-        // Current PVS buffer
+        // Current visibility bitfield
         bindings[3].binding = 3;
         bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[3].descriptorCount = 1;
         bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         
-        // PVS counter
+        // Uniform buffer
         bindings[4].binding = 4;
-        bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[4].descriptorCount = 1;
         bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        
-        // Uniform buffer
-        bindings[5].binding = 5;
-        bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        bindings[5].descriptorCount = 1;
-        bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         
         VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -393,12 +378,9 @@ void ComputeOcclusionPass::createPipelines() {
         
         VK_CHECK(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &occlusionDescLayout_));
         
-        // Pipeline layout - no push constants needed anymore
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pipelineLayoutInfo.setLayoutCount = 1;
         pipelineLayoutInfo.pSetLayouts = &occlusionDescLayout_;
-        pipelineLayoutInfo.pushConstantRangeCount = 0;
-        pipelineLayoutInfo.pPushConstantRanges = nullptr;
         
         VK_CHECK(vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &occlusionLayout_));
         
@@ -769,16 +751,6 @@ void ComputeOcclusionPass::generateHiZPyramid(
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hiZGenerateLayout_,
                                0, 1, &hiZDescSet, 0, nullptr);
         
-        // Push constants
-        struct {
-            uint32_t mipLevel;
-            uint32_t inputWidth;
-            uint32_t inputHeight;
-        } pushData = {srcLevel, inputExtent.width, inputExtent.height};
-        
-        vkCmdPushConstants(cmd, hiZGenerateLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(pushData), &pushData);
-        
         // Dispatch compute
         uint32_t groupsX = (outputExtent.width + 7) / 8;
         uint32_t groupsY = (outputExtent.height + 7) / 8;
@@ -855,26 +827,16 @@ bool ComputeOcclusionPass::performComputeOcclusionCulling(
         bool positionChanged = positionDelta > POSITION_THRESHOLD;
         bool rotationChanged = rotationDelta > ROTATION_THRESHOLD;
         
-        printf("[ComputeOcclusion] Frame %u: pos_delta=%.3f (thresh=%.1f), rot_delta=%.3f (thresh=%.3f)\n", 
-               frameIndex_, positionDelta, POSITION_THRESHOLD, rotationDelta, ROTATION_THRESHOLD);
-        
         if (positionChanged || rotationChanged) {
             cameraChanged = true;
             shouldUpdate = true;
-            printf("[ComputeOcclusion] Camera changed - updating (pos: %s, rot: %s)\n", 
-                   positionChanged ? "yes" : "no", rotationChanged ? "yes" : "no");
         }
     }
     
     if (!shouldUpdate) {
         frameIndex_++;
-        printf("[ComputeOcclusion] Frame %u: No update needed (forceUpdate=%d, isFirstFrame=%d)\n", 
-               frameIndex_, forceUpdate, output.isFirstFrame);
         return false;
     }
-    
-    printf("[ComputeOcclusion] Frame %u: Updating occlusion (forceUpdate=%d, isFirstFrame=%d)\n",
-           frameIndex_, forceUpdate, output.isFirstFrame);
     
     // Store the view projection matrix for next frame's comparison
     // IMPORTANT: Only update this when we actually perform occlusion culling
@@ -890,22 +852,13 @@ bool ComputeOcclusionPass::performComputeOcclusionCulling(
     if (output.isFirstFrame || output.pvsCurrentBuffer.buffer == VK_NULL_HANDLE) {
         initializeOutput(output, totalBlocks);
     }
-    
-    // Bootstrap: On first frame, set initial counts
-    // The GPU will compute actual values, but we need something to start with
+
     if (output.isFirstFrame) {
-        // Conservative estimate for first frame
-        output.pvsCurrentCount = 0;      // Will be computed by GPU
-        output.pvsPreviousCount = 0;      // Nothing from previous frame
-        output.pvsDifferenceCount = 0;    // Will be computed by GPU
-        printf("[ComputeOcclusion] First frame bootstrap\n");
+        output.pvsCurrentCount = 0;
+        output.pvsPreviousCount = 0;
+        output.pvsDifferenceCount = 0;
     }
     
-    // NOTE: Hi-Z pyramid generation has been moved to BEFORE Pass 1 rendering
-    // This uses the previous frame's complete depth buffer for temporal coherence
-    // The pyramid generation and occlusion test are now called separately
-    
-    // Clear the first element of pvsCurrentBuffer to use as atomic counter
     uint32_t zero = 0;
     vkCmdFillBuffer(cmd, output.pvsCurrentBuffer.buffer, 0, sizeof(uint32_t), 0);
     
@@ -919,7 +872,9 @@ bool ComputeOcclusionPass::performComputeOcclusionCulling(
         vkCmdFillBuffer(cmd, output.previousBitfieldBuffer.buffer, 0, output.previousBitfieldBuffer.size, 0);
     }
     
-    // Always clear current bitfield before generating new one
+    // Always clear current bitfield - the compute shader will rebuild it from scratch
+    // This matches the raster occlusion approach where visibility buffer is cleared
+    // and fragment shader writes 1 for visible blocks
     vkCmdFillBuffer(cmd, output.currentBitfieldBuffer.buffer, 0, output.currentBitfieldBuffer.size, 0);
     
     // Memory barrier
@@ -948,13 +903,7 @@ void ComputeOcclusionPass::runOcclusionCulling(
     const glm::mat4& viewProjMatrix,
     VkExtent2D renderExtent) {
     
-    // Run occlusion culling using the previously generated Hi-Z pyramid
-    // The Hi-Z pyramid should have been generated from the previous frame's complete depth buffer
-    
-    // Check if Hi-Z pyramid exists - on first frame it won't
     if (hiZPyramid_.fullPyramidView == VK_NULL_HANDLE) {
-        // No Hi-Z pyramid yet (first frame) - create a dummy one to avoid crashes
-        // The occlusion test will effectively be skipped due to previousPVSCount == 0
         createHiZPyramid(renderExtent);
         
         // Transition the newly created pyramid to GENERAL layout
@@ -978,9 +927,9 @@ void ComputeOcclusionPass::runOcclusionCulling(
     }
     
     // Calculate total blocks from volume dimensions
-    uint32_t blocksX = (pushConstants.volumeDim.x + 7) / 8;
-    uint32_t blocksY = (pushConstants.volumeDim.y + 7) / 8;
-    uint32_t blocksZ = (pushConstants.volumeDim.z + 7) / 8;
+    uint32_t blocksX = (pushConstants.volumeDim.x + pushConstants.blockDim.x -1) / pushConstants.blockDim.x;
+    uint32_t blocksY = (pushConstants.volumeDim.y + pushConstants.blockDim.y -1) / pushConstants.blockDim.y;
+    uint32_t blocksZ = (pushConstants.volumeDim.z + pushConstants.blockDim.z -1) / pushConstants.blockDim.z;
     uint32_t totalBlocks = blocksX * blocksY * blocksZ;
     
     // Update uniform buffer
@@ -1069,26 +1018,14 @@ void ComputeOcclusionPass::runOcclusionCulling(
     writes.back().descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes.back().pBufferInfo = &currBitfieldInfo;
     
-    // Binding 4: Dummy buffer (not used but needed for compatibility)
-    VkDescriptorBufferInfo dummyInfo{};
-    dummyInfo.buffer = output.pvsCurrentBuffer.buffer; // Use any valid buffer
-    dummyInfo.offset = 0;
-    dummyInfo.range = VK_WHOLE_SIZE;
-    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET});
-    writes.back().dstSet = occlusionDescSet;
-    writes.back().dstBinding = 4;
-    writes.back().descriptorCount = 1;
-    writes.back().descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes.back().pBufferInfo = &dummyInfo;
-    
-    // Binding 5: Uniform buffer
+    // Binding 4: Uniform buffer
     VkDescriptorBufferInfo uniformInfo{};
     uniformInfo.buffer = uniformBuffer_.buffer;
     uniformInfo.offset = 0;
     uniformInfo.range = sizeof(UniformData);
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET});
     writes.back().dstSet = occlusionDescSet;
-    writes.back().dstBinding = 5;
+    writes.back().dstBinding = 4;
     writes.back().descriptorCount = 1;
     writes.back().descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes.back().pBufferInfo = &uniformInfo;

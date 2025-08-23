@@ -25,10 +25,8 @@ void main() {
     float d01 = imageLoad(prevLevelInput, inputBase + ivec2(0, 1)).r;
     float d11 = imageLoad(prevLevelInput, inputBase + ivec2(1, 1)).r;
 
-    // Reversed-Z: Use MAX depth for conservative test
-    // With reversed-Z, closer objects have HIGHER depth values (near 1.0)
-    // An object is occluded if its depth is less than the maximum (closest) occluder
-    float maxDepth = max(max(d00, d10), max(d01, d11));
-    
-    imageStore(currentLevelOutput, outputCoord, vec4(maxDepth));
+    float m0 = min(d00, d10);
+    float m1 = min(d01, d11);
+    float minDepth = min(m0, m1);
+    imageStore(currentLevelOutput, outputCoord, vec4(minDepth));
 }

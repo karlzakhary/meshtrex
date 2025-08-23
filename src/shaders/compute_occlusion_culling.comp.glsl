@@ -1,6 +1,7 @@
 #version 460 core
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_EXT_debug_printf : enable
+#extension GL_KHR_shader_subgroup_arithmetic: enable
 
 // Compute-based occlusion culling using Hi-Z pyramid
 // This shader produces a complete PVS for the current frame only
@@ -24,13 +25,8 @@ layout(set = 0, binding = 3) restrict buffer CurrentVisibilityBitfield {
     uint bits[];  // Each uint stores visibility for 32 blocks
 } currentVisibility;
 
-// Note: binding 4 is still needed for descriptor set compatibility but not used
-layout(set = 0, binding = 4) restrict buffer Unused {
-    uint dummy;
-} unused;
-
 // Uniforms
-layout(set = 0, binding = 5) uniform UniformBuffer {
+layout(set = 0, binding = 4) uniform UniformBuffer {
     mat4 viewProj;
     mat4 prevViewProj;
     vec4 frustumPlanes[6];  // Frustum planes in world space
@@ -72,11 +68,10 @@ bool isInFrustum(vec3 minPos, vec3 maxPos) {
 // Project a 3D bounding box to screen space and get depth range
 // Reversed-Z: We need the maximum depth (closest point) for occlusion testing
 void projectToScreen(vec3 minPos, vec3 maxPos, out vec2 screenMin, out vec2 screenMax, out float minZ) {
-    screenMin = vec2(1.0);
-    screenMax = vec2(0.0);
-    minZ = 0.0;  // Reversed-Z: Initialize to far plane
+    screenMin = vec2(2.0);
+    screenMax = vec2(-1.0);
+    minZ = 0.0;  // Reversed-Z: Initialize to far plane (will find maximum/closest)
     
-    // Test all 8 corners of the bounding box
     for (int i = 0; i < 8; i++) {
         vec3 corner = vec3(
             (i & 1) != 0 ? maxPos.x : minPos.x,
@@ -107,7 +102,7 @@ uint selectHiZLevel(vec2 screenMin, vec2 screenMax) {
 }
 
 // Test occlusion against Hi-Z pyramid
-bool isOccludedByHiZ(vec2 screenMin, vec2 screenMax, float minZ) {
+bool isOccludedByHiZ(vec2 screenMin, vec2 screenMax, float minZ, vec3 blockMin, vec3 blockMax) {
     // --- (Keep all of your initial checks the same) ---
     screenMin = clamp(screenMin, vec2(0.0), vec2(1.0));
     screenMax = clamp(screenMax, vec2(0.0), vec2(1.0));
@@ -126,97 +121,91 @@ bool isOccludedByHiZ(vec2 screenMin, vec2 screenMax, float minZ) {
     }
 
     uint level = selectHiZLevel(screenMin, screenMax);
-    float lod = float(level);
-
-    // 1. Sample the four corners of the screen-space bounding box
-    float d0 = textureLod(hiZPyramid, screenMin, lod).r;
-    float d1 = textureLod(hiZPyramid, vec2(screenMax.x, screenMin.y), lod).r;
-    float d2 = textureLod(hiZPyramid, screenMax, lod).r;
-    float d3 = textureLod(hiZPyramid, vec2(screenMin.x, screenMax.y), lod).r;
-
-    // 2. Find the closest occluder. With a reversed-Z max-pyramid, this is the MAXIMUM of the sampled depths.
-    float closestOccluderDepth = max(max(d0, d1), max(d2, d3));
-    
-    return minZ < closestOccluderDepth - 0.00002;
+    ivec2 sizeL = textureSize(hiZPyramid, int(level));
+    vec2  centerUV = clamp((screenMin + screenMax) * 0.5, 0.0, 1.0);
+    ivec2 coord = clamp(ivec2(centerUV * vec2(sizeL)), ivec2(0), sizeL - ivec2(1));
+    float hizMin = texelFetch(hiZPyramid, coord, int(level)).r;
+    bool occluded = (minZ  + 1e-5 <= hizMin); 
+    return occluded;
 }
 
 void main() {
     uint blockIndex = gl_GlobalInvocationID.x;
-    
-    // Check bounds
-    if (blockIndex >= ubo.totalBlocks) {
-        return;
-    }
-    
-    // TEMPORAL COHERENCE: Check if this block was in previous PVS using bitfield
-    bool wasInPreviousPVS = false;
-    if (ubo.previousPVSCount > 0) {
-        uint bitfieldIdx = blockIndex / 32;
-        uint bitIdx = blockIndex % 32;
-        wasInPreviousPVS = (previousVisibility.bits[bitfieldIdx] & (1u << bitIdx)) != 0;
-    }
-    
-    // 1. Min-Max Test
+
+    // --- per-invocation bookkeeping (no early returns; we reduce at the end) ---
+    bool inRange  = (blockIndex < ubo.totalBlocks);
+    bool alive    = inRange;     // survives minmax + frustum
+    bool visible  = false;       // final decision for this invocation
+
+    // 1) Compute 3D block coord only if needed
     ivec3 numBlocks = (ubo.volumeDimensions + 7) / 8;
-    ivec3 blockCoord;
-    blockCoord.z = int(blockIndex) / (numBlocks.x * numBlocks.y);
-    blockCoord.y = (int(blockIndex) % (numBlocks.x * numBlocks.y)) / numBlocks.x;
-    blockCoord.x = int(blockIndex) % numBlocks.x;
-    
-    // Sample min-max values using texelFetch for exact sampling
-    uvec2 minMax = texelFetch(minMaxTexture, blockCoord, 0).rg;
-    // ubo.isovalue is normalized (0-1), but min-max values are in 0-255 range
-    float scaledIsovalue = ubo.isovalue * 255.0;
-        
-    // Block is active if isovalue is within [min, max] range
-    // Cull if isovalue is outside the range
-    if (scaledIsovalue < float(minMax.x) || scaledIsovalue > float(minMax.y)) {
-        return;
-    }
-    
-    // 2. Frustum Culling
-    vec3 blockMin = ubo.volumeMin + vec3(blockCoord) * ubo.blockSize;
-    vec3 blockMax = blockMin + vec3(ubo.blockSize);
-    
-    if (!isInFrustum(blockMin, blockMax)) {
-        return;
-    }
-    
-    // 3. HI-Z OCCLUSION TEST
-    // Only test if we have a valid Hi-Z pyramid from previous frame
-    if (ubo.previousPVSCount > 0) {
-        vec2 screenMin, screenMax;
-        float minZ;
-        projectToScreen(blockMin, blockMax, screenMin, screenMax, minZ);
+    ivec3 blockCoord = ivec3(0);
 
-        if (minZ <= 0.0 || screenMin.x > screenMax.x || screenMin.y > screenMax.y) {
-            // Conservative: don't cull if projection failed
-        } else {
-            // Use consistent Hi-Z test for all blocks
-            // The temporal coherence is handled by the two-pass rendering system
-            uint level = selectHiZLevel(screenMin, screenMax);
-            float lod = float(level);
+    if (alive) {
+        blockCoord.z = int(blockIndex) / (numBlocks.x * numBlocks.y);
+        blockCoord.y = (int(blockIndex) % (numBlocks.x * numBlocks.y)) / numBlocks.x;
+        blockCoord.x = int(blockIndex) % numBlocks.x;
 
-            // Sample four corners for robust occlusion test
-            float d0 = textureLod(hiZPyramid, screenMin, lod).r;
-            float d1 = textureLod(hiZPyramid, vec2(screenMax.x, screenMin.y), lod).r;
-            float d2 = textureLod(hiZPyramid, screenMax, lod).r;
-            float d3 = textureLod(hiZPyramid, vec2(screenMin.x, screenMax.y), lod).r;
-            
-            float closestOccluderDepth = max(max(d0, d1), max(d2, d3));
-            
-            // Use a consistent bias for all blocks to prevent artifacts
-            float bias = 0.00002;
-            bool isOccluded = minZ < closestOccluderDepth - bias;
-            
-            if (isOccluded) {
-                return; // Cull the block
-            }
+        // Min-max test
+        uvec2 minMax = texelFetch(minMaxTexture, blockCoord, 0).rg;
+        float scaledIsovalue = ubo.isovalue * 255.0;
+        if (scaledIsovalue < float(minMax.x) || scaledIsovalue > float(minMax.y)) {
+            alive = false;
         }
     }
 
-    // If the block survived all tests, mark it as visible for the next frame.
-    uint bitfieldIdx = blockIndex / 32;
-    uint bitIdx = blockIndex % 32;
-    atomicOr(currentVisibility.bits[bitfieldIdx], 1u << bitIdx);
+    // 2) Frustum test
+    vec3 blockMin = vec3(0.0);
+    vec3 blockMax = vec3(0.0);
+    if (alive) {
+        blockMin = ubo.volumeMin + vec3(blockCoord) * ubo.blockSize;
+        blockMax = blockMin + vec3(ubo.blockSize);
+        if (!isInFrustum(blockMin, blockMax)) {
+            alive = false;
+        }
+    }
+
+    if (alive) {
+        if (ubo.previousPVSCount > 0u) {
+            vec2 screenMin, screenMax;
+            float minZ;
+            projectToScreen(blockMin, blockMax, screenMin, screenMax, minZ);
+
+            bool skipHiZ = false;
+            const float nearPlaneThreshold = 0.99; // reversed-Z
+            if (minZ > nearPlaneThreshold) {
+                skipHiZ = true;        // too close → visible
+            } else if (minZ <= 0.0 || screenMin.x >= screenMax.x || screenMin.y >= screenMax.y) {
+                skipHiZ = true;        // conservative fallback
+            }
+
+            if (skipHiZ) {
+                visible = true;
+            } else {
+                bool occluded = isOccludedByHiZ(screenMin, screenMax, minZ, blockMin, blockMax);
+                visible = !occluded;
+            }
+        } else {
+            // No Hi-Z yet (bootstrap): visible if it passed minmax+frustum
+            visible = true;
+        }
+    }
+
+    // --- Workgroup aggregation: one atomic per 32 lanes ---
+
+    uint lane = gl_SubgroupInvocationID & 31u;
+    uint tile = gl_LocalInvocationID.x >> 5;    // 0..7 within WG
+
+    // Each lane contributes its bit (or 0)
+    uint myBit = visible ? (1u << lane) : 0u;
+
+    // OR within clusters of 32 lanes
+    uint mask  = subgroupOr(myBit);
+
+    // Lane 0 of each 32-lane cluster writes one global atomic
+    if (lane == 0u) {
+        uint groupBase = gl_WorkGroupID.x * gl_WorkGroupSize.x; // WG*256
+        uint baseWord  = (groupBase >> 5) + tile;
+        if (mask != 0u) atomicOr(currentVisibility.bits[baseWord], mask);
+    }
 }
