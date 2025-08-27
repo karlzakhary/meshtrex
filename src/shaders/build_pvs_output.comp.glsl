@@ -95,12 +95,6 @@ void main() {
         }
         s_warpOffsetCurrent = globalOffsetCurrent;
         s_warpOffsetDifference = globalOffsetDifference;
-        
-        // Debug output for first few workgroups
-        // if (gl_WorkGroupID.x < 3) {
-        //     debugPrintfEXT("BuildPVS WG %d: found %d current, %d difference blocks", 
-        //                   gl_WorkGroupID.x, warpTotalCurrent, warpTotalDifference);
-        // }
     }
     
     barrier();

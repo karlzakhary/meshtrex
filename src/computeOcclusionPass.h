@@ -91,6 +91,17 @@ public:
     // Extract frustum planes from view-projection matrix
     void extractFrustumPlanes(const glm::mat4& viewProj, glm::vec4 planes[6]);
     
+    // Debug functionality
+    struct DebugStats {
+        uint32_t hiZTests = 0;
+        uint32_t hiZOccluded = 0;
+        uint32_t atomicOps = 0;
+    };
+    
+    void enableDebug(bool enable) { debugEnabled_ = enable; }
+    DebugStats getDebugStats();
+    void clearDebugStats(VkCommandBuffer cmd);
+    
 private:
     const VulkanContext& context_;
     VkDevice device_;
@@ -121,13 +132,30 @@ private:
     // Pipeline for building PVS output from bitfields
     VkPipeline buildOutputPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout buildOutputLayout_ = VK_NULL_HANDLE;
+    
+    // Indirect dispatch support
+    bool useIndirectDispatch_ = true; // Re-enabled for testing
+    Buffer indirectDispatchBuffer_;
+    bool indirectBufferInitialized_ = false;  // Track if buffer has been initialized
+    VkPipeline indirectUpdatePipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout indirectUpdateLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout indirectUpdateDescLayout_ = VK_NULL_HANDLE;
+    VkShaderModule indirectUpdateComputeShader_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout buildOutputDescLayout_ = VK_NULL_HANDLE;
+    
+    // Persistent descriptor pool for indirect dispatch (never reset)
+    VkDescriptorPool persistentIndirectPool_[MAX_FRAMES_IN_FLIGHT] = {};
+    VkDescriptorSet indirectUpdateDescSets_[MAX_FRAMES_IN_FLIGHT] = {};
     
     // Uniform buffer
     Buffer uniformBuffer_;
     
     // Readback buffer for PVS counts
     Buffer readbackBuffer_;
+    
+    // Debug statistics buffer
+    Buffer debugStatsBuffer_;
+    bool debugEnabled_ = false;
     
     // Shaders
     VkShaderModule hiZGenerateShader_ = VK_NULL_HANDLE;
@@ -152,6 +180,9 @@ private:
     void createPipelines();
     void createDescriptorPools();
     void loadShaders();
+    void createIndirectDispatchBuffer();
+    void createIndirectUpdatePipeline();
+    void updateIndirectDispatchBuffer(VkCommandBuffer cmd, uint32_t totalBlocks);
     
     // Helper to calculate number of mip levels needed
     uint32_t calculateMipLevels(VkExtent2D extent);

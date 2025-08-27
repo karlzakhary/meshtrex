@@ -55,6 +55,7 @@ VkInstance createInstance()
     } else {
         printf("Warning: Vulkan debug layers are not available\n");
     }
+    
     VkValidationFeaturesEXT validationFeatures = {};
     validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
 
@@ -96,7 +97,9 @@ VkInstance createInstance()
 
     createInfo.ppEnabledExtensionNames = extensions;
     createInfo.enabledExtensionCount = std::size(extensions);
+#if KHR_VALIDATION || SYNC_VALIDATION
     createInfo.pNext = &validationFeatures;
+#endif
 #ifdef VK_USE_PLATFORM_METAL_EXT
     createInfo.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
 #endif

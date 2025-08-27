@@ -13,6 +13,8 @@ ComputeOcclusionPass::ComputeOcclusionPass(const VulkanContext& context)
     loadShaders();
     createPipelines();
     createDescriptorPools();
+    createIndirectDispatchBuffer();
+    createIndirectUpdatePipeline();
 }
 
 ComputeOcclusionPass::~ComputeOcclusionPass() {
@@ -22,6 +24,10 @@ ComputeOcclusionPass::~ComputeOcclusionPass() {
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         if (descriptorPools_[i] != VK_NULL_HANDLE) {
             vkDestroyDescriptorPool(device_, descriptorPools_[i], nullptr);
+        }
+        // Destroy persistent indirect pools
+        if (persistentIndirectPool_[i] != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(device_, persistentIndirectPool_[i], nullptr);
         }
     }
     
@@ -82,12 +88,33 @@ ComputeOcclusionPass::~ComputeOcclusionPass() {
         vkDestroyShaderModule(device_, buildOutputShader_, nullptr);
     }
     
+    // Clean up indirect dispatch resources
+    if (indirectDispatchBuffer_.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(indirectDispatchBuffer_, device_);
+    }
+    if (indirectUpdatePipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, indirectUpdatePipeline_, nullptr);
+    }
+    if (indirectUpdateLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, indirectUpdateLayout_, nullptr);
+    }
+    if (indirectUpdateDescLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, indirectUpdateDescLayout_, nullptr);
+    }
+    if (indirectUpdateComputeShader_ != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device_, indirectUpdateComputeShader_, nullptr);
+    }
+    
     if (depthSampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(device_, depthSampler_, nullptr);
     }
     
     if (readbackBuffer_.buffer != VK_NULL_HANDLE) {
         destroyBuffer(readbackBuffer_, device_);
+    }
+    
+    if (debugStatsBuffer_.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(debugStatsBuffer_, device_);
     }
 }
 
@@ -243,7 +270,7 @@ void ComputeOcclusionPass::createDescriptorPools() {
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         std::vector<VkDescriptorPoolSize> poolSizes = {
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 20},         // For Hi-Z pyramid levels
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10},        // For PVS buffers
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 15},        // For PVS buffers + indirect dispatch
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 5},         // For uniform buffers
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5}  // For Hi-Z sampler
         };
@@ -251,7 +278,7 @@ void ComputeOcclusionPass::createDescriptorPools() {
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
         poolInfo.pPoolSizes = poolSizes.data();
-        poolInfo.maxSets = 20;  // Maximum number of descriptor sets that can be allocated
+        poolInfo.maxSets = 30;  // Increased to accommodate indirect update descriptor sets
         poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
         
         VK_CHECK(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPools_[i]));
@@ -340,7 +367,7 @@ void ComputeOcclusionPass::createPipelines() {
     // Create compute occlusion culling pipeline
     {
         // Descriptor set layout
-        std::vector<VkDescriptorSetLayoutBinding> bindings(5);
+        std::vector<VkDescriptorSetLayoutBinding> bindings(6);  // Added debug buffer
         
         // Min-max texture sampler
         bindings[0].binding = 0;
@@ -371,6 +398,12 @@ void ComputeOcclusionPass::createPipelines() {
         bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[4].descriptorCount = 1;
         bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        
+        // Debug statistics buffer (optional, only used when DEBUG_OCCLUSION is defined)
+        bindings[5].binding = 5;
+        bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[5].descriptorCount = 1;
+        bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         
         VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -416,6 +449,12 @@ void ComputeOcclusionPass::createPipelines() {
     createBuffer(readbackBuffer_, device_, context_.getMemoryProperties(),
         sizeof(uint32_t) * 2,
         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    
+    // Create debug statistics buffer
+    createBuffer(debugStatsBuffer_, device_, context_.getMemoryProperties(),
+        sizeof(DebugStats),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     
     // Create build PVS output pipeline (converts bitfields to PVS lists)
@@ -835,6 +874,7 @@ bool ComputeOcclusionPass::performComputeOcclusionCulling(
     
     if (!shouldUpdate) {
         frameIndex_++;
+        
         return false;
     }
     
@@ -1030,22 +1070,44 @@ void ComputeOcclusionPass::runOcclusionCulling(
     writes.back().descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes.back().pBufferInfo = &uniformInfo;
     
+    // Binding 5: Debug statistics buffer (optional, only used when DEBUG_OCCLUSION is defined in shader)
+    VkDescriptorBufferInfo debugStatsInfo{};
+    debugStatsInfo.buffer = debugStatsBuffer_.buffer;
+    debugStatsInfo.offset = 0;
+    debugStatsInfo.range = sizeof(DebugStats);
+    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET});
+    writes.back().dstSet = occlusionDescSet;
+    writes.back().dstBinding = 5;
+    writes.back().descriptorCount = 1;
+    writes.back().descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes.back().pBufferInfo = &debugStatsInfo;
+    
     vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     
-    // Bind compute pipeline
+    // Use indirect dispatch if enabled
+    if (useIndirectDispatch_) {
+        updateIndirectDispatchBuffer(cmd, totalBlocks);
+    }
+    
+    // NOW bind occlusion pipeline (after indirect buffer update)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, occlusionPipeline_);
     
-    // Bind descriptor sets
+    // Bind descriptor sets for occlusion
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, occlusionLayout_,
                            0, 1, &occlusionDescSet, 0, nullptr);
     
-    // Dispatch compute with all blocks
-    // New workgroup size matches shader (256 threads per workgroup)
-    uint32_t workgroupSize = 256;
-    uint32_t numWorkgroups = (totalBlocks + workgroupSize - 1) / workgroupSize;
-    
-    // No push constants needed anymore
-    vkCmdDispatch(cmd, numWorkgroups, 1, 1);
+    if (useIndirectDispatch_) {
+        // Execute indirect dispatch with occlusion pipeline now bound
+        vkCmdDispatchIndirect(cmd, indirectDispatchBuffer_.buffer, 0);
+    } else {
+        // Direct dispatch fallback
+        // New workgroup size matches shader (256 threads per workgroup)
+        uint32_t workgroupSize = 256;
+        uint32_t numWorkgroups = (totalBlocks + workgroupSize - 1) / workgroupSize;
+        
+        // No push constants needed anymore
+        vkCmdDispatch(cmd, numWorkgroups, 1, 1);
+    }
     
     // Barrier before reading results
     VkMemoryBarrier2 resultBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -1226,4 +1288,176 @@ void ComputeOcclusionPass::runOcclusionCulling(
     // Clearing it here causes issues with temporal coherence
     
     return;
+}
+
+ComputeOcclusionPass::DebugStats ComputeOcclusionPass::getDebugStats() {
+    DebugStats stats;
+    if (debugStatsBuffer_.buffer != VK_NULL_HANDLE && debugStatsBuffer_.data != nullptr) {
+        // Read from the persistently mapped buffer
+        memcpy(&stats, debugStatsBuffer_.data, sizeof(DebugStats));
+    }
+    return stats;
+}
+
+void ComputeOcclusionPass::clearDebugStats(VkCommandBuffer cmd) {
+    if (debugStatsBuffer_.buffer != VK_NULL_HANDLE) {
+        // Clear the debug statistics buffer to zero
+        vkCmdFillBuffer(cmd, debugStatsBuffer_.buffer, 0, sizeof(DebugStats), 0);
+        
+        // Memory barrier to ensure clear completes before next use
+        VkMemoryBarrier2 clearBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+        
+        VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        depInfo.memoryBarrierCount = 1;
+        depInfo.pMemoryBarriers = &clearBarrier;
+        vkCmdPipelineBarrier2(cmd, &depInfo);
+    }
+}
+
+void ComputeOcclusionPass::createIndirectDispatchBuffer() {
+    // Create buffer for indirect dispatch command
+    // One command with 3 uint32_t values (x, y, z)
+    createBuffer(indirectDispatchBuffer_, device_, context_.getMemoryProperties(),
+                sizeof(uint32_t) * 3,
+                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
+
+void ComputeOcclusionPass::createIndirectUpdatePipeline() {
+    // Load compute shader
+    Shader computeShaderData{};
+    assert(loadShader(computeShaderData, device_, "/spirv/update_compute_indirect.comp.spv"));
+    indirectUpdateComputeShader_ = computeShaderData.module;
+    
+    // Create descriptor set layout
+    VkDescriptorSetLayoutBinding indirectBufferBinding{};
+    indirectBufferBinding.binding = 0;
+    indirectBufferBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    indirectBufferBinding.descriptorCount = 1;
+    indirectBufferBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = 1;
+    layoutInfo.pBindings = &indirectBufferBinding;
+    
+    VK_CHECK(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &indirectUpdateDescLayout_));
+    
+    // Create pipeline layout with push constant for totalBlockCount
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = sizeof(uint32_t);
+    
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &indirectUpdateDescLayout_;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+    
+    VK_CHECK(vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &indirectUpdateLayout_));
+    
+    // Create compute pipeline
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    
+    VkPipelineShaderStageCreateInfo shaderStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    shaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    shaderStage.module = indirectUpdateComputeShader_;
+    shaderStage.pName = "main";
+    
+    pipelineInfo.stage = shaderStage;
+    pipelineInfo.layout = indirectUpdateLayout_;
+    
+    VK_CHECK(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &indirectUpdatePipeline_));
+    
+    // Create persistent descriptor pools for indirect dispatch (never reset)
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        poolSize.descriptorCount = 1;
+        
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.maxSets = 1;
+        
+        VK_CHECK(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &persistentIndirectPool_[i]));
+        
+        // Pre-allocate descriptor sets
+        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocInfo.descriptorPool = persistentIndirectPool_[i];
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &indirectUpdateDescLayout_;
+        
+        VK_CHECK(vkAllocateDescriptorSets(device_, &allocInfo, &indirectUpdateDescSets_[i]));
+        
+        // Update descriptor set with indirect buffer
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = indirectDispatchBuffer_.buffer;
+        bufferInfo.offset = 0;
+        bufferInfo.range = sizeof(uint32_t) * 3;
+        
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = indirectUpdateDescSets_[i];
+        write.dstBinding = 0;
+        write.dstArrayElement = 0;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.descriptorCount = 1;
+        write.pBufferInfo = &bufferInfo;
+        
+        vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    }
+}
+
+void ComputeOcclusionPass::updateIndirectDispatchBuffer(VkCommandBuffer cmd, uint32_t totalBlocks) {
+    // Initialize buffer on first use to prevent Nsight crashes with uninitialized data
+    if (!indirectBufferInitialized_) {
+        uint32_t initValue = 1;  // Safe default: (1,1,1) dispatch
+        vkCmdFillBuffer(cmd, indirectDispatchBuffer_.buffer, 0, sizeof(uint32_t) * 3, initValue);
+        
+        // Barrier to ensure initialization completes before use
+        VkMemoryBarrier2 initBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        initBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        initBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        initBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        initBarrier.dstAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+        
+        VkDependencyInfo initDep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        initDep.memoryBarrierCount = 1;
+        initDep.pMemoryBarriers = &initBarrier;
+        vkCmdPipelineBarrier2(cmd, &initDep);
+        
+        indirectBufferInitialized_ = true;
+    }
+    
+    // Use pre-allocated persistent descriptor set
+    VkDescriptorSet indirectDescSet = indirectUpdateDescSets_[currentFrameIndex_];
+    
+    // Bind pipeline and descriptor set
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, indirectUpdatePipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, indirectUpdateLayout_,
+                           0, 1, &indirectDescSet, 0, nullptr);
+    
+    // Push total block count
+    vkCmdPushConstants(cmd, indirectUpdateLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(uint32_t), &totalBlocks);
+    
+    // Dispatch single thread to update indirect buffer
+    vkCmdDispatch(cmd, 1, 1, 1);
+    
+    // Barrier to ensure indirect buffer is written before use
+    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;  // Required for VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT
+    barrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    
+    VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depInfo.memoryBarrierCount = 1;
+    depInfo.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
 }

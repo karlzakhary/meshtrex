@@ -1,7 +1,14 @@
 #version 460 core
 #extension GL_EXT_scalar_block_layout : enable
-#extension GL_EXT_debug_printf : enable
 #extension GL_KHR_shader_subgroup_arithmetic: enable
+
+// Use DEBUG_ENABLED from CMake (defaults to 0 if not defined)
+#ifndef DEBUG_ENABLED
+#define DEBUG_ENABLED 0
+#endif
+
+// Enable debug metrics collection only in debug builds
+#define DEBUG_OCCLUSION DEBUG_ENABLED
 
 // Compute-based occlusion culling using Hi-Z pyramid
 // This shader produces a complete PVS for the current frame only
@@ -40,6 +47,15 @@ layout(set = 0, binding = 4) uniform UniformBuffer {
     uint hiZLevels;
     uint previousPVSCount;
 } ubo;
+
+// Simple debug buffer for Hi-Z occlusion statistics
+#ifdef DEBUG_OCCLUSION
+layout(set = 0, binding = 5) coherent buffer DebugStats {
+    uint hiZTests;      // Total blocks that reached Hi-Z test
+    uint hiZOccluded;   // Total blocks occluded by Hi-Z
+    uint atomicOps;     // Total atomic operations performed
+} debugStats;
+#endif
 
 // No push constants needed - we process all blocks directly
 
@@ -182,8 +198,16 @@ void main() {
             if (skipHiZ) {
                 visible = true;
             } else {
+#ifdef DEBUG_OCCLUSION
+                atomicAdd(debugStats.hiZTests, 1);
+#endif
                 bool occluded = isOccludedByHiZ(screenMin, screenMax, minZ, blockMin, blockMax);
                 visible = !occluded;
+#ifdef DEBUG_OCCLUSION
+                if (occluded) {
+                    atomicAdd(debugStats.hiZOccluded, 1);
+                }
+#endif
             }
         } else {
             // No Hi-Z yet (bootstrap): visible if it passed minmax+frustum
@@ -206,6 +230,11 @@ void main() {
     if (lane == 0u) {
         uint groupBase = gl_WorkGroupID.x * gl_WorkGroupSize.x; // WG*256
         uint baseWord  = (groupBase >> 5) + tile;
-        if (mask != 0u) atomicOr(currentVisibility.bits[baseWord], mask);
+        if (mask != 0u) {
+            atomicOr(currentVisibility.bits[baseWord], mask);
+#ifdef DEBUG_OCCLUSION
+            atomicAdd(debugStats.atomicOps, 1);
+#endif
+        }
     }
 }

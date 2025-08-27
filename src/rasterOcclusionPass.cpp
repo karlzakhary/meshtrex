@@ -12,6 +12,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <array>
 #include <algorithm>
+#include <cstring>
 
 RasterOcclusionPass::RasterOcclusionPass(const VulkanContext& context) 
     : context_(context), device_(context.getDevice()) {
@@ -24,6 +25,12 @@ RasterOcclusionPass::RasterOcclusionPass(const VulkanContext& context)
     createIndirectUpdatePipeline();
     useIndirectDraw_ = true;  // Enable indirect drawing by default
     createPersistentResources();
+    
+    // Create debug statistics buffer
+    createBuffer(debugStatsBuffer_, device_, context.getMemoryProperties(),
+        sizeof(DebugStats),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
 
 RasterOcclusionPass::~RasterOcclusionPass() {
@@ -71,6 +78,11 @@ RasterOcclusionPass::~RasterOcclusionPass() {
     }
     if (buildOutputShader_ != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device_, buildOutputShader_, nullptr);
+    }
+    
+    // Cleanup debug buffer
+    if (debugStatsBuffer_.buffer != VK_NULL_HANDLE) {
+        destroyBuffer(debugStatsBuffer_, device_);
     }
     
     // Cleanup indirect draw resources
@@ -126,7 +138,10 @@ void RasterOcclusionPass::createPipelineLayout() {
          VK_SHADER_STAGE_TASK_BIT_EXT, nullptr},
         // Binding 2: Visibility buffer SSBO
         {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, 
-         VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}
+         VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        // Binding 3: Debug statistics buffer (optional)
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+         VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}
     };
     
     VkDescriptorSetLayoutCreateInfo occlusionLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -464,6 +479,11 @@ RasterOcclusionPass::Output RasterOcclusionPass::performOcclusionCulling(
     VkDescriptorBufferInfo visibilityInfo{output.visibilityBuffer.buffer, 0, VK_WHOLE_SIZE};
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, occlusionDescriptorSet,
                      2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &visibilityInfo, nullptr});
+    
+    // Binding 3: Debug statistics buffer (optional)
+    VkDescriptorBufferInfo debugInfo{debugStatsBuffer_.buffer, 0, sizeof(DebugStats)};
+    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, occlusionDescriptorSet,
+                     3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &debugInfo, nullptr});
     
     vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     
@@ -932,6 +952,11 @@ bool RasterOcclusionPass::performTemporalOcclusionCulling(
     writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, occlusionDescriptorSet,
                      2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &visibilityInfo, nullptr});
     
+    // Binding 3: Debug statistics buffer (optional)
+    VkDescriptorBufferInfo debugInfo{debugStatsBuffer_.buffer, 0, sizeof(DebugStats)};
+    writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, occlusionDescriptorSet,
+                     3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &debugInfo, nullptr});
+    
     vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     
     // Set viewport and scissor
@@ -1280,4 +1305,32 @@ void RasterOcclusionPass::updateIndirectDrawBufferGPU(VkCommandBuffer cmd, uint3
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+RasterOcclusionPass::DebugStats RasterOcclusionPass::getDebugStats() {
+    DebugStats stats;
+    if (debugStatsBuffer_.buffer != VK_NULL_HANDLE && debugStatsBuffer_.data != nullptr) {
+        // Read from the persistently mapped buffer
+        memcpy(&stats, debugStatsBuffer_.data, sizeof(DebugStats));
+    }
+    return stats;
+}
+
+void RasterOcclusionPass::clearDebugStats(VkCommandBuffer cmd) {
+    if (debugStatsBuffer_.buffer != VK_NULL_HANDLE) {
+        // Clear the debug statistics buffer to zero
+        vkCmdFillBuffer(cmd, debugStatsBuffer_.buffer, 0, sizeof(DebugStats), 0);
+        
+        // Memory barrier to ensure clear completes before next use
+        VkMemoryBarrier2 clearBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+        clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+        
+        VkDependencyInfo depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        depInfo.memoryBarrierCount = 1;
+        depInfo.pMemoryBarriers = &clearBarrier;
+        vkCmdPipelineBarrier2(cmd, &depInfo);
+    }
 }

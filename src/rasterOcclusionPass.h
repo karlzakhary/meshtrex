@@ -138,10 +138,25 @@ public:
 
     // Initialize output for first frame
     void initializeOutput(Output& output, uint32_t numBlocks);
+    
+    // Debug functionality
+    struct DebugStats {
+        uint32_t blocksQueried = 0;      // Total blocks that went through occlusion query
+        uint32_t blocksVisible = 0;      // Blocks that passed occlusion test
+        uint32_t atomicOps = 0;          // Total atomic operations performed
+    };
+    
+    void enableDebug(bool enable) { debugEnabled_ = enable; }
+    DebugStats getDebugStats();
+    void clearDebugStats(VkCommandBuffer cmd);
 
 private:
     const VulkanContext& context_;
     VkDevice device_;
+    
+    // Debug statistics buffer
+    Buffer debugStatsBuffer_;
+    bool debugEnabled_ = false;
     
     // Temporary descriptor pool for indirect update (cleaned up after command submission)
     IndirectTempResources indirectTempResources_;

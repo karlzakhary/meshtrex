@@ -8,6 +8,13 @@
 #extension GL_EXT_shader_subgroup_extended_types_int8: require
 #extension GL_EXT_debug_printf : enable
 
+// Use DEBUG_ENABLED from CMake (defaults to 0 if not defined)
+#ifndef DEBUG_ENABLED
+#define DEBUG_ENABLED 0
+#endif
+
+#define DEBUG_OCCLUSION DEBUG_ENABLED
+
 #define WORKGROUP_SIZE 32
 #define BLOCKS_PER_WORKGROUP 256
 #define BLOCKS_PER_THREAD (BLOCKS_PER_WORKGROUP / WORKGROUP_SIZE)
@@ -24,6 +31,13 @@ layout(set = 0, binding = 0) uniform ViewUniforms {
 } view;
 
 layout(set = 0, binding = 1) uniform usampler3D minMaxHierarchy;
+
+// Debug statistics buffer (optional)
+layout(set = 0, binding = 3) coherent buffer DebugStats {
+    uint blocksQueried;
+    uint blocksVisible;
+    uint atomicOps;
+} debugStats;
 
 taskPayloadSharedEXT struct Task {
     uint baseID;
@@ -103,7 +117,15 @@ void main() {
 
         taskOutput.baseID = workgroupID;
         taskOutput.numOccupiedBlocks = totalOccupied;
-        
+        #ifdef DEBUG_OCCLUSION
+        atomicAdd(debugStats.blocksVisible, totalOccupied);
+
+        // Debug: Count blocks that were queried (passed min-max test)
+        if (totalOccupied > 0) {
+            atomicAdd(debugStats.blocksQueried, totalOccupied);
+            atomicAdd(debugStats.atomicOps, 1);
+        }
+        #endif
         uint meshWorkgroups = (totalOccupied + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
         if (meshWorkgroups > 0) {
             EmitMeshTasksEXT(meshWorkgroups, 1, 1);
