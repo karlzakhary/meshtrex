@@ -73,7 +73,7 @@ void main() {
     uvec3 groupStartBlock = groupCoord * uvec3(8, 8, 4);
 
     // --- 1. Identify Occupied Blocks ---
-    // Each thread checks 8 blocks.
+    // Each thread checks 8 blocks (256 blocks / 32 threads = 8).
     bool blockOccupancyForThread[BLOCKS_PER_THREAD];
     uint numBlocksChecked = 0;
     for (int i = 0; i < BLOCKS_PER_THREAD; ++i) {

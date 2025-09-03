@@ -758,19 +758,23 @@ ExtractionOutput extractMeshletDescriptorsWithDensity(
             mediumPipeline.descriptorSet_, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             nullptr, &consolidatedBufferInfo, nullptr});
         
-        // TODO: Update density-based extraction to use new MC table utils
-        // For now, commented out as density-based approach is being ignored
-        /*
         // Binding 4: MC Triangle Table
+        VkDescriptorBufferInfo mcTriTableInfo{};
+        mcTriTableInfo.buffer = mcTables.triTableBuffer.buffer;
+        mcTriTableInfo.offset = 0;
+        mcTriTableInfo.range = 256 * 16 * sizeof(uint8_t);
         writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
             mediumPipeline.descriptorSet_, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             nullptr, &mcTriTableInfo, nullptr});
         
-        // Binding 5: MC Edge Table
+        // Binding 5: MC Num Vertices Table
+        VkDescriptorBufferInfo mcNumVerticesInfo{};
+        mcNumVerticesInfo.buffer = mcTables.numVerticesBuffer.buffer;
+        mcNumVerticesInfo.offset = 0;
+        mcNumVerticesInfo.range = 256 * sizeof(uint8_t);
         writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
             mediumPipeline.descriptorSet_, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            nullptr, &mcEdgeTableInfo, nullptr});
-        */
+            nullptr, &mcNumVerticesInfo, nullptr});
         
         // Binding 6: Output Vertex Buffer
         writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
@@ -840,6 +844,23 @@ ExtractionOutput extractMeshletDescriptorsWithDensity(
         if (profiler) {
             // profiler->endProfileRegion(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
         }
+        
+        // --- Add Post-Extraction Barriers (CRITICAL for synchronization with rendering) ---
+        // These barriers ensure buffers written by extraction shaders are ready for reading by rendering
+        std::vector<VkBufferMemoryBarrier2> postBufferBarriers;
+        VkPipelineStageFlags2 postSrcStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+        VkAccessFlags2 postSrcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        VkPipelineStageFlags2 postDstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+        VkAccessFlags2 postDstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.vertexBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.indexBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.meshletDescriptorBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.vertexCountBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.indexCountBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
+        postBufferBarriers.push_back(bufferBarrier(extractionOutput.meshletDescriptorCountBuffer.buffer, postSrcStageMask, postSrcAccessMask, postDstStageMask, postDstAccessMask, 0, VK_WHOLE_SIZE));
+
+        pipelineBarrier(cmd, {}, postBufferBarriers.size(), postBufferBarriers.data(), 0, {});
         
         // Submit if we own the command buffer
         if (ownCommandBuffer) {

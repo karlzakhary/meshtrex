@@ -53,53 +53,85 @@ DensityAnalyzer::BlockDensity DensityAnalyzer::analyzeBlock(
     uint32_t totalSamples = 0;
     uint32_t edgeSamples = 0;
     
-    const uint32_t SAMPLE_RATE = 4;  // Increased sampling for better coverage
+    // Calculate actual block dimensions
+    uint32_t blockWidth = blockEnd.x - blockStart.x;
+    uint32_t blockHeight = blockEnd.y - blockStart.y;
+    uint32_t blockDepth = blockEnd.z - blockStart.z;
     
-    for (uint32_t sz = 0; sz < SAMPLE_RATE; sz++) {
-        for (uint32_t sy = 0; sy < SAMPLE_RATE; sy++) {
-            for (uint32_t sx = 0; sx < SAMPLE_RATE; sx++) {
-                // Map to actual voxel coordinates
-                glm::uvec3 samplePos;
-                samplePos.x = blockStart.x + (blockEnd.x - blockStart.x - 1) * sx / (SAMPLE_RATE - 1);
-                samplePos.y = blockStart.y + (blockEnd.y - blockStart.y - 1) * sy / (SAMPLE_RATE - 1);
-                samplePos.z = blockStart.z + (blockEnd.z - blockStart.z - 1) * sz / (SAMPLE_RATE - 1);
-                
-                // Ensure we're within bounds
-                if (samplePos.x < params.volumeDim.x && 
-                    samplePos.y < params.volumeDim.y && 
-                    samplePos.z < params.volumeDim.z) {
+    // Handle degenerate blocks (1x1x1)
+    if (blockWidth <= 1 || blockHeight <= 1 || blockDepth <= 1) {
+        // For tiny blocks, just sample the center point
+        glm::uvec3 samplePos = blockStart;
+        if (samplePos.x < params.volumeDim.x && 
+            samplePos.y < params.volumeDim.y && 
+            samplePos.z < params.volumeDim.z) {
+            
+            uint32_t idx = samplePos.z * params.volumeDim.x * params.volumeDim.y + 
+                          samplePos.y * params.volumeDim.x + 
+                          samplePos.x;
+            
+            float value = float(volume[idx]);
+            float isoDist = std::abs(value - isovalue);
+            
+            // Simple classification for 1x1x1 blocks
+            result.complexity = (isoDist < 25.5f) ? 0.5f : 0.0f;
+        } else {
+            result.complexity = 0.0f;
+        }
+    } else {
+        // Normal sampling for larger blocks
+        const uint32_t SAMPLE_RATE = 4;  // Increased sampling for better coverage
+        
+        for (uint32_t sz = 0; sz < SAMPLE_RATE; sz++) {
+            for (uint32_t sy = 0; sy < SAMPLE_RATE; sy++) {
+                for (uint32_t sx = 0; sx < SAMPLE_RATE; sx++) {
+                    // Map to actual voxel coordinates
+                    glm::uvec3 samplePos;
+                    samplePos.x = blockStart.x + (blockWidth - 1) * sx / (SAMPLE_RATE - 1);
+                    samplePos.y = blockStart.y + (blockHeight - 1) * sy / (SAMPLE_RATE - 1);
+                    samplePos.z = blockStart.z + (blockDepth - 1) * sz / (SAMPLE_RATE - 1);
                     
-                    uint32_t idx = samplePos.z * params.volumeDim.x * params.volumeDim.y + 
-                                   samplePos.y * params.volumeDim.x + 
-                                   samplePos.x;
-                    
-                    float value = float(volume[idx]);
-                    
-                    // Check if this sample is near the isovalue
-                    float isoDist = std::abs(value - isovalue);
-                    if (isoDist < 25.5f) { // Within 10% of 255 range
-                        crossings++;
-                    }
-                    
-                    // Also check for edge transitions
-                    if (sx > 0 || sy > 0 || sz > 0) {
-                        glm::uvec3 prevPos = samplePos;
-                        if (sx > 0) prevPos.x--;
-                        else if (sy > 0) prevPos.y--;
-                        else prevPos.z--;
+                    // Ensure we're within bounds
+                    if (samplePos.x < params.volumeDim.x && 
+                        samplePos.y < params.volumeDim.y && 
+                        samplePos.z < params.volumeDim.z) {
                         
-                        uint32_t prevIdx = prevPos.z * params.volumeDim.x * params.volumeDim.y + 
-                                          prevPos.y * params.volumeDim.x + 
-                                          prevPos.x;
-                        float prevValue = float(volume[prevIdx]);
+                        uint32_t idx = samplePos.z * params.volumeDim.x * params.volumeDim.y + 
+                                       samplePos.y * params.volumeDim.x + 
+                                       samplePos.x;
                         
-                        // Check for sign change across isovalue
-                        if ((value - isovalue) * (prevValue - isovalue) < 0) {
-                            edgeSamples++;
+                        float value = float(volume[idx]);
+                        
+                        // Check if this sample is near the isovalue
+                        float isoDist = std::abs(value - isovalue);
+                        if (isoDist < 25.5f) { // Within 10% of 255 range
+                            crossings++;
                         }
+                        
+                        // Also check for edge transitions (with bounds checking)
+                        if (sx > 0 || sy > 0 || sz > 0) {
+                            glm::uvec3 prevPos = samplePos;
+                            if (sx > 0 && prevPos.x > 0) prevPos.x--;
+                            else if (sy > 0 && prevPos.y > 0) prevPos.y--;
+                            else if (sz > 0 && prevPos.z > 0) prevPos.z--;
+                            else {
+                                totalSamples++;
+                                continue; // Skip edge check if we can't safely go back
+                            }
+                            
+                            uint32_t prevIdx = prevPos.z * params.volumeDim.x * params.volumeDim.y + 
+                                              prevPos.y * params.volumeDim.x + 
+                                              prevPos.x;
+                            float prevValue = float(volume[prevIdx]);
+                            
+                            // Check for sign change across isovalue
+                            if ((value - isovalue) * (prevValue - isovalue) < 0) {
+                                edgeSamples++;
+                            }
+                        }
+                        
+                        totalSamples++;
                     }
-                    
-                    totalSamples++;
                 }
             }
         }

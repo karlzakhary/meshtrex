@@ -117,9 +117,60 @@ void RenderingManager::createSwapchainResources() {
     for (uint32_t i = 0; i < swapchain_.imageCount; ++i) {
         swapchainImageViews_[i] = createImageView(context_.getDevice(), swapchain_.images[i], swapchainFormat_, VK_IMAGE_TYPE_2D, 0, 1);
     }
+    
+    // Create synchronization objects - using MAX_FRAMES_IN_FLIGHT for proper frame synchronization
+    VkDevice device = context_.getDevice();
+    constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 3;
+    imageAvailableSemaphores_.resize(MAX_FRAMES_IN_FLIGHT);
+    renderFinishedSemaphores_.resize(MAX_FRAMES_IN_FLIGHT);
+    imageFences_.resize(MAX_FRAMES_IN_FLIGHT);
+    
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        imageAvailableSemaphores_[i] = createSemaphore(device);
+        renderFinishedSemaphores_[i] = createSemaphore(device);
+        
+        VkFenceCreateInfo fenceCreateInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &imageFences_[i]));
+    }
+    
+    // Allocate command buffers - one per frame in flight to avoid conflicts
+    commandBuffers_.resize(MAX_FRAMES_IN_FLIGHT);
+    VkCommandBufferAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    allocInfo.commandPool = context_.getCommandPool();
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, commandBuffers_.data()));
 }
 
 void RenderingManager::cleanupSwapchainResources() {
+    VkDevice device = context_.getDevice();
+    
+    // Wait for device to be idle before cleanup
+    vkDeviceWaitIdle(device);
+    
+    // Free command buffers
+    if (!commandBuffers_.empty()) {
+        vkFreeCommandBuffers(device, context_.getCommandPool(), commandBuffers_.size(), commandBuffers_.data());
+        commandBuffers_.clear();
+    }
+    
+    // Destroy synchronization objects
+    for (size_t i = 0; i < imageFences_.size(); i++) {
+        if (imageFences_[i] != VK_NULL_HANDLE) {
+            vkDestroyFence(device, imageFences_[i], nullptr);
+        }
+        if (imageAvailableSemaphores_[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, imageAvailableSemaphores_[i], nullptr);
+        }
+        if (renderFinishedSemaphores_[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, renderFinishedSemaphores_[i], nullptr);
+        }
+    }
+    imageFences_.clear();
+    imageAvailableSemaphores_.clear();
+    renderFinishedSemaphores_.clear();
+    
     destroyImage(depthImage_, context_.getDevice());
 
     for (auto imageView : swapchainImageViews_) {
@@ -159,23 +210,10 @@ void RenderingManager::render(const ExtractionOutput& extractionOutput) {
     std::cout << "Rendering " << actualMeshletCount << " meshlets." << std::endl;
     if (actualMeshletCount == 0) return;
 
-    VkSemaphore acquireSemaphore = createSemaphore(device);
-    VkSemaphore releaseSemaphore = createSemaphore(device);
-
-    VkFenceCreateInfo fenceCreateInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    VkFence frameFence = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateFence(device, &fenceCreateInfo, nullptr, &frameFence));
-
-    // Allocate one command buffer to be reused for the render loop
-    VkCommandBuffer commandBuffer;
-    VkCommandBufferAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    allocInfo.commandPool = context_.getCommandPool();
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer));
-
-
+    // Synchronization objects are now member variables, created in createSwapchainResources()
+    
+    uint32_t frameCounter = 0;
+    
     while (!glfwWindowShouldClose(window_)) {
         float currentTime = (float)glfwGetTime();
         float deltaTime = currentTime - lastFrameTime_;
@@ -199,11 +237,16 @@ void RenderingManager::render(const ExtractionOutput& extractionOutput) {
         lastMouseX_ = mouseX;
         lastMouseY_ = mouseY;
 
-        VK_CHECK(vkWaitForFences(device, 1, &frameFence, VK_TRUE, UINT64_MAX));
-        VK_CHECK(vkResetFences(device, 1, &frameFence));
-
         uint32_t imageIndex;
-        VkResult result = vkAcquireNextImageKHR(device, swapchain_.swapchain, UINT64_MAX, acquireSemaphore, VK_NULL_HANDLE, &imageIndex);
+        // Use frame-based semaphore indexing with MAX_FRAMES_IN_FLIGHT
+        constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 3;
+        uint32_t currentFrame = frameCounter % MAX_FRAMES_IN_FLIGHT;
+        
+        // Wait for this frame's fence before using its semaphores
+        VK_CHECK(vkWaitForFences(device, 1, &imageFences_[currentFrame], VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(device, 1, &imageFences_[currentFrame]));
+        
+        VkResult result = vkAcquireNextImageKHR(device, swapchain_.swapchain, UINT64_MAX, imageAvailableSemaphores_[currentFrame], VK_NULL_HANDLE, &imageIndex);
         
         if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(device);
@@ -213,7 +256,10 @@ void RenderingManager::render(const ExtractionOutput& extractionOutput) {
         }
         assert(result == VK_SUCCESS);
 
-        // Reset the command buffer for new recording
+        // Use the command buffer for this frame (not swapchain image)
+        VkCommandBuffer commandBuffer = commandBuffers_[currentFrame];
+        
+        // Reset the command buffer for new recording (safe now that we've waited for the fence)
         VK_CHECK(vkResetCommandBuffer(commandBuffer, 0));
         
         VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -306,18 +352,18 @@ void RenderingManager::render(const ExtractionOutput& extractionOutput) {
         VkPipelineStageFlags submitStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &acquireSemaphore;
+        submitInfo.pWaitSemaphores = &imageAvailableSemaphores_[currentFrame];
         submitInfo.pWaitDstStageMask = &submitStageMask;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffer;
         submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &releaseSemaphore;
+        submitInfo.pSignalSemaphores = &renderFinishedSemaphores_[currentFrame];
         
-        VK_CHECK(vkQueueSubmit(context_.getQueue(), 1, &submitInfo, frameFence));
+        VK_CHECK(vkQueueSubmit(context_.getQueue(), 1, &submitInfo, imageFences_[currentFrame]));
 
         VkPresentInfoKHR presentInfo = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         presentInfo.waitSemaphoreCount = 1;
-        presentInfo.pWaitSemaphores = &releaseSemaphore;
+        presentInfo.pWaitSemaphores = &renderFinishedSemaphores_[currentFrame];
         presentInfo.swapchainCount = 1;
         presentInfo.pSwapchains = &swapchain_.swapchain;
         presentInfo.pImageIndices = &imageIndex;
@@ -329,12 +375,11 @@ void RenderingManager::render(const ExtractionOutput& extractionOutput) {
         } else {
             assert(result == VK_SUCCESS);
         }
+        
+        // Advance frame counter
+        frameCounter++;
     }
 
     vkDeviceWaitIdle(device);
-
-    vkFreeCommandBuffers(device, context_.getCommandPool(), 1, &commandBuffer);
-    vkDestroyFence(device, frameFence, nullptr);
-    vkDestroySemaphore(device, releaseSemaphore, nullptr);
-    vkDestroySemaphore(device, acquireSemaphore, nullptr);
+    // Synchronization objects are now member variables, cleaned up in cleanupSwapchainResources()
 }

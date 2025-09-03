@@ -51,4 +51,10 @@ glm::vec3 cameraPos_ = glm::vec3(-1.f, -1.f, -2.f); // Closer initial position
     glm::vec3 cameraUp_ = glm::vec3(0.0f, 1.0f, 0.0f);
     double lastMouseX_ = 0, lastMouseY_ = 0;
     float lastFrameTime_ = 0.0f;
+    
+    // Synchronization objects - one per swapchain image
+    std::vector<VkSemaphore> imageAvailableSemaphores_;
+    std::vector<VkSemaphore> renderFinishedSemaphores_;
+    std::vector<VkFence> imageFences_;
+    std::vector<VkCommandBuffer> commandBuffers_;
 };

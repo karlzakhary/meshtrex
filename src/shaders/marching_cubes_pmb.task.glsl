@@ -103,7 +103,7 @@ const uint edgeTable[256] = uint[256](
 uint getPrimitiveCount(uint configuration) {
     uint primitiveCount = 0;
     for (int i = 0; i < 5; i++) {
-        if (mcTriangleTable.triTable[configuration * 16 + i * 3] == 255u) break;
+        if (uint(mcTriangleTable.triTable[configuration * 16 + i * 3]) == 255u) break;
         primitiveCount++;
     }
     return primitiveCount;

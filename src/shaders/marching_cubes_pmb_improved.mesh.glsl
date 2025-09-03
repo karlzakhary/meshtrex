@@ -7,7 +7,6 @@
 #extension GL_KHR_shader_subgroup_ballot: require
 
 // --- Debug Configuration (should match task shader) ---
-#define DEBUG_ENABLED 0
 #define DEBUG_BOUNDS_CHECK 0
 #define DEBUG_MEMORY_USAGE 0
 #define DEBUG_OVERFLOW_DETECTION 0

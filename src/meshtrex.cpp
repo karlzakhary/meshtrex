@@ -1161,16 +1161,16 @@ int main(int argc, char** argv) {
     try {
         bool pmb = false; // Use regular marching cubes for transient rendering
         // Parse command line arguments
-        bool disableCoherenceOptimization = false;
+        bool disableCoherenceOptimization = true;
         bool useDensityDispatch = false;
         bool useTransientExtraction = true;
         bool useTemporalCoherence = true;
-        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/bonsai_256x256x256_uint8.raw");
+        std::string volumePath = getFullPath(ROOT_BUILD_PATH, "/raw_volumes/aneurism_256x256x256_uint8.raw");
         float isovalue = 80;
         bool requestMeshShading = false;
         
         // Synthetic data options
-        bool useSyntheticData = true;
+        bool useSyntheticData = false;
         std::string syntheticType = "stress";  // "random", "layered", or "stress"
         int numSpheres = 1000;
 #ifndef __APPLE__
@@ -1287,13 +1287,26 @@ int main(int argc, char** argv) {
         
         PushConstants pushConstants = {};
         pushConstants.volumeDim = glm::uvec4(volume.volume_dims, 1);
-        pushConstants.blockDim = glm::uvec4(8, 8, 8, 1);
+        if (useTransientExtraction) {
+            pushConstants.blockDim = glm::uvec4(8, 8, 8, 1);
+            pushConstants.isovalue = isovalue / 255.0f;  // Convert to normalized float
+        } else {
+            if (pmb) {
+                pushConstants.blockDim = glm::uvec4(3, 3, 3, 1);
+            } else {
+                pushConstants.blockDim = glm::uvec4(1, 1, 1, 1);
+            
+            }
+            pushConstants.isovalue = isovalue;  // Convert to normalized float
+        }
+        
         pushConstants.blockGridDim = glm::uvec4(
             (volume.volume_dims.x + pushConstants.blockDim.x - 1) / pushConstants.blockDim.x,
             (volume.volume_dims.y + pushConstants.blockDim.y - 1) / pushConstants.blockDim.y,
             (volume.volume_dims.z + pushConstants.blockDim.z - 1) / pushConstants.blockDim.z,
             1);
-        pushConstants.isovalue = isovalue / 255.0f;  // Convert to normalized float
+
+        
 
         std::cout << "Loaded volume dims: ("
                   << pushConstants.volumeDim.x << "x" << pushConstants.volumeDim.y << "x" << pushConstants.volumeDim.z << ")" << std::endl;

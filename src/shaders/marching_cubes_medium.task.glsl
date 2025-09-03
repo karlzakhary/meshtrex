@@ -3,6 +3,8 @@
 #extension GL_EXT_shader_atomic_int64 : require
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_EXT_debug_printf : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8: require
+
 
 // --- Configurable Parameters ---
 #define BLOCK_DIM_X 4
@@ -54,7 +56,7 @@ layout(set = 0, binding = 2, std430) readonly buffer ActiveBlockCount { uint cou
 layout(set = 0, binding = 3, std430) readonly buffer ActiveBlockIDs { uint ids[]; } activeBlockIDs;
 
 // Binding 4: Triangle-Edge Connectivity Table (Size: 256 * 16)
-layout(set = 0, binding = 4, std430) readonly buffer MarchingCubesTriangleTable { int triTable[]; } mcTriangleTable;
+layout(set = 0, binding = 4, std430) readonly buffer MarchingCubesTriangleTable { uint8_t triTable[]; } mcTriangleTable;
 // --- End Descriptor Set Bindings ---
 
 // --- Shared Memory ---
@@ -71,7 +73,7 @@ uint getPrimitiveCount(uint configuration) {
     // Max 5 triangles per cell, check each one.
     for (int i = 0; i < 5; i++) {
         // Accessing the flattened 2D array: triTable[configuration][i*3]
-        if (mcTriangleTable.triTable[configuration * 16 + i * 3] == -1) {
+        if (uint(mcTriangleTable.triTable[configuration * 16 + i * 3]) == 255u) break; {
             break; // Found the end of the list for this configuration.
         }
         primitiveCount++;

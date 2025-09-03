@@ -2,6 +2,7 @@
 #extension GL_EXT_mesh_shader : require
 #extension GL_EXT_shader_atomic_int64 : require
 #extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8: require
 
 // --- Configurable Parameters ---
 #define WORKGROUP_SIZE 64   // Use a full workgroup to process all cells in parallel
@@ -41,7 +42,7 @@ layout(set = 0, binding = 0, std140) uniform PushConstants {
 } ubo;
 layout(set = 0, binding = 1, r8ui) uniform readonly uimage3D volumeImage;
 layout(set = 0, binding = 3, std430) readonly buffer ActiveBlockIDs { uint ids[]; } activeBlockIDs;
-layout(set = 0, binding = 4, std430) readonly buffer MarchingCubesTriangleTable { int triTable[]; } mcTriangleTable;
+layout(set = 0, binding = 4, std430) readonly buffer MarchingCubesTriangleTable { uint8_t triTable[]; } mcTriangleTable;
 
 // --- Workgroup Definition ---
 layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
@@ -58,7 +59,7 @@ const ivec3 cornerOffset[8] = ivec3[8](
 uint getPrimitiveCount(uint configuration) {
     uint primitiveCount = 0;
     for (int i = 0; i < 5; i++) {
-        if (mcTriangleTable.triTable[configuration * 16 + i * 3] == -1) break;
+        if (uint(mcTriangleTable.triTable[configuration * 16 + i * 3]) == 255u) break;
         primitiveCount++;
     }
     return primitiveCount;
